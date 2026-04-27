@@ -62,7 +62,11 @@ FALLBACK_IMAGE_RELATIVE_PATH = "assets/dog_1.jpg"
 FALLBACK_LABEL = "dog"
 
 # Validator runtime constants.
-IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "http://api.picflux.io/v1/search")
+IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "https://api.pexels.com/v1/search")
+PEXELS_API_KEY = _env_first(("PERTURB_PEXELS_API_KEY", "PEXELS_API_KEY"), "")
+PEXELS_PER_PAGE = _env_int("PERTURB_PEXELS_PER_PAGE", 40)
+PEXELS_PAGE_SPAN = _env_int("PERTURB_PEXELS_PAGE_SPAN", 10)
+PEXELS_IMAGE_VARIANT = os.getenv("PERTURB_PEXELS_IMAGE_VARIANT", "medium")
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
 TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 60)
 QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 120)
@@ -77,6 +81,7 @@ LLM_ENDPOINT_MODEL = _env_first(
     ("PERTURB_LLM_ENDPOINT_MODEL", "PERTURB_LABEL_MATCH_MODEL", "PERTURB_LLM_VERIFY_MODEL"),
     "Qwen2.5-1.5B-Instruct",
 )
+LLM_ENDPOINT_TIMEOUT_SECONDS = _env_int("PERTURB_LLM_ENDPOINT_TIMEOUT_SECONDS", 20)
 MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.002)
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.12)
 MAX_CHALLENGE_ATTEMPTS = _env_int("PERTURB_MAX_CHALLENGE_ATTEMPTS", 12)
@@ -84,6 +89,10 @@ MINER_EXPLORATION_RATIO = _env_float("PERTURB_MINER_EXPLORATION_RATIO", 0.20)
 
 VALIDATOR_CONFIG = {
     "image_endpoint": IMAGE_ENDPOINT,
+    "pexels_api_key": PEXELS_API_KEY,
+    "pexels_per_page": PEXELS_PER_PAGE,
+    "pexels_page_span": PEXELS_PAGE_SPAN,
+    "pexels_image_variant": PEXELS_IMAGE_VARIANT,
     "image_size": IMAGE_SIZE,
     "timeout_seconds": TIMEOUT_SECONDS,
     "query_interval_seconds": QUERY_INTERVAL_SECONDS,
@@ -92,6 +101,7 @@ VALIDATOR_CONFIG = {
     "min_processed_count": MIN_PROCESSED_COUNT,
     "llm_endpoint_url": LLM_ENDPOINT_URL,
     "llm_endpoint_model": LLM_ENDPOINT_MODEL,
+    "llm_endpoint_timeout_seconds": LLM_ENDPOINT_TIMEOUT_SECONDS,
     "min_linf_delta": MIN_LINF_DELTA,
     "max_linf_delta": MAX_LINF_DELTA,
     "max_challenge_attempts": MAX_CHALLENGE_ATTEMPTS,

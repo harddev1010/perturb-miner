@@ -40,6 +40,9 @@ _metrics = Metrics(started_at=time.time())
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
 DEFAULT_MODEL = os.getenv("PERTURB_LLM_ENDPOINT_MODEL", os.getenv("PERTURB_LLM_VERIFY_MODEL", "qwen2.5:1.5b-instruct"))
 OLLAMA_TIMEOUT_SECONDS = float(os.getenv("OLLAMA_TIMEOUT_SECONDS", "8"))
+OLLAMA_TEMPERATURE = float(os.getenv("OLLAMA_TEMPERATURE", "0"))
+OLLAMA_TOP_P = float(os.getenv("OLLAMA_TOP_P", "0.1"))
+OLLAMA_TOP_K = int(os.getenv("OLLAMA_TOP_K", "20"))
 
 
 def _resolve_model_name(raw: str) -> str:
@@ -54,13 +57,36 @@ def _resolve_model_name(raw: str) -> str:
 
 def _prompt(prediction: str, target: str) -> str:
     return (
-        "You are a strict semantic label verifier for image classification.\n"
-        "Decide if prediction is a semantic subtype/instance of target_label.\n"
-        "Examples: 'irish terrier' vs 'dog' => true, 'tabby cat' vs 'dog' => false.\n"
-        "Return JSON only: {\"is_match\": true|false, \"reason\": \"short reason\"}.\n"
+        "You are a strict taxonomy membership judge for image classification labels.\n"
+        "Task: decide whether prediction BELONGS TO target_label.\n"
+        "Interpretation: prediction is usually specific; target_label is usually broader.\n"
+        "CRITICAL POLICY:\n"
+        "- If prediction is a subtype/breed/species/member/instance inside target_label, set is_match=true.\n"
+        "- Do NOT reject because prediction is more specific than target_label.\n"
+        "- Specific->general membership MUST be true.\n"
+        "- Only set is_match=false when prediction is outside target_label taxonomy.\n"
+        "- Use common biological/lexical taxonomy knowledge.\n"
+        "- If uncertain between true/false, prefer true only when membership is plausible; otherwise false.\n"
+        "Self-check before final answer:\n"
+        "1) Is prediction inside target category? if yes => true.\n"
+        "2) Is prediction unrelated to target category? if yes => false.\n"
+        "Rturn ONLY valid JSON (no markdown, no extra text):\n"
+        "{\"is_match\": <true|false>, \"reason\": \"one short sentence\"}\n"
         f"prediction={prediction}\n"
         f"target_label={target}\n"
     )
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "1", "yes"}:
+            return True
+        if lowered in {"false", "0", "no"}:
+            return False
+    return None
 
 
 def _ollama_match(prediction: str, target_label: str, model: str) -> tuple[bool, str]:
@@ -70,6 +96,11 @@ def _ollama_match(prediction: str, target_label: str, model: str) -> tuple[bool,
         "prompt": _prompt(prediction=prediction, target=target_label),
         "stream": False,
         "format": "json",
+        "options": {
+            "temperature": OLLAMA_TEMPERATURE,
+            "top_p": OLLAMA_TOP_P,
+            "top_k": OLLAMA_TOP_K,
+        },
     }
     response = requests.post(
         f"{OLLAMA_URL.rstrip('/')}/api/generate",
@@ -84,7 +115,10 @@ def _ollama_match(prediction: str, target_label: str, model: str) -> tuple[bool,
     parsed: Any = json.loads(raw)
     if not isinstance(parsed, dict) or "is_match" not in parsed:
         raise ValueError("LLM JSON did not include is_match")
-    is_match = bool(parsed["is_match"])
+    parsed_bool = _coerce_bool(parsed["is_match"])
+    if parsed_bool is None:
+        raise ValueError("LLM JSON is_match is not a boolean")
+    is_match = parsed_bool
     reason = str(parsed.get("reason", "llm semantic decision"))
     return is_match, reason
 
