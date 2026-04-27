@@ -124,6 +124,7 @@ class PerturbValidator:
         self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self._query_loop = asyncio.new_event_loop()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.system_random = random.SystemRandom()
 
         self.model = load_efficientnet_b5(self.device)
         self.step = 0
@@ -233,8 +234,8 @@ class PerturbValidator:
         return 0.06 + (seed % 1400) / 10000.0
 
     def _choose_prompt(self, seed: int) -> str:
-        rng = random.Random(seed)
-        return rng.choice(list(C.PROMPTS))
+        _ = seed  # Keep signature stable; prompt selection is intentionally non-deterministic.
+        return self.system_random.choice(list(C.PROMPTS))
 
     def _parse_llm_endpoint_result(self, payload: Any) -> bool | None:
         if isinstance(payload, bool):
@@ -292,20 +293,50 @@ class PerturbValidator:
             return False
 
     def _fetch_image_for_prompt(self, prompt: str, seed: int) -> str:
-        endpoint = self.config.perturb.image_endpoint
+        endpoint = str(self.config.perturb.image_endpoint).strip()
+        api_key = str(getattr(self.config.perturb, "pexels_api_key", "")).strip()
+        if not api_key:
+            raise ValueError("Missing Pexels API key. Set PERTURB_PEXELS_API_KEY in validator env.")
+        per_page = max(1, min(80, int(getattr(self.config.perturb, "pexels_per_page", 40))))
+        page_span = max(1, int(getattr(self.config.perturb, "pexels_page_span", 10)))
+        image_variant = str(getattr(self.config.perturb, "pexels_image_variant", "medium")).strip().lower()
+        _ = seed  # Keep signature stable; page/photo sampling is intentionally non-deterministic.
         params = {
-            "prompt": prompt,
-            "seed": seed,
-            "image_size": self.config.perturb.image_size,
-            "random_mode": "true",
+            "query": prompt,
+            "page": self.system_random.randint(1, page_span),
+            "per_page": per_page,
         }
-        response = requests.get(endpoint, params=params, timeout=12)
+        response = requests.get(
+            endpoint,
+            params=params,
+            headers={"Authorization": api_key},
+            timeout=12,
+        )
         response.raise_for_status()
         data = response.json()
-        image_b64 = str(data.get("image_base64", ""))
-        if not image_b64:
-            raise ValueError("image response missing image_base64")
-        return image_b64
+        photos = data.get("photos") if isinstance(data, dict) else None
+        if not isinstance(photos, list) or not photos:
+            raise ValueError("Pexels response has no photos for the requested prompt")
+        photo = photos[self.system_random.randrange(len(photos))]
+        src = photo.get("src", {}) if isinstance(photo, dict) else {}
+        if not isinstance(src, dict):
+            src = {}
+        image_url = (
+            src.get(image_variant)
+            or src.get("medium")
+            or src.get("large")
+            or src.get("large2x")
+            or src.get("original")
+        )
+        if not isinstance(image_url, str) or not image_url.strip():
+            raise ValueError("Pexels photo src is missing usable image URL")
+
+        image_response = requests.get(image_url, timeout=12)
+        image_response.raise_for_status()
+        image_bytes = image_response.content
+        if not image_bytes:
+            raise ValueError("Downloaded Pexels image is empty")
+        return base64.b64encode(image_bytes).decode("utf-8")
 
     def _load_fallback_image_b64(self) -> str:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

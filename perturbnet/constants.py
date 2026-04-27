@@ -62,7 +62,11 @@ FALLBACK_IMAGE_RELATIVE_PATH = "assets/dog_1.jpg"
 FALLBACK_LABEL = "dog"
 
 # Validator runtime constants.
-IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "http://api.picflux.io/v1/search")
+IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "https://api.pexels.com/v1/search")
+PEXELS_API_KEY = _env_first(("PERTURB_PEXELS_API_KEY", "PEXELS_API_KEY"), "")
+PEXELS_PER_PAGE = _env_int("PERTURB_PEXELS_PER_PAGE", 40)
+PEXELS_PAGE_SPAN = _env_int("PERTURB_PEXELS_PAGE_SPAN", 10)
+PEXELS_IMAGE_VARIANT = os.getenv("PERTURB_PEXELS_IMAGE_VARIANT", "medium")
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
 TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 60)
 QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 120)
@@ -84,6 +88,10 @@ MINER_EXPLORATION_RATIO = _env_float("PERTURB_MINER_EXPLORATION_RATIO", 0.20)
 
 VALIDATOR_CONFIG = {
     "image_endpoint": IMAGE_ENDPOINT,
+    "pexels_api_key": PEXELS_API_KEY,
+    "pexels_per_page": PEXELS_PER_PAGE,
+    "pexels_page_span": PEXELS_PAGE_SPAN,
+    "pexels_image_variant": PEXELS_IMAGE_VARIANT,
     "image_size": IMAGE_SIZE,
     "timeout_seconds": TIMEOUT_SECONDS,
     "query_interval_seconds": QUERY_INTERVAL_SECONDS,

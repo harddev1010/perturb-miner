@@ -13,7 +13,7 @@ This repository provides:
 
 ### Validator responsibilities
 
-- Pull challenge images from external API (`PERTURB_IMAGE_ENDPOINT`)
+- Pull challenge images from Pexels Search API (`PERTURB_IMAGE_ENDPOINT`)
 - Run fixed classifier (`EfficientNet-B5`) on pulled image
 - Verify semantic consistency of model output vs prompt label through local `llm_endpoint`
 - Build and broadcast `AttackChallenge` synapse to selected miners
@@ -30,7 +30,7 @@ This repository provides:
 ### Challenge lifecycle
 
 1. Validator samples a prompt from `perturbnet/constants.py` (`PROMPTS`)
-2. Validator fetches image from API with `prompt`, `seed`, `image_size`, `random_mode=true`
+2. Validator fetches image from Pexels using `query=<prompt>` and random page/photo selection
 3. If API pull fails, validator falls back to `assets/dog_1.jpg` and sets prompt to `dog`
 4. Validator runs `EfficientNet-B5` and gets exact model label string
 5. Validator calls local `llm_endpoint` (`POST /verify-label`) to confirm semantic match between model label and prompt
@@ -158,6 +158,10 @@ Edit required fields in `scripts/validator.env`:
 Important validator-specific fields:
 
 - `PERTURB_IMAGE_ENDPOINT`
+- `PERTURB_PEXELS_API_KEY` (required)
+- `PERTURB_PEXELS_PER_PAGE`
+- `PERTURB_PEXELS_PAGE_SPAN`
+- `PERTURB_PEXELS_IMAGE_VARIANT` (`medium`, `large`, `original`, etc.)
 - `PERTURB_LLM_ENDPOINT_URL` (must point to your running llm endpoint, e.g. `http://127.0.0.1:8081/verify-label`)
 - `PERTURB_LLM_ENDPOINT_MODEL`
 - `PERTURB_K_MINERS`
@@ -230,12 +234,11 @@ Expected log behavior:
 
 ### Image API contract (validator input source)
 
-- Request params: `prompt`, `seed`, `image_size`, `random_mode`
-- Response JSON must include:
-
-```json
-{"image_base64":"<base64 image bytes>"}
-```
+- Pexels endpoint: `GET https://api.pexels.com/v1/search`
+- Required header: `Authorization: <PEXELS_API_KEY>` (raw key, no Bearer prefix)
+- Validator sends params: `query`, `page`, `per_page`
+- Validator reads `photos[].src.<variant>` and downloads the selected image bytes
+- No custom `image_base64` API response is required; validator converts downloaded image bytes to base64 internally.
 
 ### llm_endpoint contract (validator verification)
 
@@ -314,7 +317,7 @@ The smoke test validates:
 ## Troubleshooting
 
 - Validator fails verification loop: check `PERTURB_LLM_ENDPOINT_URL` and llm_endpoint health.
-- Frequent API failures: verify `PERTURB_IMAGE_ENDPOINT`; fallback should load `assets/dog_1.jpg`.
+- Frequent image API failures: verify `PERTURB_IMAGE_ENDPOINT` and `PERTURB_PEXELS_API_KEY`; fallback should load `assets/dog_1.jpg`.
 - No miner scoring activity: ensure miner hotkeys are registered and publicly reachable.
 - Dependency install issues: install CUDA/CPU-specific PyTorch build compatible with your host.
 - Slow verifier responses: reduce model size or place llm_endpoint closer to validator process.
