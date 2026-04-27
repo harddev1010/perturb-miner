@@ -35,6 +35,15 @@ class ChallengeSpec:
     timeout_seconds: int
 
 
+@dataclass
+class EvaluationResult:
+    score: float
+    reason: str
+    model_prediction: str = ""
+    norm: float = 0.0
+    epsilon: float = 0.0
+
+
 def _make_wallet(config):
     wallet_name = getattr(config.wallet, "name", getattr(config, "wallet_name", "default"))
     wallet_hotkey = getattr(config.wallet, "hotkey", getattr(config, "wallet_hotkey", "default"))
@@ -140,9 +149,9 @@ class PerturbValidator:
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
             rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            bt.logging.info(f"[STEP_START] {step_name} {rendered}")
+            bt.logging.info(f"{step_name} {rendered}")
         else:
-            bt.logging.info(f"[STEP_START] {step_name}")
+            bt.logging.info(step_name)
 
     def sync(self) -> None:
         old_n = int(self.metagraph.n)
@@ -277,12 +286,6 @@ class PerturbValidator:
         timeout_seconds = float(
             getattr(self.config.perturb, "llm_endpoint_timeout_seconds", 20)
         )
-        self._log_step_start(
-            "llm_endpoint_check",
-            endpoint=endpoint,
-            prediction=normalized_prediction,
-            expected=expected_label,
-        )
         try:
             response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
             response.raise_for_status()
@@ -364,6 +367,7 @@ class PerturbValidator:
         for attempt in range(self.config.perturb.max_challenge_attempts):
             seed = base_seed + attempt
             chosen_prompt = self._choose_prompt(seed)
+            bt.logging.info(f"Selected category: {chosen_prompt}")
             self._log_step_start(
                 "challenge_attempt",
                 attempt=attempt + 1,
@@ -393,15 +397,17 @@ class PerturbValidator:
                 image = decode_image_b64(image_b64).to(self.device)
                 predicted = predict_label(self.model, image)
                 predicted_label = normalize_prediction_label(predicted)
+                bt.logging.info(f"Output label: {predicted_label}")
             except Exception as exc:
                 bt.logging.warning(f"Challenge decode/model validation failed, retrying: {exc}")
                 continue
 
             # Verify the candidate by semantically checking model output against the API prompt label.
-            if not self._llm_endpoint_check(predicted_label, effective_prompt):
-                bt.logging.debug(
-                    f"Challenge rejected by classifier consistency: pred={predicted_label} expected={effective_prompt}"
-                )
+            verify_ok = self._llm_endpoint_check(predicted_label, effective_prompt)
+            bt.logging.info(
+                f"verify-label passed={verify_ok}"
+            )
+            if not verify_ok:
                 bt.logging.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
                 time.sleep(60)
                 continue
@@ -502,7 +508,12 @@ class PerturbValidator:
             self._query_loop = asyncio.new_event_loop()
         return self._query_loop.run_until_complete(self._query_miners(uids, challenge))
 
-    def verify_and_score(self, challenge: ChallengeSpec, perturbed_image_b64: str, response_time_ms: int) -> float:
+    def verify_and_score(
+        self,
+        challenge: ChallengeSpec,
+        perturbed_image_b64: str,
+        response_time_ms: int,
+    ) -> EvaluationResult:
         self._log_step_start(
             "verify_and_score",
             task_id=challenge.task_id,
@@ -511,13 +522,19 @@ class PerturbValidator:
         try:
             x_clean = decode_image_b64(challenge.clean_image_b64).to(self.device)
             x_adv = decode_image_b64(perturbed_image_b64).to(self.device)
-        except Exception:
-            return 0.0
+        except Exception as exc:
+            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}")
 
         if x_adv.shape != x_clean.shape:
-            return 0.0
+            return EvaluationResult(score=0.0, reason="shape_mismatch")
         if x_adv.min().item() < 0.0 or x_adv.max().item() > 1.0:
-            return 0.0
+            return EvaluationResult(score=0.0, reason="value_out_of_range")
+
+        prediction = ""
+        try:
+            prediction = predict_label(self.model, x_adv)
+        except Exception as exc:
+            return EvaluationResult(score=0.0, reason=f"model_inference_failed:{exc}")
 
         if challenge.norm_type == "Linf":
             norm = (x_adv - x_clean).abs().max().item()
@@ -527,14 +544,32 @@ class PerturbValidator:
             norm = float((x_adv - x_clean).ne(0).sum().item())
 
         if norm < self.config.perturb.min_linf_delta:
-            return 0.0
+            return EvaluationResult(
+                score=0.0,
+                reason="below_min_delta",
+                model_prediction=prediction,
+                norm=float(norm),
+                epsilon=float(challenge.epsilon),
+            )
         if norm > min(float(challenge.epsilon), float(self.config.perturb.max_linf_delta)):
-            return 0.0
+            return EvaluationResult(
+                score=0.0,
+                reason="above_max_delta",
+                model_prediction=prediction,
+                norm=float(norm),
+                epsilon=float(challenge.epsilon),
+            )
 
-        prediction = predict_label(self.model, x_adv)
-        # Successful perturbation means the response no longer verifies as original label.
-        if self._llm_endpoint_check(prediction, challenge.true_label):
-            return 0.0
+        normalized_prediction = normalize_prediction_label(prediction)
+        # Successful perturbation means the response label changes from original model output.
+        if normalized_prediction == challenge.true_label:
+            return EvaluationResult(
+                score=0.0,
+                reason="label_match_with_original",
+                model_prediction=normalized_prediction,
+                norm=float(norm),
+                epsilon=float(challenge.epsilon),
+            )
 
         perturbation_ratio = norm / max(1e-12, float(challenge.epsilon))
         perturbation_score = 1.0 - min(perturbation_ratio, 1.0)
@@ -542,7 +577,14 @@ class PerturbValidator:
         time_ratio = response_time_ms / (challenge.timeout_seconds * 1000.0)
         speed_score = 1.0 - min(time_ratio, 1.0)
 
-        return C.PERTURBATION_WEIGHT * perturbation_score + C.SPEED_WEIGHT * speed_score
+        score = C.PERTURBATION_WEIGHT * perturbation_score + C.SPEED_WEIGHT * speed_score
+        return EvaluationResult(
+            score=float(score),
+            reason="success",
+            model_prediction=normalized_prediction,
+            norm=float(norm),
+            epsilon=float(challenge.epsilon),
+        )
 
     def _update_histories(self, uids: Sequence[int], rewards: Sequence[float]) -> None:
         for uid, reward in zip(uids, rewards):
@@ -720,16 +762,24 @@ class PerturbValidator:
                     response_time_ms = int((process_time or challenge.timeout_seconds) * 1000)
 
                     if status_code != 200 or not response.perturbed_image_b64:
-                        score = 0.0
+                        result = EvaluationResult(
+                            score=0.0,
+                            reason="response_missing_or_status_error",
+                            model_prediction="unavailable",
+                        )
                     else:
-                        score = self.verify_and_score(
+                        result = self.verify_and_score(
                             challenge=challenge,
                             perturbed_image_b64=response.perturbed_image_b64,
                             response_time_ms=response_time_ms,
                         )
+                    score = float(result.score)
                     rewards.append(score)
                     bt.logging.info(
-                        f"uid={uid} status={status_code} score={score:.6f} processed={int(self.processed_counts[uid]) + 1}"
+                        f"uid={uid} status={status_code} score={score:.6f} "
+                        f"processed={int(self.processed_counts[uid]) + 1} "
+                        f"reason={result.reason} model_prediction={result.model_prediction} "
+                        f"norm={result.norm:.6f} epsilon={result.epsilon:.6f}"
                     )
 
                 self._log_step_start("loop_update_histories")

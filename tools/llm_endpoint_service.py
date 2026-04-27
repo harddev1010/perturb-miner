@@ -70,7 +70,7 @@ def _prompt(prediction: str, target: str) -> str:
         "Self-check before final answer:\n"
         "1) Is prediction inside target category? if yes => true.\n"
         "2) Is prediction unrelated to target category? if yes => false.\n"
-        "Return ONLY valid JSON (no markdown, no extra text):\n"
+        "Rturn ONLY valid JSON (no markdown, no extra text):\n"
         "{\"is_match\": <true|false>, \"reason\": \"one short sentence\"}\n"
         f"prediction={prediction}\n"
         f"target_label={target}\n"
