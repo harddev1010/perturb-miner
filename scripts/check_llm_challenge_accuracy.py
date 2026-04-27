@@ -35,7 +35,6 @@ DEFAULT_CHALLENGE_EXAMPLES: list[tuple[str, str, bool]] = [
     ("bullfrog", "amphibian", True),
     ("sorrel", "equine", True),
     ("street sign", "porcine", False),
-    ("pillow", "spiny lobster", False),
 ]
 
 
