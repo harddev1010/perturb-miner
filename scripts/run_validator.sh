@@ -7,7 +7,6 @@ SCRIPT_DIR="$ROOT_DIR/scripts"
 ENV_FILE="$SCRIPT_DIR/validator.env"
 EXAMPLE_ENV_FILE="$SCRIPT_DIR/validator.env.example"
 
-echo "=== Perturb Validator One-Command Launcher ==="
 if [[ ! -f "$ENV_FILE" ]]; then
   if [[ -f "$EXAMPLE_ENV_FILE" ]]; then
     echo "Missing $ENV_FILE"
@@ -29,9 +28,16 @@ NETUID="${NETUID:-1}"
 NETWORK="${NETWORK:-local}"
 VALIDATOR_EXTRA_ARGS="${VALIDATOR_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
+VALIDATOR_PORT="${VALIDATOR_PORT:-8090}"
 
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
+  exit 1
+fi
+
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  echo "Python interpreter not found: $PYTHON_BIN"
   exit 1
 fi
 
@@ -42,12 +48,33 @@ fi
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python -m pip install -e .
 
-echo "Starting validator (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK)..."
-python neurons/validator.py \
+if [[ "${1:-}" == "--foreground" ]]; then
+  echo "Starting validator (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK port=$VALIDATOR_PORT)..."
+  python neurons/validator.py \
+    --netuid "$NETUID" \
+    --network "$NETWORK" \
+    --wallet.name "$WALLET_NAME" \
+    --wallet.hotkey "$WALLET_HOTKEY" \
+    --axon.port "$VALIDATOR_PORT" \
+    --log-level "$LOG_LEVEL" \
+    $VALIDATOR_EXTRA_ARGS
+  exit 0
+fi
+
+echo "Starting validator with PM2..."
+if pm2 describe perturb-validator >/dev/null 2>&1; then
+  pm2 delete perturb-validator
+fi
+pm2 start ".venv/bin/python" --name perturb-validator -- \
+  neurons/validator.py \
   --netuid "$NETUID" \
   --network "$NETWORK" \
   --wallet.name "$WALLET_NAME" \
   --wallet.hotkey "$WALLET_HOTKEY" \
+  --axon.port "$VALIDATOR_PORT" \
+  --log-level "$LOG_LEVEL" \
   $VALIDATOR_EXTRA_ARGS
-
+pm2 save
+pm2 status perturb-validator

@@ -5,6 +5,7 @@ import asyncio
 import base64
 import hashlib
 import json
+import logging as pylogging
 import os
 import random
 import time
@@ -34,13 +35,94 @@ class ChallengeSpec:
     timeout_seconds: int
 
 
+def _make_wallet(config):
+    wallet_name = getattr(config.wallet, "name", getattr(config, "wallet_name", "default"))
+    wallet_hotkey = getattr(config.wallet, "hotkey", getattr(config, "wallet_hotkey", "default"))
+    if hasattr(bt, "wallet"):
+        try:
+            return bt.wallet(name=wallet_name, hotkey=wallet_hotkey)
+        except Exception:
+            return bt.wallet(config=config)
+    wallet_cls = getattr(bt, "Wallet", None)
+    if wallet_cls is None:
+        raise RuntimeError("No wallet constructor found in bittensor.")
+    try:
+        return wallet_cls(name=wallet_name, hotkey=wallet_hotkey)
+    except TypeError:
+        return wallet_cls(config=config)
+
+
+def _make_subtensor(config):
+    network = getattr(config.subtensor, "network", getattr(config, "network", "finney"))
+    if hasattr(bt, "subtensor"):
+        try:
+            return bt.subtensor(network=network)
+        except Exception:
+            return bt.subtensor(config=config)
+    subtensor_cls = getattr(bt, "Subtensor", None)
+    if subtensor_cls is None:
+        raise RuntimeError("No subtensor constructor found in bittensor.")
+    try:
+        return subtensor_cls(network=network)
+    except Exception:
+        return subtensor_cls(config=config)
+
+
+def _make_dendrite(wallet):
+    if hasattr(bt, "dendrite"):
+        return bt.dendrite(wallet=wallet)
+    dendrite_cls = getattr(bt, "Dendrite", None)
+    if dendrite_cls is None:
+        raise RuntimeError("No dendrite constructor found in bittensor.")
+    return dendrite_cls(wallet=wallet)
+
+
+def _make_axon(wallet, config):
+    resolved_config = config() if callable(config) else config
+    if hasattr(bt, "axon"):
+        try:
+            return bt.axon(wallet=wallet, config=resolved_config)
+        except Exception:
+            return bt.axon(wallet=wallet)
+    axon_cls = getattr(bt, "Axon", None)
+    if axon_cls is None:
+        raise RuntimeError("No axon constructor found in bittensor.")
+    try:
+        return axon_cls(wallet=wallet, config=resolved_config)
+    except Exception:
+        return axon_cls(wallet=wallet)
+
+
+def _configure_log_level(level_raw: str) -> None:
+    level_name = (level_raw or "DEBUG").upper()
+    level = getattr(pylogging, level_name, pylogging.INFO)
+    pylogging.getLogger().setLevel(level)
+    bt_logger = getattr(bt, "logging", None)
+    if bt_logger is None:
+        return
+    try:
+        if level_name == "DEBUG" and hasattr(bt_logger, "set_debug"):
+            bt_logger.set_debug(True)
+        elif level_name in {"WARNING", "WARN"} and hasattr(bt_logger, "set_warning"):
+            bt_logger.set_warning(True)
+        elif level_name == "ERROR" and hasattr(bt_logger, "set_error"):
+            bt_logger.set_error(True)
+        elif hasattr(bt_logger, "set_info"):
+            bt_logger.set_info(True)
+    except Exception:
+        pass
+
+
 class PerturbValidator:
     def __init__(self, config: bt.config) -> None:
         self.config = config
-        self.wallet = bt.wallet(config=self.config)
-        self.subtensor = bt.subtensor(config=self.config)
+        _configure_log_level(getattr(self.config, "log_level", "DEBUG"))
+        self.wallet = _make_wallet(config=self.config)
+        self.subtensor = _make_subtensor(config=self.config)
         self.metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
-        self.dendrite = bt.dendrite(wallet=self.wallet)
+        self.dendrite = _make_dendrite(wallet=self.wallet)
+        self.axon = _make_axon(wallet=self.wallet, config=self.config)
+        self._query_loop = asyncio.new_event_loop()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
         self.model = load_efficientnet_b5(self.device)
@@ -50,8 +132,16 @@ class PerturbValidator:
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
+        self.uid_hotkeys: list[str] = list(self.metagraph.hotkeys[: int(self.metagraph.n)])
 
         self._load_state()
+
+    def _log_step_start(self, step_name: str, **context: Any) -> None:
+        if context:
+            rendered = " ".join([f"{k}={v}" for k, v in context.items()])
+            bt.logging.info(f"[STEP_START] {step_name} {rendered}")
+        else:
+            bt.logging.info(f"[STEP_START] {step_name}")
 
     def sync(self) -> None:
         old_n = int(self.metagraph.n)
@@ -66,6 +156,30 @@ class PerturbValidator:
                 self.score_histories.extend([[] for _ in range(new_n - len(self.score_histories))])
             else:
                 self.score_histories = self.score_histories[:new_n]
+            if new_n > len(self.uid_hotkeys):
+                self.uid_hotkeys.extend([""] * (new_n - len(self.uid_hotkeys)))
+            else:
+                self.uid_hotkeys = self.uid_hotkeys[:new_n]
+        self._reconcile_uid_identities()
+
+    def _reset_uid_stats(self, uid: int, reason: str) -> None:
+        self.processed_counts[uid] = 0
+        self.score_histories[uid] = []
+        bt.logging.info(f"Reset uid={uid} stats due to {reason}.")
+
+    def _reconcile_uid_identities(self) -> None:
+        n = int(self.metagraph.n)
+        if len(self.uid_hotkeys) < n:
+            self.uid_hotkeys.extend([""] * (n - len(self.uid_hotkeys)))
+        elif len(self.uid_hotkeys) > n:
+            self.uid_hotkeys = self.uid_hotkeys[:n]
+
+        for uid in range(n):
+            current_hotkey = str(self.metagraph.hotkeys[uid])
+            previous_hotkey = self.uid_hotkeys[uid]
+            if previous_hotkey and previous_hotkey != current_hotkey:
+                self._reset_uid_stats(uid, reason="hotkey_changed")
+            self.uid_hotkeys[uid] = current_hotkey
 
     def _load_state(self) -> None:
         if not os.path.exists(self.state_path):
@@ -87,6 +201,15 @@ class PerturbValidator:
             if isinstance(raw, list):
                 self.score_histories[idx] = [float(x) for x in raw[-self.config.perturb.history_size :]]
 
+        saved_hotkeys = state.get("uid_hotkeys", [])
+        if isinstance(saved_hotkeys, list):
+            copied_keys = min(len(saved_hotkeys), len(self.uid_hotkeys))
+            for idx in range(copied_keys):
+                value = saved_hotkeys[idx]
+                if isinstance(value, str):
+                    self.uid_hotkeys[idx] = value
+        self._reconcile_uid_identities()
+
     def _save_state(self) -> None:
         directory = os.path.dirname(self.state_path)
         if directory:
@@ -96,6 +219,7 @@ class PerturbValidator:
             "last_weight_block": int(self.last_weight_block),
             "processed_counts": self.processed_counts.tolist(),
             "score_histories": [history[-self.config.perturb.history_size :] for history in self.score_histories],
+            "uid_hotkeys": self.uid_hotkeys,
         }
         with open(self.state_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -149,6 +273,12 @@ class PerturbValidator:
                 )
             ),
         }
+        self._log_step_start(
+            "llm_endpoint_check",
+            endpoint=endpoint,
+            prediction=normalized_prediction,
+            expected=expected_label,
+        )
         try:
             response = requests.post(endpoint, json=payload, timeout=8)
             response.raise_for_status()
@@ -158,7 +288,7 @@ class PerturbValidator:
                 return False
             return bool(parsed)
         except Exception as exc:
-            bt.logging.error("LLM endpoint request failed (%s); rejecting check.", exc)
+            bt.logging.error(f"LLM endpoint request failed ({exc}); rejecting check.")
             return False
 
     def _fetch_image_for_prompt(self, prompt: str, seed: int) -> str:
@@ -189,38 +319,52 @@ class PerturbValidator:
     def generate_challenge(self, block: int) -> ChallengeSpec:
         model_name = C.MODEL_NAME
         base_seed = self._seed_from_block(block)
+        self._log_step_start(
+            "generate_challenge",
+            block=block,
+            base_seed=base_seed,
+            max_attempts=self.config.perturb.max_challenge_attempts,
+        )
         for attempt in range(self.config.perturb.max_challenge_attempts):
             seed = base_seed + attempt
             chosen_prompt = self._choose_prompt(seed)
+            self._log_step_start(
+                "challenge_attempt",
+                attempt=attempt + 1,
+                seed=seed,
+                prompt=chosen_prompt,
+            )
             try:
+                self._log_step_start("challenge_fetch_image", prompt=chosen_prompt, seed=seed)
                 image_b64 = self._fetch_image_for_prompt(prompt=chosen_prompt, seed=seed)
                 effective_prompt = chosen_prompt
             except Exception as exc:
-                bt.logging.warning("Challenge image fetch failed (%s), using fallback dog image.", exc)
+                bt.logging.warning(f"Challenge image fetch failed ({exc}), using fallback dog image.")
                 try:
+                    self._log_step_start("challenge_load_fallback_image", label=C.FALLBACK_LABEL)
                     image_b64 = self._load_fallback_image_b64()
                     effective_prompt = C.FALLBACK_LABEL
                 except Exception as fallback_exc:
-                    bt.logging.warning("Fallback image load failed, retrying: %s", fallback_exc)
+                    bt.logging.warning(f"Fallback image load failed, retrying: {fallback_exc}")
                     continue
 
             epsilon = self._sample_epsilon(seed)
             task_id = f"{block}-{seed}"
+            self._log_step_start("challenge_prepare", task_id=task_id, epsilon=f"{epsilon:.4f}")
 
             try:
+                self._log_step_start("challenge_model_inference", task_id=task_id)
                 image = decode_image_b64(image_b64).to(self.device)
                 predicted = predict_label(self.model, image)
                 predicted_label = normalize_prediction_label(predicted)
             except Exception as exc:
-                bt.logging.warning("Challenge decode/model validation failed, retrying: %s", exc)
+                bt.logging.warning(f"Challenge decode/model validation failed, retrying: {exc}")
                 continue
 
             # Verify the candidate by semantically checking model output against the API prompt label.
             if not self._llm_endpoint_check(predicted_label, effective_prompt):
                 bt.logging.debug(
-                    "Challenge rejected by classifier consistency: pred=%s expected=%s",
-                    predicted_label,
-                    effective_prompt,
+                    f"Challenge rejected by classifier consistency: pred={predicted_label} expected={effective_prompt}"
                 )
                 continue
 
@@ -251,18 +395,48 @@ class PerturbValidator:
 
     def _valuable_miner_uids(self, candidate_uids: Sequence[int]) -> list[int]:
         min_processed = int(self.config.perturb.min_processed_count)
-        return [uid for uid in candidate_uids if int(self.processed_counts[uid]) > min_processed]
+        return [uid for uid in candidate_uids if int(self.processed_counts[uid]) >= min_processed]
 
     def _select_random_miners(self, candidate_uids: Sequence[int], seed: int) -> list[int]:
         if not candidate_uids:
             return []
         valuable = self._valuable_miner_uids(candidate_uids)
-        pool = list(valuable) if valuable else list(candidate_uids)
+        pool = list(candidate_uids)
         k = min(int(self.config.perturb.k_miners), len(pool))
         rng = random.Random(seed)
-        return sorted(rng.sample(pool, k=k))
+        if k <= 0:
+            return []
+        if not valuable:
+            return sorted(rng.sample(pool, k=k))
+
+        valuable_set = set(valuable)
+        newcomers = [uid for uid in pool if uid not in valuable_set]
+        ratio = float(max(0.0, min(1.0, self.config.perturb.miner_exploration_ratio)))
+        explore_k = min(len(newcomers), int(round(k * ratio)))
+        if newcomers and ratio > 0.0 and explore_k == 0:
+            explore_k = 1
+        exploit_k = min(len(valuable), k - explore_k)
+        if exploit_k + explore_k < k:
+            explore_k = min(len(newcomers), explore_k + (k - (exploit_k + explore_k)))
+
+        selected: list[int] = []
+        if exploit_k > 0:
+            selected.extend(rng.sample(list(valuable), k=exploit_k))
+        if explore_k > 0:
+            selected.extend(rng.sample(newcomers, k=explore_k))
+
+        if len(selected) < k:
+            remaining = [uid for uid in pool if uid not in set(selected)]
+            selected.extend(rng.sample(remaining, k=min(k - len(selected), len(remaining))))
+        return sorted(selected)
 
     async def _query_miners(self, uids: Sequence[int], challenge: ChallengeSpec):
+        self._log_step_start(
+            "query_miners",
+            task_id=challenge.task_id,
+            miner_count=len(uids),
+            timeout=challenge.timeout_seconds,
+        )
         axons = [self.metagraph.axons[uid] for uid in uids]
         synapse = AttackChallenge(
             task_id=challenge.task_id,
@@ -275,7 +449,7 @@ class PerturbValidator:
             min_delta=self.config.perturb.min_linf_delta,
             timeout_seconds=challenge.timeout_seconds,
         )
-        responses = await self.dendrite(
+        responses = await self.dendrite.forward(
             axons=axons,
             synapse=synapse,
             deserialize=False,
@@ -283,7 +457,19 @@ class PerturbValidator:
         )
         return responses
 
+    def _run_query_miners(self, uids: Sequence[int], challenge: ChallengeSpec):
+        # Keep a persistent event loop for dendrite calls; asyncio.run() closes
+        # the loop each call and can trigger "Event loop is closed" on reuse.
+        if self._query_loop.is_closed():
+            self._query_loop = asyncio.new_event_loop()
+        return self._query_loop.run_until_complete(self._query_miners(uids, challenge))
+
     def verify_and_score(self, challenge: ChallengeSpec, perturbed_image_b64: str, response_time_ms: int) -> float:
+        self._log_step_start(
+            "verify_and_score",
+            task_id=challenge.task_id,
+            response_time_ms=response_time_ms,
+        )
         try:
             x_clean = decode_image_b64(challenge.clean_image_b64).to(self.device)
             x_adv = decode_image_b64(perturbed_image_b64).to(self.device)
@@ -321,67 +507,114 @@ class PerturbValidator:
         return C.PERTURBATION_WEIGHT * perturbation_score + C.SPEED_WEIGHT * speed_score
 
     def _update_histories(self, uids: Sequence[int], rewards: Sequence[float]) -> None:
-        history_size = int(self.config.perturb.history_size)
         for uid, reward in zip(uids, rewards):
             self.processed_counts[uid] += 1
             self.score_histories[uid].append(float(reward))
-            if len(self.score_histories[uid]) > history_size:
-                self.score_histories[uid] = self.score_histories[uid][-history_size:]
-
-    def _rank_points(self, rank: int) -> float:
-        # rank is 0-based among eligible miners sorted by avg score
-        if rank == 0:
-            return 50.0
-        if rank == 1:
-            return 30.0
-        if rank == 2:
-            return 10.0
-        if rank <= 9:
-            return 5.0
-        return 3.0
 
     def _set_weights(self) -> None:
+        self._log_step_start(
+            "set_weights",
+            min_processed=self.config.perturb.min_processed_count,
+            history_size=self.config.perturb.history_size,
+        )
         eligible: list[tuple[int, float]] = []
-        min_processed = int(self.config.perturb.min_processed_count)
         history_size = int(self.config.perturb.history_size)
+        min_processed = int(self.config.perturb.min_processed_count)
         for uid in range(int(self.metagraph.n)):
-            if self.processed_counts[uid] <= min_processed:
+            if int(self.processed_counts[uid]) < min_processed:
                 continue
             history = self.score_histories[uid]
-            if not history:
+            if len(history) < history_size:
                 continue
             tail = history[-history_size:]
-            avg_score = float(sum(tail) / max(1, len(tail)))
+            avg_score = float(sum(tail) / history_size)
             eligible.append((uid, avg_score))
 
         if not eligible:
-            bt.logging.warning("No eligible miners with processed_count >= %d", min_processed)
+            bt.logging.warning(f"No eligible miners with processed_count >= {min_processed}.")
             return
 
         eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
-        avg_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
-        bonus_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
-        for rank, (uid, avg_score) in enumerate(eligible):
-            avg_raw[uid] = max(0.0, float(avg_score))
-            bonus_raw[uid] = float(self._rank_points(rank))
+        n_eligible = len(eligible)
+        emission_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
 
-        avg_total = float(avg_raw.sum())
-        bonus_total = float(bonus_raw.sum())
-        if avg_total <= 0.0 or bonus_total <= 0.0:
-            bt.logging.warning("Average or rank-bonus totals are zero; skipping set_weights.")
+        rank_to_uid: dict[int, int] = {}
+        for rank0, (uid, avg_score) in enumerate(eligible):
+            rank = rank0 + 1
+            rank_to_uid[rank] = uid
+
+        # Top-3 fixed emission.
+        if n_eligible >= 1:
+            emission_raw[rank_to_uid[1]] = 0.50
+        if n_eligible >= 2:
+            emission_raw[rank_to_uid[2]] = 0.30
+        if n_eligible >= 3:
+            emission_raw[rank_to_uid[3]] = 0.10
+
+        # Ranks 4-10 share 5% with inverse-rank decay.
+        start_4_10 = 4
+        end_4_10 = min(10, n_eligible)
+        if end_4_10 >= start_4_10:
+            denom_4_10 = sum((1.0 / r) for r in range(start_4_10, end_4_10 + 1))
+            if denom_4_10 > 0:
+                for r in range(start_4_10, end_4_10 + 1):
+                    emission_raw[rank_to_uid[r]] = float(0.05 * (1.0 / r) / denom_4_10)
+
+        # Ranks 11+ share 5% with inverse-rank decay.
+        start_11 = 11
+        if n_eligible >= start_11:
+            denom_11p = sum((1.0 / r) for r in range(start_11, n_eligible + 1))
+            if denom_11p > 0:
+                for r in range(start_11, n_eligible + 1):
+                    emission_raw[rank_to_uid[r]] = float(0.05 * (1.0 / r) / denom_11p)
+
+        # Only miners with positive average score may receive non-zero emissions.
+        positive_uids = [uid for uid, avg_score in eligible if avg_score > 0.0]
+        if not positive_uids:
+            bt.logging.warning("No miners with positive average score; setting all weights to zero.")
+            zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
+            uids = list(range(len(zero_weights)))
+            ok, msg = self.subtensor.set_weights(
+                wallet=self.wallet,
+                netuid=self.config.netuid,
+                uids=uids,
+                weights=[float(v) for v in zero_weights.tolist()],
+                wait_for_inclusion=False,
+                wait_for_finalization=False,
+            )
+            if ok:
+                bt.logging.info("set_weights success (all zero)")
+            else:
+                bt.logging.error(f"set_weights failed (all zero): {msg}")
+            return
+        active_emission_total = float(sum(float(emission_raw[uid]) for uid in positive_uids))
+        if active_emission_total <= 0.0:
+            bt.logging.warning("No positive-score miners in weighted rank buckets; setting all weights to zero.")
+            zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
+            uids = list(range(len(zero_weights)))
+            ok, msg = self.subtensor.set_weights(
+                wallet=self.wallet,
+                netuid=self.config.netuid,
+                uids=uids,
+                weights=[float(v) for v in zero_weights.tolist()],
+                wait_for_inclusion=False,
+                wait_for_finalization=False,
+            )
+            if ok:
+                bt.logging.info("set_weights success (all zero)")
+            else:
+                bt.logging.error(f"set_weights failed (all zero): {msg}")
             return
 
-        avg_norm = avg_raw / avg_total
-        bonus_norm = bonus_raw / bonus_total
-        gamma = float(C.GAMMA_HISTORY_WEIGHT)
-        raw = gamma * avg_norm + (1.0 - gamma) * bonus_norm
+        normalized = np.zeros(int(self.metagraph.n), dtype=np.float32)
+        for uid in positive_uids:
+            normalized[uid] = float(emission_raw[uid]) / active_emission_total
+        for rank0, (uid, avg_score) in enumerate(eligible):
+            rank = rank0 + 1
+            bt.logging.info(
+                f"rank={rank} uid={uid} avg100={avg_score:.6f} emission={emission_raw[uid]:.6f} final_weight={normalized[uid]:.6f}"
+            )
 
-        total = float(raw.sum())
-        if total <= 0.0:
-            bt.logging.warning("Rank-based weights are all zero; skipping set_weights.")
-            return
-
-        normalized = raw / total
         uids = list(range(len(normalized)))
         weights = [float(v) for v in normalized.tolist()]
         ok, msg = self.subtensor.set_weights(
@@ -395,33 +628,40 @@ class PerturbValidator:
         if ok:
             bt.logging.info("set_weights success")
         else:
-            bt.logging.error("set_weights failed: %s", msg)
+            bt.logging.error(f"set_weights failed: {msg}")
 
     def run(self) -> None:
+        self._log_step_start("validator_boot")
         self.sync()
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             raise RuntimeError("Validator hotkey is not registered on this netuid.")
 
+        self._log_step_start("validator_serve_axon", port=getattr(self.config.axon, "port", "unknown"))
+        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
+        self.axon.start()
+
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
-        bt.logging.info("Validator started with tempo=%s", tempo)
+        bt.logging.info(f"Validator started with tempo={tempo}")
 
         while True:
             try:
+                self._log_step_start("loop_sync_metagraph")
                 self.sync()
+                self._log_step_start("loop_get_current_block")
                 block = self.subtensor.get_current_block()
+                self._log_step_start("loop_generate_challenge", block=block)
                 challenge = self.generate_challenge(block=block)
                 bt.logging.info(
-                    "Challenge task=%s prompt=%s eps=%.4f",
-                    challenge.task_id,
-                    challenge.prompt,
-                    challenge.epsilon,
+                    f"Challenge task={challenge.task_id} prompt={challenge.prompt} eps={challenge.epsilon:.4f}"
                 )
 
+                self._log_step_start("loop_discover_miners")
                 available_uids = self._available_miner_uids()
                 if not available_uids:
                     bt.logging.warning("No miners available")
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
+                self._log_step_start("loop_select_miners", candidate_count=len(available_uids))
                 valuable_uids = self._valuable_miner_uids(available_uids)
                 miner_uids = self._select_random_miners(available_uids, seed=self._seed_from_block(block))
                 if not miner_uids:
@@ -429,13 +669,12 @@ class PerturbValidator:
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
                 bt.logging.info(
-                    "Selected %d miners (valuable pool=%d, total pool=%d)",
-                    len(miner_uids),
-                    len(valuable_uids),
-                    len(available_uids),
+                    f"Selected {len(miner_uids)} miners (valuable pool={len(valuable_uids)}, total pool={len(available_uids)})"
                 )
 
-                responses = asyncio.run(self._query_miners(miner_uids, challenge))
+                self._log_step_start("loop_query_miners", selected_count=len(miner_uids))
+                responses = self._run_query_miners(miner_uids, challenge)
+                self._log_step_start("loop_score_responses", response_count=len(responses))
                 rewards: list[float] = []
                 for uid, response in zip(miner_uids, responses):
                     status_code = getattr(response.dendrite, "status_code", 0) if response.dendrite else 0
@@ -452,40 +691,77 @@ class PerturbValidator:
                         )
                     rewards.append(score)
                     bt.logging.info(
-                        "uid=%s status=%s score=%.6f processed=%d",
-                        uid,
-                        status_code,
-                        score,
-                        int(self.processed_counts[uid]) + 1,
+                        f"uid={uid} status={status_code} score={score:.6f} processed={int(self.processed_counts[uid]) + 1}"
                     )
 
+                self._log_step_start("loop_update_histories")
                 self._update_histories(miner_uids, rewards)
+                self._log_step_start("loop_save_state")
                 self._save_state()
 
                 blocks_since_weights = block - self.last_weight_block
                 if blocks_since_weights >= tempo:
+                    self._log_step_start("loop_maybe_set_weights", blocks_since_weights=blocks_since_weights, tempo=tempo)
                     self._set_weights()
                     self.last_weight_block = block
 
                 self.step += 1
+                self._log_step_start("loop_sleep", seconds=self.config.perturb.query_interval_seconds)
                 time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
                 bt.logging.info("Validator stopped by user.")
                 break
             except Exception as exc:
-                bt.logging.error("Validator loop error: %s", exc)
+                bt.logging.error(f"Validator loop error: {exc}")
                 time.sleep(5)
+        if not self._query_loop.is_closed():
+            self._query_loop.close()
 
 
 def build_config() -> bt.config:
     parser = argparse.ArgumentParser(description="Perturb subnet validator")
     parser.add_argument("--netuid", type=int, required=True)
-    bt.wallet.add_args(parser)
-    bt.subtensor.add_args(parser)
-    bt.logging.add_args(parser)
-    bt.axon.add_args(parser)
+    parser.add_argument("--network", type=str, default=os.getenv("NETWORK", "finney"))
+    parser.add_argument("--wallet.name", dest="wallet_name", type=str, default=os.getenv("WALLET_NAME", "default"))
+    parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", type=str, default=os.getenv("HOTKEY_NAME", "default"))
+    parser.add_argument("--logging-dir", dest="logging_dir", type=str, default=os.getenv("LOGGING_DIR", "./logs"))
+    parser.add_argument("--log-level", dest="log_level", type=str, default=os.getenv("LOG_LEVEL", "DEBUG"))
+    parser.add_argument(
+        "--axon.port",
+        dest="axon_port",
+        type=int,
+        default=int(os.getenv("VALIDATOR_PORT", os.getenv("AXON_PORT", "8090"))),
+    )
 
-    config = bt.config(parser)
+    if hasattr(bt, "config"):
+        config = bt.config(parser)
+    else:
+        config = parser.parse_args()
+
+    if not hasattr(config, "wallet"):
+        config.wallet = type("WalletConfig", (), {})()
+    config.wallet.name = getattr(config.wallet, "name", getattr(config, "wallet_name", "default"))
+    config.wallet.hotkey = getattr(config.wallet, "hotkey", getattr(config, "wallet_hotkey", "default"))
+
+    if not hasattr(config, "subtensor"):
+        config.subtensor = type("SubtensorConfig", (), {})()
+    config.subtensor.network = getattr(config.subtensor, "network", getattr(config, "network", "finney"))
+
+    if not hasattr(config, "logging"):
+        config.logging = type("LoggingConfig", (), {})()
+    config.logging.logging_dir = getattr(config.logging, "logging_dir", getattr(config, "logging_dir", "./logs"))
+    config.log_level = getattr(config, "log_level", os.getenv("LOG_LEVEL", "DEBUG"))
+
+    if not hasattr(config, "axon"):
+        config.axon = type("AxonConfig", (), {})()
+    config.axon.port = int(getattr(config.axon, "port", getattr(config, "axon_port", 8090)))
+    config.axon.ip = getattr(config.axon, "ip", os.getenv("VALIDATOR_IP", os.getenv("AXON_IP", "0.0.0.0")))
+    config.axon.external_ip = getattr(config.axon, "external_ip", os.getenv("VALIDATOR_EXTERNAL_IP", None))
+    config.axon.external_port = int(
+        getattr(config.axon, "external_port", os.getenv("VALIDATOR_EXTERNAL_PORT", str(config.axon.port)))
+    )
+    config.axon.max_workers = int(getattr(config.axon, "max_workers", os.getenv("AXON_MAX_WORKERS", "10")))
+
     perturb_cfg = type("PerturbConfig", (), {})()
     config.perturb = perturb_cfg
     for key, value in C.VALIDATOR_CONFIG.items():
