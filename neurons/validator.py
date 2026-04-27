@@ -274,6 +274,9 @@ class PerturbValidator:
                 )
             ),
         }
+        timeout_seconds = float(
+            getattr(self.config.perturb, "llm_endpoint_timeout_seconds", 20)
+        )
         self._log_step_start(
             "llm_endpoint_check",
             endpoint=endpoint,
@@ -281,7 +284,7 @@ class PerturbValidator:
             expected=expected_label,
         )
         try:
-            response = requests.post(endpoint, json=payload, timeout=8)
+            response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
             response.raise_for_status()
             parsed = self._parse_llm_endpoint_result(response.json())
             if parsed is None:
@@ -289,7 +292,9 @@ class PerturbValidator:
                 return False
             return bool(parsed)
         except Exception as exc:
-            bt.logging.error(f"LLM endpoint request failed ({exc}); rejecting check.")
+            bt.logging.error(
+                f"LLM endpoint request failed ({exc}); timeout={timeout_seconds}s; rejecting check."
+            )
             return False
 
     def _fetch_image_for_prompt(self, prompt: str, seed: int) -> str:
@@ -643,7 +648,7 @@ class PerturbValidator:
         for rank0, (uid, avg_score) in enumerate(eligible):
             rank = rank0 + 1
             bt.logging.info(
-                f"rank={rank} uid={uid} avg100={avg_score:.6f} emission={emission_raw[uid]:.6f} final_weight={normalized[uid]:.6f}"
+                f"rank={rank} uid={uid} avg100={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
             )
 
         uids = list(range(len(normalized)))

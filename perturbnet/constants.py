@@ -81,6 +81,7 @@ LLM_ENDPOINT_MODEL = _env_first(
     ("PERTURB_LLM_ENDPOINT_MODEL", "PERTURB_LABEL_MATCH_MODEL", "PERTURB_LLM_VERIFY_MODEL"),
     "Qwen2.5-1.5B-Instruct",
 )
+LLM_ENDPOINT_TIMEOUT_SECONDS = _env_int("PERTURB_LLM_ENDPOINT_TIMEOUT_SECONDS", 20)
 MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.002)
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.12)
 MAX_CHALLENGE_ATTEMPTS = _env_int("PERTURB_MAX_CHALLENGE_ATTEMPTS", 12)
@@ -100,6 +101,7 @@ VALIDATOR_CONFIG = {
     "min_processed_count": MIN_PROCESSED_COUNT,
     "llm_endpoint_url": LLM_ENDPOINT_URL,
     "llm_endpoint_model": LLM_ENDPOINT_MODEL,
+    "llm_endpoint_timeout_seconds": LLM_ENDPOINT_TIMEOUT_SECONDS,
     "min_linf_delta": MIN_LINF_DELTA,
     "max_linf_delta": MAX_LINF_DELTA,
     "max_challenge_attempts": MAX_CHALLENGE_ATTEMPTS,
