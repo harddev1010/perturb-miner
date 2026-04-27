@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import sys
 from typing import Any
 
@@ -33,7 +34,9 @@ def _verify(llm_endpoint: str, prediction: str, target: str, model: str) -> dict
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Perturb subnet local integration smoke test")
-    parser.add_argument("--image-endpoint", default="http://api.picflux.io/v1/search")
+    parser.add_argument("--image-endpoint", default="https://api.pexels.com/v1/search")
+    parser.add_argument("--pexels-api-key", default="")
+    parser.add_argument("--pexels-image-variant", default="medium")
     parser.add_argument("--llm-endpoint", default="http://127.0.0.1:8081")
     parser.add_argument("--label", default="dog")
     parser.add_argument("--seed", type=int, default=42)
@@ -56,16 +59,42 @@ def main() -> int:
         raise RuntimeError("Expected negative semantic match for tabby cat vs dog")
 
     print("[3/5] Fetch image challenge candidate")
+    pexels_api_key = args.pexels_api_key.strip()
+    if not pexels_api_key:
+        raise RuntimeError("Missing --pexels-api-key")
     params = {
-        "prompt": args.label,
-        "seed": args.seed,
-        "image_size": args.image_size,
-        "random_mode": "true",
+        "query": args.label,
+        "page": 1,
+        "per_page": 10,
     }
-    image_data = _require_ok(requests.get(args.image_endpoint, params=params, timeout=12), "image fetch")
-    image_b64 = str(image_data.get("image_base64", "")).strip()
-    if not image_b64:
-        raise RuntimeError("image endpoint response missing image_base64")
+    image_data = _require_ok(
+        requests.get(
+            args.image_endpoint,
+            params=params,
+            headers={"Authorization": pexels_api_key},
+            timeout=12,
+        ),
+        "pexels search",
+    )
+    photos = image_data.get("photos")
+    if not isinstance(photos, list) or not photos:
+        raise RuntimeError("pexels search returned no photos")
+    src = photos[0].get("src", {}) if isinstance(photos[0], dict) else {}
+    if not isinstance(src, dict):
+        src = {}
+    image_url = (
+        src.get(args.pexels_image_variant)
+        or src.get("medium")
+        or src.get("large")
+        or src.get("original")
+    )
+    if not isinstance(image_url, str) or not image_url.strip():
+        raise RuntimeError("pexels photo src missing usable url")
+    image_response = requests.get(image_url, timeout=12)
+    image_response.raise_for_status()
+    if not image_response.content:
+        raise RuntimeError("downloaded pexels image is empty")
+    image_b64 = base64.b64encode(image_response.content).decode("utf-8")
 
     print("[4/5] Run EfficientNet-B5 inference")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
