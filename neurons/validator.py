@@ -402,6 +402,8 @@ class PerturbValidator:
                 bt.logging.debug(
                     f"Challenge rejected by classifier consistency: pred={predicted_label} expected={effective_prompt}"
                 )
+                bt.logging.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
+                time.sleep(60)
                 continue
 
             return ChallengeSpec(
