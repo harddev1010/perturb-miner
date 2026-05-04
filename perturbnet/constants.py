@@ -32,7 +32,7 @@ def _env_first(names: tuple[str, ...], default: str) -> str:
 
 # Shared subnet identity/constants.
 SUBNET_NAMESPACE = "perturb"
-MODEL_NAME = "EfficientNet-B5"
+MODEL_NAME = "EfficientNetV2-M"
 PROMPTS = (
     "dog",
     "cat",

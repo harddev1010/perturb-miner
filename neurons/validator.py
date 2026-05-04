@@ -19,7 +19,7 @@ import torch
 
 from perturbnet import constants as C
 from perturbnet.image_io import decode_image_b64
-from perturbnet.model import load_efficientnet_b5, normalize_prediction_label, predict_label
+from perturbnet.model import load_efficientnet_v2_m, normalize_prediction_label, predict_label
 from perturbnet.protocol import AttackChallenge
 
 
@@ -135,7 +135,7 @@ class PerturbValidator:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.system_random = random.SystemRandom()
 
-        self.model = load_efficientnet_b5(self.device)
+        self.model = load_efficientnet_v2_m(self.device)
         self.step = 0
         self.last_weight_block = 0
         self.state_path = os.path.join(self.config.logging.logging_dir, C.VALIDATOR_STATE_FILENAME)
