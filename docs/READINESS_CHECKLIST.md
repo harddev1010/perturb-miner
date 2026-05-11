@@ -31,6 +31,7 @@ Use this before long validator uptime tests or mainnet deployment.
   - semantic sanity checks pass
   - EfficientNetV2-M prediction succeeds
   - challenge semantic verification passes
+  - validator logs include `ssim` and `psnr_db` for scored responses
 
 ## 5) Long-Run Reliability
 

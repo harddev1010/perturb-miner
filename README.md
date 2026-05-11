@@ -287,16 +287,25 @@ Miner response field:
 
 Per-response score (if verification passes):
 
-- `perturbation_score = 1 - min(norm / epsilon, 1)`
+- Hard gates:
+  - `min_linf_delta <= norm <= min(epsilon, max_linf_delta)`
+  - `ssim(clean, adv) >= min_ssim`
+  - `psnr_db(clean, adv) >= min_psnr_db`
+  - predicted label must differ from the original label
+- `linf_ratio = clamp((norm - min_linf_delta) / (min(epsilon, max_linf_delta) - min_linf_delta), 0, 1)`
+- `rmse_ratio = clamp(rmse / min(epsilon, max_linf_delta), 0, 1)`
+- `linf_score = (1 - linf_ratio)^2`
+- `rmse_score = (1 - rmse_ratio)^2`
+- `perturbation_score = weighted_avg(linf_score, rmse_score)` using `PERTURB_LINF_COMPONENT_WEIGHT` and `PERTURB_RMSE_COMPONENT_WEIGHT`
 - `speed_score = 1 - min(response_time / timeout, 1)`
-- `final = 0.65 * perturbation_score + 0.35 * speed_score`
+- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score`
 
 Any verification or constraint failure gets `0.0`.
 
 Weight setting:
 
 - Only miners with `processed_count > 100` are weight-eligible
-- Rank bonuses: `50, 30, 10, 5 (ranks 4-10), 3 (remaining)`
+- Emission schedule: top-5 only with fixed shares `62%, 24%, 9%, 4%, 1%` (ranks 6+ receive 0)
 - Final weights combine normalized rolling average and normalized rank bonus, then normalize to sum 1
 
 ## Integration Smoke Test
