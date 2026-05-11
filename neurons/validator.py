@@ -704,30 +704,11 @@ class PerturbValidator:
             rank = rank0 + 1
             rank_to_uid[rank] = uid
 
-        # Top-3 fixed emission.
-        if n_eligible >= 1:
-            emission_raw[rank_to_uid[1]] = 0.50
-        if n_eligible >= 2:
-            emission_raw[rank_to_uid[2]] = 0.30
-        if n_eligible >= 3:
-            emission_raw[rank_to_uid[3]] = 0.10
-
-        # Ranks 4-10 share 5% with inverse-rank decay.
-        start_4_10 = 4
-        end_4_10 = min(10, n_eligible)
-        if end_4_10 >= start_4_10:
-            denom_4_10 = sum((1.0 / r) for r in range(start_4_10, end_4_10 + 1))
-            if denom_4_10 > 0:
-                for r in range(start_4_10, end_4_10 + 1):
-                    emission_raw[rank_to_uid[r]] = float(0.05 * (1.0 / r) / denom_4_10)
-
-        # Ranks 11+ share 5% with inverse-rank decay.
-        start_11 = 11
-        if n_eligible >= start_11:
-            denom_11p = sum((1.0 / r) for r in range(start_11, n_eligible + 1))
-            if denom_11p > 0:
-                for r in range(start_11, n_eligible + 1):
-                    emission_raw[rank_to_uid[r]] = float(0.05 * (1.0 / r) / denom_11p)
+        # Fixed top-5 emission schedule; ranks 6+ intentionally receive zero.
+        top5_shares = (0.62, 0.24, 0.09, 0.04, 0.01)
+        for rank, share in enumerate(top5_shares, start=1):
+            if rank <= n_eligible:
+                emission_raw[rank_to_uid[rank]] = float(share)
 
         # Only miners with positive average score may receive non-zero emissions.
         positive_uids = [uid for uid, avg_score in eligible if avg_score > 0.0]

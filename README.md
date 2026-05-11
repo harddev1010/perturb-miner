@@ -305,7 +305,7 @@ Any verification or constraint failure gets `0.0`.
 Weight setting:
 
 - Only miners with `processed_count > 100` are weight-eligible
-- Rank bonuses: `50, 30, 10, 5 (ranks 4-10), 3 (remaining)`
+- Emission schedule: top-5 only with fixed shares `62%, 24%, 9%, 4%, 1%` (ranks 6+ receive 0)
 - Final weights combine normalized rolling average and normalized rank bonus, then normalize to sum 1
 
 ## Integration Smoke Test
