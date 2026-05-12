@@ -335,10 +335,12 @@ class PerturbValidator:
             entity = str(getattr(self.config.perturb, "wandb_entity", "")).strip()
             run_name = str(getattr(self.config.perturb, "wandb_run_name", "")).strip()
             mode = str(getattr(self.config.perturb, "wandb_mode", "online")).strip() or "online"
+            if not run_name:
+                uid_suffix = self._resolve_validator_uid_for_run_name()
+                run_name = f"{time.strftime('%Y%m%d-%H%M%S')}-uid{uid_suffix}"
             if entity:
                 init_kwargs["entity"] = entity
-            if run_name:
-                init_kwargs["name"] = run_name
+            init_kwargs["name"] = run_name
             init_kwargs["mode"] = mode
             self.wandb_run = wandb.init(**init_kwargs)
             self._attach_wandb_console_handler()
@@ -346,6 +348,15 @@ class PerturbValidator:
         except Exception as exc:
             bt.logging.warning(f"Failed to initialize W&B logging: {exc}")
             self.wandb_run = None
+
+    def _resolve_validator_uid_for_run_name(self) -> str:
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "") or "")
+        try:
+            if hotkey and hotkey in self.metagraph.hotkeys:
+                return str(self.metagraph.hotkeys.index(hotkey))
+        except Exception:
+            pass
+        return "unknown"
 
     def _attach_wandb_console_handler(self) -> None:
         if not bool(getattr(self.config.perturb, "wandb_log_console", True)):
