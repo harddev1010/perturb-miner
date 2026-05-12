@@ -10,6 +10,7 @@ import math
 import os
 import random
 import time
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -39,6 +40,8 @@ class ChallengeSpec:
     epsilon: float
     norm_type: str
     timeout_seconds: int
+    fallback_used: bool = False
+    verified_by_llm: bool = True
 
 
 @dataclass
@@ -206,6 +209,9 @@ class PerturbValidator:
         self.state_path = os.path.join(self.config.logging.logging_dir, C.VALIDATOR_STATE_FILENAME)
         self.wandb_run: Any | None = None
         self._wandb_console_handler: pylogging.Handler | None = None
+        hotkey = getattr(self.wallet.hotkey, "ss58_address", "unknown")
+        self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
+        self.reason_counts_total: Counter[str] = Counter()
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
@@ -220,6 +226,13 @@ class PerturbValidator:
             bt.logging.info(f"{step_name} {rendered}")
         else:
             bt.logging.info(step_name)
+
+    def _log_summary(self, event: str, **context: Any) -> None:
+        if context:
+            rendered = " ".join([f"{k}={v}" for k, v in context.items()])
+            bt.logging.info(f"[run_id={self.run_id}] {event} {rendered}")
+        else:
+            bt.logging.info(f"[run_id={self.run_id}] {event}")
 
     def sync(self) -> None:
         old_n = int(self.metagraph.n)
@@ -519,12 +532,14 @@ class PerturbValidator:
                 self._log_step_start("challenge_fetch_image", prompt=chosen_prompt, seed=seed)
                 image_b64 = self._fetch_image_for_prompt(prompt=chosen_prompt, seed=seed)
                 effective_prompt = chosen_prompt
+                used_fallback = False
             except Exception as exc:
                 bt.logging.warning(f"Challenge image fetch failed ({exc}), using fallback dog image.")
                 try:
                     self._log_step_start("challenge_load_fallback_image", label=C.FALLBACK_LABEL)
                     image_b64 = self._load_fallback_image_b64()
                     effective_prompt = C.FALLBACK_LABEL
+                    used_fallback = True
                 except Exception as fallback_exc:
                     bt.logging.warning(f"Fallback image load failed, retrying: {fallback_exc}")
                     continue
@@ -563,6 +578,8 @@ class PerturbValidator:
                 epsilon=epsilon,
                 norm_type="Linf",
                 timeout_seconds=self.config.perturb.timeout_seconds,
+                fallback_used=used_fallback,
+                verified_by_llm=True,
             )
 
         raise RuntimeError("Unable to build a validated challenge after max attempts")
@@ -862,6 +879,15 @@ class PerturbValidator:
             bt.logging.info(
                 f"rank={rank} uid={uid} avg100={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
             )
+        top_weight_items: list[str] = []
+        for rank, (uid, avg_score) in enumerate(eligible[:5], start=1):
+            top_weight_items.append(f"r{rank}:uid{uid}:avg={avg_score:.4f}:w={normalized[uid]:.4f}")
+        self._log_summary(
+            "weights_summary",
+            eligible=n_eligible,
+            distributed=min(5, n_eligible),
+            top5="|".join(top_weight_items) if top_weight_items else "none",
+        )
 
         uids = list(range(len(normalized)))
         weights = [float(v) for v in normalized.tolist()]
@@ -890,6 +916,20 @@ class PerturbValidator:
 
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
         bt.logging.info(f"Validator started with tempo={tempo}")
+        self._log_summary(
+            "validator_config",
+            timeout=self.config.perturb.timeout_seconds,
+            k_miners=self.config.perturb.k_miners,
+            history_size=self.config.perturb.history_size,
+            min_processed=self.config.perturb.min_processed_count,
+            min_linf=self.config.perturb.min_linf_delta,
+            max_linf=self.config.perturb.max_linf_delta,
+            min_ssim=self.config.perturb.min_ssim,
+            min_psnr_db=self.config.perturb.min_psnr_db,
+            perturb_weight=C.PERTURBATION_WEIGHT,
+            speed_weight=C.SPEED_WEIGHT,
+            run_id=self.run_id,
+        )
 
         while True:
             try:
@@ -901,6 +941,15 @@ class PerturbValidator:
                 challenge = self.generate_challenge(block=block)
                 bt.logging.info(
                     f"Challenge task={challenge.task_id} prompt={challenge.prompt} eps={challenge.epsilon:.4f}"
+                )
+                self._log_summary(
+                    "challenge_summary",
+                    task_id=challenge.task_id,
+                    prompt=challenge.prompt,
+                    epsilon=f"{challenge.epsilon:.4f}",
+                    true_label=challenge.true_label,
+                    llm_verified=challenge.verified_by_llm,
+                    fallback_used=challenge.fallback_used,
                 )
 
                 self._log_step_start("loop_discover_miners")
@@ -945,16 +994,36 @@ class PerturbValidator:
                     score = float(result.score)
                     rewards.append(score)
                     results_by_uid.append((uid, result))
+                    self.reason_counts_total[result.reason] += 1
                     bt.logging.info(
                         f"uid={uid} status={status_code} score={score:.6f} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
-                        f"reason={result.reason} model_prediction={result.model_prediction} "
+                        f"reason={result.reason} "
                         f"norm={result.norm:.6f} rmse={result.rmse:.6f} epsilon={result.epsilon:.6f} "
                         f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f}"
                     )
 
                 self._log_step_start("loop_update_histories")
                 self._update_histories(miner_uids, rewards)
+                reason_counts = Counter(result.reason for _, result in results_by_uid)
+                success_count = int(reason_counts.get("success", 0))
+                avg_score = float(sum(rewards) / max(1, len(rewards)))
+                max_score = float(max(rewards)) if rewards else 0.0
+                min_score = float(min(rewards)) if rewards else 0.0
+                avg_norm = float(sum(result.norm for _, result in results_by_uid) / max(1, len(results_by_uid)))
+                avg_rmse = float(sum(result.rmse for _, result in results_by_uid) / max(1, len(results_by_uid)))
+                self._log_summary(
+                    "loop_summary",
+                    block=block,
+                    selected=len(miner_uids),
+                    success=f"{success_count}/{len(results_by_uid)}",
+                    avg_score=f"{avg_score:.4f}",
+                    min_score=f"{min_score:.4f}",
+                    max_score=f"{max_score:.4f}",
+                    avg_norm=f"{avg_norm:.5f}",
+                    avg_rmse=f"{avg_rmse:.5f}",
+                    reasons=",".join([f"{k}:{v}" for k, v in sorted(reason_counts.items())]),
+                )
                 
                 self._log_step_start("loop_save_state")
                 self._save_state()
@@ -970,12 +1039,20 @@ class PerturbValidator:
                 time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
                 bt.logging.info("Validator stopped by user.")
+                self._log_summary(
+                    "reason_totals",
+                    counts=",".join([f"{k}:{v}" for k, v in sorted(self.reason_counts_total.items())]),
+                )
                 break
             except Exception as exc:
                 bt.logging.error(f"Validator loop error: {exc}")
                 time.sleep(5)
         if not self._query_loop.is_closed():
             self._query_loop.close()
+        self._log_summary(
+            "reason_totals",
+            counts=",".join([f"{k}:{v}" for k, v in sorted(self.reason_counts_total.items())]),
+        )
         self._finish_wandb()
 
 
