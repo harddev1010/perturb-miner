@@ -212,6 +212,7 @@ class PerturbValidator:
         hotkey = getattr(self.wallet.hotkey, "ss58_address", "unknown")
         self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
         self.reason_counts_total: Counter[str] = Counter()
+        self.miner_emission_share = 1
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
@@ -838,11 +839,9 @@ class PerturbValidator:
             rank = rank0 + 1
             rank_to_uid[rank] = uid
 
-        # Fixed top-5 emission schedule; ranks 6+ intentionally receive zero.
-        top5_shares = (0.62, 0.24, 0.09, 0.04, 0.01)
-        for rank, share in enumerate(top5_shares, start=1):
-            if rank <= n_eligible:
-                emission_raw[rank_to_uid[rank]] = float(share)
+        # Winner-take-all: top ranked eligible miner gets full miner emission allocation.
+        if n_eligible >= 1:
+            emission_raw[rank_to_uid[1]] = 1.0
 
         # Only miners with positive average score may receive non-zero emissions.
         positive_uids = [uid for uid, avg_score in eligible if avg_score > 0.0]
@@ -900,8 +899,15 @@ class PerturbValidator:
             top5="|".join(top_weight_items) if top_weight_items else "none",
         )
 
-        uids = list(range(len(normalized)))
-        weights = [float(v) for v in normalized.tolist()]
+        # Scale miner emissions by configured share; route remainder to uid 0.
+        miner_share = float(min(max(self.miner_emission_share, 0.0), 1.0))
+        scaled = normalized * miner_share
+        remainder = 1.0 - miner_share
+        if len(scaled) > 0:
+            scaled[0] = remainder
+
+        uids = list(range(len(scaled)))
+        weights = [float(v) for v in scaled.tolist()]
         ok, msg = self.subtensor.set_weights(
             wallet=self.wallet,
             netuid=self.config.netuid,
