@@ -995,7 +995,14 @@ class PerturbValidator:
                     )
 
                 self._log_step_start("loop_update_histories")
-                self._update_histories(miner_uids, rewards)
+                all_zero_scores = bool(rewards) and all(score <= 0.0 for score in rewards)
+                if all_zero_scores:
+                    logger.warning(
+                        "Skipping history update because all selected miner scores are zero "
+                        f"(block={block}, selected={len(miner_uids)})."
+                    )
+                else:
+                    self._update_histories(miner_uids, rewards)
                 reason_counts = Counter(result.reason for _, result in results_by_uid)
                 success_count = int(reason_counts.get("success", 0))
                 avg_score = float(sum(rewards) / max(1, len(rewards)))
