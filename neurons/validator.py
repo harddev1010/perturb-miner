@@ -815,9 +815,11 @@ class PerturbValidator:
             rank = rank0 + 1
             rank_to_uid[rank] = uid
 
-        # Winner-take-all: top ranked eligible miner gets full miner emission allocation.
-        if n_eligible >= 1:
-            emission_raw[rank_to_uid[1]] = 1.0
+        # Fixed top-3 emission schedule; ranks 4+ intentionally receive zero.
+        top3_shares = (0.70, 0.29, 0.01)
+        for rank, share in enumerate(top3_shares, start=1):
+            if rank <= n_eligible:
+                emission_raw[rank_to_uid[rank]] = float(share)
 
         # Only miners with positive average score may receive non-zero emissions.
         positive_uids = [uid for uid, avg_score in eligible if avg_score > 0.0]
