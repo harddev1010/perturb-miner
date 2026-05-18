@@ -51,6 +51,7 @@ class EvaluationResult:
     score: float
     reason: str
     model_prediction: str = ""
+    response_time_ms: int = 0
     norm: float = 0.0
     rmse: float = 0.0
     epsilon: float = 0.0
@@ -200,13 +201,13 @@ class PerturbValidator:
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
             rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            logger.info(f"{step_name} {rendered}")
+            logger.debug(f"{step_name} {rendered}")
         else:
-            logger.info(step_name)
+            logger.debug(step_name)
 
     def _log_summary(self, event: str, **context: Any) -> None:
         if context:
-            rendered = " ".join([f"{k}={v}" for k, v in context.items()])
+            rendered = " ".join([f"{k}={context[k]}" for k in sorted(context.keys())])
             logger.info(f"[run_id={self.run_id}] {event} {rendered}")
         else:
             logger.info(f"[run_id={self.run_id}] {event}")
@@ -509,12 +510,16 @@ class PerturbValidator:
         for attempt in range(self.config.perturb.max_challenge_attempts):
             seed = base_seed + attempt
             chosen_prompt = self._choose_prompt(seed)
-            logger.info(f"Selected category: {chosen_prompt}")
-            self._log_step_start(
+            self._log_summary(
                 "challenge_attempt",
                 attempt=attempt + 1,
-                seed=seed,
+                max_attempts=self.config.perturb.max_challenge_attempts,
                 prompt=chosen_prompt,
+                seed=seed,
+            )
+            self._log_step_start(
+                "challenge_attempt_internal",
+                attempt=attempt + 1,
             )
             try:
                 self._log_step_start("challenge_fetch_image", prompt=chosen_prompt, seed=seed)
@@ -541,16 +546,14 @@ class PerturbValidator:
                 image = decode_image_b64(image_b64).to(self.device)
                 predicted = predict_label(self.model, image)
                 predicted_label = normalize_prediction_label(predicted)
-                logger.info(f"Output label: {predicted_label}")
+                self._log_summary("challenge_model_output", predicted_label=predicted_label)
             except Exception as exc:
                 logger.warning(f"Challenge decode/model validation failed, retrying: {exc}")
                 continue
 
             # Verify the candidate by semantically checking model output against the API prompt label.
             verify_ok = self._llm_endpoint_check(predicted_label, effective_prompt)
-            logger.info(
-                f"verify-label passed={verify_ok}"
-            )
+            self._log_summary("challenge_llm_verify", passed=verify_ok)
             if not verify_ok:
                 logger.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
                 time.sleep(60)
@@ -714,27 +717,26 @@ class PerturbValidator:
         perturbed_image_b64: str,
         response_time_ms: int,
     ) -> EvaluationResult:
-        self._log_step_start(
-            "verify_and_score",
-            task_id=challenge.task_id,
-            response_time_ms=response_time_ms,
-        )
         try:
             x_clean = decode_image_b64(challenge.clean_image_b64).to(self.device)
             x_adv = decode_image_b64(perturbed_image_b64).to(self.device)
         except Exception as exc:
-            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}")
+            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}", response_time_ms=response_time_ms)
 
         if x_adv.shape != x_clean.shape:
-            return EvaluationResult(score=0.0, reason="shape_mismatch")
+            return EvaluationResult(score=0.0, reason="shape_mismatch", response_time_ms=response_time_ms)
         if x_adv.min().item() < 0.0 or x_adv.max().item() > 1.0:
-            return EvaluationResult(score=0.0, reason="value_out_of_range")
+            return EvaluationResult(score=0.0, reason="value_out_of_range", response_time_ms=response_time_ms)
 
         prediction = ""
         try:
             prediction = predict_label(self.model, x_adv)
         except Exception as exc:
-            return EvaluationResult(score=0.0, reason=f"model_inference_failed:{exc}")
+            return EvaluationResult(
+                score=0.0,
+                reason=f"model_inference_failed:{exc}",
+                response_time_ms=response_time_ms,
+            )
 
         if challenge.norm_type == "Linf":
             norm = (x_adv - x_clean).abs().max().item()
@@ -748,6 +750,7 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_delta",
                 model_prediction=prediction,
+                response_time_ms=response_time_ms,
                 norm=float(norm),
                 epsilon=float(challenge.epsilon),
             )
@@ -757,6 +760,7 @@ class PerturbValidator:
                 score=0.0,
                 reason="above_max_delta",
                 model_prediction=prediction,
+                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
@@ -769,6 +773,7 @@ class PerturbValidator:
                 score=0.0,
                 reason="label_match_with_original",
                 model_prediction=normalized_prediction,
+                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
@@ -783,6 +788,7 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_ssim",
                 model_prediction=normalized_prediction,
+                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
@@ -796,6 +802,7 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_psnr_db",
                 model_prediction=normalized_prediction,
+                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
@@ -825,6 +832,7 @@ class PerturbValidator:
             score=float(score),
             reason="success",
             model_prediction=normalized_prediction,
+            response_time_ms=response_time_ms,
             norm=float(norm),
             rmse=float(rmse),
             epsilon=float(challenge.epsilon),
@@ -916,19 +924,19 @@ class PerturbValidator:
         normalized = np.zeros(int(self.metagraph.n), dtype=np.float32)
         for uid in positive_uids:
             normalized[uid] = float(emission_raw[uid]) / active_emission_total
-        for rank0, (uid, avg_score) in enumerate(eligible):
+        for rank0, (uid, avg_score) in enumerate(eligible[:10]):
             rank = rank0 + 1
-            logger.info(
-                f"rank={rank} uid={uid} avg100={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
+            logger.debug(
+                f"rank={rank} uid={uid} avg_score={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
             )
         top_weight_items: list[str] = []
-        for rank, (uid, avg_score) in enumerate(eligible[:5], start=1):
+        for rank, (uid, avg_score) in enumerate(eligible[:10], start=1):
             top_weight_items.append(f"r{rank}:uid{uid}:avg={avg_score:.4f}:w={normalized[uid]:.4f}")
         self._log_summary(
             "weights_summary",
             eligible=n_eligible,
-            distributed=min(5, n_eligible),
-            top5="|".join(top_weight_items) if top_weight_items else "none",
+            distributed=min(10, n_eligible),
+            top10="|".join(top_weight_items) if top_weight_items else "none",
         )
 
         # Scale miner emissions by configured share; route remainder to uid 0.
@@ -960,7 +968,6 @@ class PerturbValidator:
             raise RuntimeError("Validator hotkey is not registered on this netuid.")
 
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
-        logger.info(f"Validator started with tempo={tempo}")
         self._log_summary(
             "validator_config",
             timeout=self.config.perturb.timeout_seconds,
@@ -973,6 +980,7 @@ class PerturbValidator:
             min_psnr_db=self.config.perturb.min_psnr_db,
             perturb_weight=C.PERTURBATION_WEIGHT,
             speed_weight=C.SPEED_WEIGHT,
+            tempo=tempo,
             run_id=self.run_id,
         )
 
@@ -984,9 +992,6 @@ class PerturbValidator:
                 block = self.subtensor.get_current_block()
                 self._log_step_start("loop_generate_challenge", block=block)
                 challenge = self.generate_challenge(block=block)
-                logger.info(
-                    f"Challenge task={challenge.task_id} prompt={challenge.prompt} eps={challenge.epsilon:.4f}"
-                )
                 self._log_summary(
                     "challenge_summary",
                     task_id=challenge.task_id,
@@ -1010,8 +1015,11 @@ class PerturbValidator:
                     logger.warning("Miner selection is empty")
                     time.sleep(self.config.perturb.query_interval_seconds)
                     continue
-                logger.info(
-                    f"Selected {len(miner_uids)} miners (valuable pool={len(valuable_uids)}, total pool={len(available_uids)})"
+                self._log_summary(
+                    "miner_selection",
+                    selected=len(miner_uids),
+                    valuable_pool=len(valuable_uids),
+                    total_pool=len(available_uids),
                 )
 
                 self._log_step_start("loop_query_miners", selected_count=len(miner_uids))
@@ -1019,6 +1027,7 @@ class PerturbValidator:
                 self._log_step_start("loop_score_responses", response_count=len(responses))
                 rewards: list[float] = []
                 results_by_uid: list[tuple[int, EvaluationResult]] = []
+                response_log_lines: list[str] = []
                 for uid, response in zip(miner_uids, responses):
                     status_code = getattr(response.dendrite, "status_code", 0) if response.dendrite else 0
                     process_time = getattr(response.dendrite, "process_time", None) if response.dendrite else None
@@ -1029,6 +1038,7 @@ class PerturbValidator:
                             score=0.0,
                             reason="response_missing_or_status_error",
                             model_prediction="unavailable",
+                            response_time_ms=response_time_ms,
                         )
                     else:
                         result = self.verify_and_score(
@@ -1040,42 +1050,49 @@ class PerturbValidator:
                     rewards.append(score)
                     results_by_uid.append((uid, result))
                     self.reason_counts_total[result.reason] += 1
-                    logger.info(
+                    response_log_lines.append(
                         f"uid={uid} status={status_code} score={score:.6f} "
+                        f"response_time_ms={result.response_time_ms} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} "
                         f"norm={result.norm:.6f} rmse={result.rmse:.6f} epsilon={result.epsilon:.6f} "
                         f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f}"
                     )
 
-                self._log_step_start("loop_update_histories")
                 all_zero_scores = bool(rewards) and all(score <= 0.0 for score in rewards)
+
+                self._log_step_start("loop_update_histories")
                 if all_zero_scores:
                     logger.warning(
                         "Skipping history update because all selected miner scores are zero "
                         f"(block={block}, selected={len(miner_uids)})."
                     )
                 else:
+                    if response_log_lines:
+                        logger.info(
+                            f"miner_response_evaluations block={block} count={len(response_log_lines)}\n"
+                            + "\n".join(response_log_lines)
+                        )
                     self._update_histories(miner_uids, rewards)
-                reason_counts = Counter(result.reason for _, result in results_by_uid)
-                success_count = int(reason_counts.get("success", 0))
-                avg_score = float(sum(rewards) / max(1, len(rewards)))
-                max_score = float(max(rewards)) if rewards else 0.0
-                min_score = float(min(rewards)) if rewards else 0.0
-                avg_norm = float(sum(result.norm for _, result in results_by_uid) / max(1, len(results_by_uid)))
-                avg_rmse = float(sum(result.rmse for _, result in results_by_uid) / max(1, len(results_by_uid)))
-                self._log_summary(
-                    "loop_summary",
-                    block=block,
-                    selected=len(miner_uids),
-                    success=f"{success_count}/{len(results_by_uid)}",
-                    avg_score=f"{avg_score:.4f}",
-                    min_score=f"{min_score:.4f}",
-                    max_score=f"{max_score:.4f}",
-                    avg_norm=f"{avg_norm:.5f}",
-                    avg_rmse=f"{avg_rmse:.5f}",
-                    reasons=",".join([f"{k}:{v}" for k, v in sorted(reason_counts.items())]),
-                )
+                    reason_counts = Counter(result.reason for _, result in results_by_uid)
+                    success_count = int(reason_counts.get("success", 0))
+                    avg_score = float(sum(rewards) / max(1, len(rewards)))
+                    max_score = float(max(rewards)) if rewards else 0.0
+                    min_score = float(min(rewards)) if rewards else 0.0
+                    avg_norm = float(sum(result.norm for _, result in results_by_uid) / max(1, len(results_by_uid)))
+                    avg_rmse = float(sum(result.rmse for _, result in results_by_uid) / max(1, len(results_by_uid)))
+                    self._log_summary(
+                        "loop_summary",
+                        block=block,
+                        selected=len(miner_uids),
+                        success=f"{success_count}/{len(results_by_uid)}",
+                        avg_score=f"{avg_score:.4f}",
+                        min_score=f"{min_score:.4f}",
+                        max_score=f"{max_score:.4f}",
+                        avg_norm=f"{avg_norm:.5f}",
+                        avg_rmse=f"{avg_rmse:.5f}",
+                        reasons=",".join([f"{k}:{v}" for k, v in sorted(reason_counts.items())]),
+                    )
                 
                 self._log_step_start("loop_save_state")
                 self._save_state()
@@ -1091,20 +1108,12 @@ class PerturbValidator:
                 time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
                 logger.info("Validator stopped by user.")
-                self._log_summary(
-                    "reason_totals",
-                    counts=",".join([f"{k}:{v}" for k, v in sorted(self.reason_counts_total.items())]),
-                )
                 break
             except Exception as exc:
                 logger.error(f"Validator loop error: {exc}")
                 time.sleep(5)
         if not self._query_loop.is_closed():
             self._query_loop.close()
-        self._log_summary(
-            "reason_totals",
-            counts=",".join([f"{k}:{v}" for k, v in sorted(self.reason_counts_total.items())]),
-        )
         self._finish_wandb()
 
 
