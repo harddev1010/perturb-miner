@@ -574,14 +574,68 @@ class PerturbValidator:
 
     def _available_miner_uids(self) -> list[int]:
         my_hotkey = self.wallet.hotkey.ss58_address
-        uids: list[int] = []
+        candidate_uids: list[int] = []
         for uid in range(int(self.metagraph.n)):
             if self.metagraph.hotkeys[uid] == my_hotkey:
                 continue
             if self.metagraph.axons[uid].ip == "0.0.0.0":
                 continue
-            uids.append(uid)
-        return uids
+            candidate_uids.append(uid)
+
+        if len(candidate_uids) <= 1:
+            return candidate_uids
+
+        # Merge miners that likely belong to the same operator:
+        # - same coldkey OR same axon ip
+        # Keep only the lowest uid representative from each merged group.
+        parent: dict[int, int] = {uid: uid for uid in candidate_uids}
+
+        def _find(uid: int) -> int:
+            while parent[uid] != uid:
+                parent[uid] = parent[parent[uid]]
+                uid = parent[uid]
+            return uid
+
+        def _union(a: int, b: int) -> None:
+            ra = _find(a)
+            rb = _find(b)
+            if ra == rb:
+                return
+            if ra < rb:
+                parent[rb] = ra
+            else:
+                parent[ra] = rb
+
+        first_uid_by_coldkey: dict[str, int] = {}
+        first_uid_by_ip: dict[str, int] = {}
+        coldkeys = getattr(self.metagraph, "coldkeys", [])
+        for uid in candidate_uids:
+            coldkey = ""
+            if uid < len(coldkeys):
+                coldkey = str(coldkeys[uid] or "").strip()
+            if coldkey:
+                seen_uid = first_uid_by_coldkey.get(coldkey)
+                if seen_uid is None:
+                    first_uid_by_coldkey[coldkey] = uid
+                else:
+                    _union(seen_uid, uid)
+
+            ip = str(getattr(self.metagraph.axons[uid], "ip", "") or "").strip()
+            if ip:
+                seen_uid = first_uid_by_ip.get(ip)
+                if seen_uid is None:
+                    first_uid_by_ip[ip] = uid
+                else:
+                    _union(seen_uid, uid)
+
+        min_uid_by_group: dict[int, int] = {}
+        for uid in candidate_uids:
+            root = _find(uid)
+            current_min = min_uid_by_group.get(root)
+            if current_min is None or uid < current_min:
+                min_uid_by_group[root] = uid
+
+        return sorted(min_uid_by_group.values())
 
     def _valuable_miner_uids(self, candidate_uids: Sequence[int]) -> list[int]:
         min_processed = int(self.config.perturb.min_processed_count)
@@ -1091,4 +1145,4 @@ def build_config() -> bt.config:
 if __name__ == "__main__":
     validator = PerturbValidator(config=build_config())
     validator.run()
-
+    
