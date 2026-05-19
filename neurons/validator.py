@@ -1074,6 +1074,10 @@ class PerturbValidator:
                             + "\n".join(response_log_lines)
                         )
                     self._update_histories(miner_uids, rewards)
+                    available_uid_set = set(available_uids)
+                    unavailable_all_uids = [uid for uid in range(int(self.metagraph.n)) if uid not in available_uid_set]
+                    if unavailable_all_uids:
+                        self._update_histories(unavailable_all_uids, [0.0] * len(unavailable_all_uids))
                     reason_counts = Counter(result.reason for _, result in results_by_uid)
                     success_count = int(reason_counts.get("success", 0))
                     avg_score = float(sum(rewards) / max(1, len(rewards)))
