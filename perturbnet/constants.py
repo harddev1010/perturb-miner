@@ -41,26 +41,25 @@ def _env_first(names: tuple[str, ...], default: str) -> str:
 SUBNET_NAMESPACE = "perturb"
 MODEL_NAME = "EfficientNetV2-L"
 PROMPTS = (
-    "dog",
-    "cat",
-    "bird",
-    "fish",
-    "reptile",
-    "amphibian",
-    "insect",
-    "arachnid",
-    "crustacean",
-    "mollusk",
-    "primate",
-    "rodent",
-    "rabbit",
-    "equine",
-    "bovine",
-    "ovine",
-    "caprine",
-    "porcine",
-    "ungulate",
-    "marine_mammal",
+    # ── Animals ──────────────────────────────────────────
+    "dog", "cat", "bird", "fish", "snake", "frog", "butterfly",
+    "spider", "crab", "jellyfish", "monkey", "hamster", "rabbit",
+    "horse", "cow", "sheep", "elephant", "lion", "tiger", "bear",
+    # ── Vehicles ──────────────────────────────────────────
+    "sports car", "truck", "bus", "motorcycle", "bicycle", "airplane",
+    "helicopter", "sailboat", "canoe", "train",
+    # ── Food ──────────────────────────────────────────────
+    "banana", "strawberry", "orange", "broccoli", "mushroom", "pizza",
+    "cheeseburger", "ice cream", "coffee mug", "wine bottle",
+    # ── Everyday Objects ──────────────────────────────────
+    "chair", "lamp", "clock", "backpack", "umbrella", "sunglasses",
+    "shoe", "hat", "vase", "television",
+    # ── Electronics & Instruments ─────────────────────────
+    "keyboard", "mouse", "camera", "guitar", "drum", "violin",
+    "telescope", "microscope",
+    # ── Sports & Recreation ───────────────────────────────
+    "soccer ball", "basketball", "tennis ball", "baseball bat",
+    "skateboard", "surfboard", "parachute",
 )
 
 # Validator runtime state files.
