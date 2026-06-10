@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import io
 import os
 import sys
 from pathlib import Path
@@ -31,7 +32,7 @@ def _load_manifest_images(manifest_path: Path, root: Path) -> list[Path]:
     return paths
 
 
-def _first_imagenet100_image(root: Path, manifest: Path | None) -> Path:
+def _first_local_image(root: Path, manifest: Path | None) -> Path:
     if manifest is not None:
         image_paths = _load_manifest_images(manifest_path=manifest, root=root)
     else:
@@ -48,35 +49,31 @@ def _first_imagenet100_image(root: Path, manifest: Path | None) -> Path:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Perturb subnet local integration smoke test")
-    parser.add_argument("--imagenet100-root", default=os.getenv("PERTURB_IMAGENET100_ROOT", "assets/imagenet-100"))
+    parser.add_argument("--imagenet100-root", default=os.getenv("PERTURB_IMAGENET100_ROOT", ""))
     parser.add_argument("--imagenet100-manifest", default=os.getenv("PERTURB_IMAGENET100_MANIFEST", ""))
     parser.add_argument("--imagenet100-repo-id", default=os.getenv("PERTURB_IMAGENET100_REPO_ID", "clane9/imagenet-100"))
     parser.add_argument("--imagenet100-split", default=os.getenv("PERTURB_IMAGENET100_SPLIT", "train"))
-    parser.add_argument("--imagenet100-max-images", type=int, default=int(os.getenv("PERTURB_IMAGENET100_MAX_IMAGES", "5000")))
-    parser.add_argument("--imagenet100-min-images", type=int, default=int(os.getenv("PERTURB_IMAGENET100_MIN_IMAGES", "1000")))
-    parser.add_argument("--skip-imagenet100-bootstrap", action="store_true")
     args = parser.parse_args()
 
     print("[1/3] Load ImageNet-100 challenge candidate")
-    root = _resolve_path(args.imagenet100_root)
     manifest = _resolve_path(args.imagenet100_manifest) if args.imagenet100_manifest.strip() else None
-    if manifest is None and not args.skip_imagenet100_bootstrap:
-        from perturbnet.imagenet100_bootstrap import bootstrap_imagenet100
+    if args.imagenet100_root.strip() or manifest is not None:
+        root = _resolve_path(args.imagenet100_root or "assets/imagenet-100")
+        image_path = _first_local_image(root=root, manifest=manifest)
+        image_bytes = image_path.read_bytes()
+        if not image_bytes:
+            raise RuntimeError(f"ImageNet-100 image is empty: {image_path}")
+        print(f"  image={image_path}")
+    else:
+        from perturbnet.imagenet100_bootstrap import load_imagenet100
 
-        bootstrap_imagenet100(
-            root=root,
-            repo_id=args.imagenet100_repo_id,
-            split=args.imagenet100_split,
-            max_images=max(1, args.imagenet100_max_images),
-            min_images=max(1, args.imagenet100_min_images),
-            force=False,
-        )
-    image_path = _first_imagenet100_image(root=root, manifest=manifest)
-    image_bytes = image_path.read_bytes()
-    if not image_bytes:
-        raise RuntimeError(f"ImageNet-100 image is empty: {image_path}")
+        dataset = load_imagenet100(repo_id=args.imagenet100_repo_id, split=args.imagenet100_split)
+        example = dataset[0]
+        buffer = io.BytesIO()
+        example["image"].convert("RGB").save(buffer, format="JPEG", quality=95)
+        image_bytes = buffer.getvalue()
+        print(f"  dataset rows={int(dataset.num_rows)} sample=row 0")
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    print(f"  image={image_path}")
 
     print("[2/3] Run EfficientNetV2-L inference")
     import torch
@@ -103,8 +100,8 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"Smoke test failed: {exc}", file=sys.stderr)
         exit_code = 1
-    # Hard-exit: pyarrow/datasets streaming can leave non-joinable IO threads
-    # that deadlock normal interpreter shutdown after a partial stream read.
+    # Hard-exit: pyarrow/datasets can leave non-joinable IO threads that
+    # deadlock normal interpreter shutdown.
     sys.stdout.flush()
     sys.stderr.flush()
     os._exit(exit_code)

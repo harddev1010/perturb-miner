@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging as pylogging
 import math
@@ -37,14 +38,11 @@ _SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 class ChallengeSpec:
     task_id: str
     model_name: str
-    prompt: str
     clean_image_b64: str
     true_label: str
     epsilon: float
     norm_type: str
     timeout_seconds: int
-    fallback_used: bool = False
-    verified_by_llm: bool = True
 
 
 @dataclass
@@ -191,12 +189,14 @@ class PerturbValidator:
         self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
         self.reason_counts_total: Counter[str] = Counter()
         self.miner_emission_share = 1
-        self.recent_challenge_image_ids: list[str] = []
-        self.imagenet100_order_ids: list[str] = []
+        self.imagenet100_order_seed = 0
         self.imagenet100_order_cursor = 0
         self.imagenet100_order_fingerprint = ""
         self.imagenet100_order_epoch = 0
-        self._imagenet100_index: list[tuple[str, Path]] = []
+        self._imagenet100_index: list[tuple[str, Any]] = []
+        self._imagenet100_dataset: Any | None = None
+        self._imagenet100_order_cache: list[str] = []
+        self._imagenet100_order_cache_key: tuple[str, int] = ("", 0)
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
@@ -260,8 +260,13 @@ class PerturbValidator:
     def _load_state(self) -> None:
         if not os.path.exists(self.state_path):
             return
-        with open(self.state_path, "r", encoding="utf-8") as handle:
-            state = json.load(handle)
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except Exception as exc:
+            # Saves are atomic, so this should never happen; never brick startup on it.
+            logger.error(f"Validator state file is unreadable, starting fresh: {self.state_path} ({exc})")
+            return
         self.step = int(state.get("step", 0))
         self.last_weight_block = int(state.get("last_weight_block", 0))
 
@@ -284,20 +289,7 @@ class PerturbValidator:
                 value = saved_hotkeys[idx]
                 if isinstance(value, str):
                     self.uid_hotkeys[idx] = value
-        saved_recent_images = state.get("recent_challenge_image_ids", [])
-        if isinstance(saved_recent_images, list):
-            self.recent_challenge_image_ids = [
-                str(value)
-                for value in saved_recent_images
-                if isinstance(value, str) and value.strip()
-            ][-1000:]
-        saved_order_ids = state.get("imagenet100_order_ids", [])
-        if isinstance(saved_order_ids, list):
-            self.imagenet100_order_ids = [
-                str(value)
-                for value in saved_order_ids
-                if isinstance(value, str) and value.strip()
-            ]
+        self.imagenet100_order_seed = max(0, int(state.get("imagenet100_order_seed", 0)))
         self.imagenet100_order_cursor = max(0, int(state.get("imagenet100_order_cursor", 0)))
         self.imagenet100_order_fingerprint = str(state.get("imagenet100_order_fingerprint", "") or "")
         self.imagenet100_order_epoch = max(0, int(state.get("imagenet100_order_epoch", 0)))
@@ -313,13 +305,19 @@ class PerturbValidator:
             "processed_counts": self.processed_counts.tolist(),
             "score_histories": [history[-self.config.perturb.history_size :] for history in self.score_histories],
             "uid_hotkeys": self.uid_hotkeys,
-            "imagenet100_order_ids": self.imagenet100_order_ids,
+            "imagenet100_order_seed": int(self.imagenet100_order_seed),
             "imagenet100_order_cursor": int(self.imagenet100_order_cursor),
             "imagenet100_order_fingerprint": self.imagenet100_order_fingerprint,
             "imagenet100_order_epoch": int(self.imagenet100_order_epoch),
         }
-        with open(self.state_path, "w", encoding="utf-8") as handle:
+        # Atomic write: a crash mid-save must never corrupt the state file,
+        # otherwise a restart could reset the traversal and repeat images.
+        tmp_path = f"{self.state_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self.state_path)
 
     def _init_wandb(self) -> None:
         if not bool(getattr(self.config.perturb, "wandb_enabled", False)):
@@ -450,46 +448,55 @@ class PerturbValidator:
             paths.append(candidate if candidate.is_absolute() else root / candidate)
         return paths
 
-    def _load_imagenet100_index(self) -> list[tuple[str, Path]]:
+    def _load_imagenet100_index(self) -> list[tuple[str, Any]]:
+        """Build the challenge image index.
+
+        Default mode (`imagenet100_auto_download=true`, no manifest) opens the
+        full Hugging Face split (~126k train images) with random access; ids
+        map to dataset row indices. Otherwise a local directory/manifest of
+        image files is indexed.
+        """
         if self._imagenet100_index:
             return self._imagenet100_index
 
-        root = self._resolve_imagenet100_path(str(getattr(self.config.perturb, "imagenet100_root", "")))
         manifest_raw = str(getattr(self.config.perturb, "imagenet100_manifest", "") or "").strip()
-        if not manifest_raw and bool(getattr(self.config.perturb, "imagenet100_auto_download", True)):
-            try:
-                from perturbnet.imagenet100_bootstrap import bootstrap_imagenet100
-
-                bootstrap_imagenet100(
-                    root=root,
-                    repo_id=str(getattr(self.config.perturb, "imagenet100_repo_id", "clane9/imagenet-100")),
-                    split=str(getattr(self.config.perturb, "imagenet100_split", "train")),
-                    max_images=int(getattr(self.config.perturb, "imagenet100_max_images", 5000)),
-                    min_images=int(getattr(self.config.perturb, "imagenet100_min_images", 1000)),
-                    force=False,
+        auto_download = bool(getattr(self.config.perturb, "imagenet100_auto_download", True))
+        indexed: list[tuple[str, Any]] = []
+        if manifest_raw or not auto_download:
+            root = self._resolve_imagenet100_path(str(getattr(self.config.perturb, "imagenet100_root", "")))
+            if manifest_raw:
+                manifest_path = self._resolve_imagenet100_path(manifest_raw)
+                image_paths = self._iter_manifest_images(manifest_path=manifest_path, root=root)
+            else:
+                image_paths = [
+                    path
+                    for path in root.rglob("*")
+                    if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
+                ]
+            for path in sorted(image_paths):
+                if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS:
+                    indexed.append((self._image_id_for_path(path=path, root=root), path.resolve()))
+            if not indexed:
+                raise RuntimeError(
+                    f"No ImageNet-100 images found. Set PERTURB_IMAGENET100_ROOT to a directory with images: {root}"
                 )
-            except Exception as exc:
-                logger.warning(f"ImageNet-100 auto-bootstrap failed; will try existing local cache: {exc}")
-        if manifest_raw:
-            manifest_path = self._resolve_imagenet100_path(manifest_raw)
-            image_paths = self._iter_manifest_images(manifest_path=manifest_path, root=root)
+            logger.info(f"Loaded ImageNet-100 challenge index images={len(indexed)} root={root}")
         else:
-            image_paths = [
-                path
-                for path in root.rglob("*")
-                if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
-            ]
+            from perturbnet.imagenet100_bootstrap import imagenet100_dataset_version, load_imagenet100
 
-        indexed: list[tuple[str, Path]] = []
-        for path in sorted(image_paths):
-            if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS:
-                indexed.append((self._image_id_for_path(path=path, root=root), path.resolve()))
-        if not indexed:
-            raise RuntimeError(
-                f"No ImageNet-100 images found. Set PERTURB_IMAGENET100_ROOT to a directory with images: {root}"
+            repo_id = str(getattr(self.config.perturb, "imagenet100_repo_id", "clane9/imagenet-100"))
+            split = str(getattr(self.config.perturb, "imagenet100_split", "train"))
+            dataset = load_imagenet100(repo_id=repo_id, split=split)
+            version = imagenet100_dataset_version(dataset=dataset, repo_id=repo_id, split=split)
+            total_rows = int(dataset.num_rows)
+            if total_rows <= 0:
+                raise RuntimeError(f"ImageNet-100 dataset is empty: repo={repo_id} split={split}")
+            self._imagenet100_dataset = dataset
+            indexed = [(f"hf-{version}-{row:07d}", row) for row in range(total_rows)]
+            logger.info(
+                f"Loaded ImageNet-100 challenge index images={total_rows} repo={repo_id} split={split}"
             )
         self._imagenet100_index = indexed
-        logger.info(f"Loaded ImageNet-100 challenge index images={len(indexed)} root={root}")
         return self._imagenet100_index
 
     def _imagenet100_fingerprint(self, image_ids: Sequence[str]) -> str:
@@ -499,83 +506,75 @@ class PerturbValidator:
             digest.update(b"\0")
         return digest.hexdigest()
 
-    def _reshuffle_imagenet100_order(self, image_ids: Sequence[str], fingerprint: str) -> None:
-        self.imagenet100_order_ids = list(image_ids)
-        self.system_random.shuffle(self.imagenet100_order_ids)
+    def _derive_imagenet100_order(self, image_ids: Sequence[str], seed: int) -> list[str]:
+        # Deterministic shuffle from the persisted seed: restarts rebuild the
+        # exact same traversal order without storing ~126k ids in state.
+        order = sorted(image_ids)
+        random.Random(seed).shuffle(order)
+        return order
+
+    def _reset_imagenet100_order(self, fingerprint: str, epoch: int) -> None:
+        self.imagenet100_order_seed = self.system_random.randrange(1, 2**63)
         self.imagenet100_order_cursor = 0
         self.imagenet100_order_fingerprint = fingerprint
-        logger.info(
-            f"Initialized ImageNet-100 random traversal epoch={self.imagenet100_order_epoch} "
-            f"images={len(self.imagenet100_order_ids)}"
-        )
+        self.imagenet100_order_epoch = epoch
+        self._imagenet100_order_cache = []
+        self._imagenet100_order_cache_key = ("", 0)
 
     def _ensure_imagenet100_order(self, image_ids: Sequence[str]) -> None:
-        image_id_set = set(image_ids)
         fingerprint = self._imagenet100_fingerprint(image_ids)
-        if self.imagenet100_order_fingerprint != fingerprint:
-            migrated_used = [
-                image_id
-                for image_id in self.recent_challenge_image_ids
-                if image_id in image_id_set
-            ]
-            seen = set(migrated_used)
-            remaining = [image_id for image_id in image_ids if image_id not in seen]
-            self.system_random.shuffle(remaining)
-            self.imagenet100_order_ids = migrated_used + remaining
-            self.imagenet100_order_cursor = len(migrated_used)
-            self.imagenet100_order_fingerprint = fingerprint
-            self.imagenet100_order_epoch = 0
+        if self.imagenet100_order_fingerprint != fingerprint or self.imagenet100_order_seed <= 0:
+            self._reset_imagenet100_order(fingerprint=fingerprint, epoch=0)
+            logger.info(f"Initialized ImageNet-100 random traversal images={len(image_ids)}")
+        elif self.imagenet100_order_cursor >= len(image_ids):
+            self._reset_imagenet100_order(fingerprint=fingerprint, epoch=self.imagenet100_order_epoch + 1)
             logger.info(
-                f"Initialized ImageNet-100 random traversal images={len(self.imagenet100_order_ids)} "
-                f"already_used={len(migrated_used)}"
+                f"ImageNet-100 traversal exhausted; reshuffled for epoch={self.imagenet100_order_epoch} "
+                f"images={len(image_ids)}"
             )
-            return
-
-        valid_order = [image_id for image_id in self.imagenet100_order_ids if image_id in image_id_set]
-        missing = [image_id for image_id in image_ids if image_id not in set(valid_order)]
-        if missing:
-            self.system_random.shuffle(missing)
-            valid_order.extend(missing)
-        self.imagenet100_order_ids = valid_order
-        self.imagenet100_order_cursor = min(
-            max(0, int(self.imagenet100_order_cursor)),
-            len(self.imagenet100_order_ids),
-        )
-
-        if self.imagenet100_order_cursor >= len(self.imagenet100_order_ids):
-            self.imagenet100_order_epoch += 1
-            self._reshuffle_imagenet100_order(image_ids=image_ids, fingerprint=fingerprint)
+        cache_key = (self.imagenet100_order_fingerprint, int(self.imagenet100_order_seed))
+        if self._imagenet100_order_cache_key != cache_key or not self._imagenet100_order_cache:
+            self._imagenet100_order_cache = self._derive_imagenet100_order(
+                image_ids=image_ids, seed=int(self.imagenet100_order_seed)
+            )
+            self._imagenet100_order_cache_key = cache_key
 
     def _mark_imagenet100_image_used(self, image_id: str) -> None:
-        if (
-            self.imagenet100_order_cursor < len(self.imagenet100_order_ids)
-            and self.imagenet100_order_ids[self.imagenet100_order_cursor] == image_id
-        ):
-            self.imagenet100_order_cursor += 1
-            return
-        try:
-            idx = self.imagenet100_order_ids.index(image_id, self.imagenet100_order_cursor)
-        except ValueError:
-            logger.warning("Accepted ImageNet-100 image was not found in traversal order; advancing cursor unchanged.")
-            return
-        self.imagenet100_order_ids.pop(idx)
-        self.imagenet100_order_ids.insert(self.imagenet100_order_cursor, image_id)
+        order = self._imagenet100_order_cache
+        if self.imagenet100_order_cursor < len(order) and order[self.imagenet100_order_cursor] != image_id:
+            logger.warning("Accepted ImageNet-100 image does not match traversal cursor; advancing anyway.")
         self.imagenet100_order_cursor += 1
+
+    def _imagenet100_image_bytes(self, source: Any) -> bytes:
+        if isinstance(source, Path):
+            return source.read_bytes()
+        if self._imagenet100_dataset is None:
+            raise RuntimeError("ImageNet-100 dataset is not loaded")
+        example = self._imagenet100_dataset[int(source)]
+        image = example.get("image")
+        if image is None:
+            raise ValueError(f"ImageNet-100 row {source} has no image payload")
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG", quality=95)
+        return buffer.getvalue()
 
     def _sample_imagenet100_image(self) -> tuple[str, str]:
         index = self._load_imagenet100_index()
-        path_by_id = {image_id: path for image_id, path in index}
-        image_ids = list(path_by_id.keys())
+        source_by_id = {image_id: source for image_id, source in index}
+        image_ids = list(source_by_id.keys())
         self._ensure_imagenet100_order(image_ids=image_ids)
-        if not self.imagenet100_order_ids:
+        if not self._imagenet100_order_cache:
             raise RuntimeError("ImageNet-100 traversal order is empty")
-        image_id = self.imagenet100_order_ids[self.imagenet100_order_cursor]
-        path = path_by_id[image_id]
-        raw = path.read_bytes()
-        if not raw:
+        image_id = self._imagenet100_order_cache[self.imagenet100_order_cursor]
+        try:
+            raw = self._imagenet100_image_bytes(source_by_id[image_id])
+            if not raw:
+                raise ValueError(f"ImageNet-100 image is empty: {image_id}")
+        except Exception:
+            # Skip corrupt/unreadable entries permanently in this traversal.
             self._mark_imagenet100_image_used(image_id=image_id)
             self._save_state()
-            raise ValueError(f"ImageNet-100 image is empty: {path}")
+            raise
         return image_id, base64.b64encode(raw).decode("utf-8")
 
     def generate_challenge(self, block: int) -> ChallengeSpec:
@@ -628,15 +627,12 @@ class PerturbValidator:
             return ChallengeSpec(
                 task_id=task_id,
                 model_name=model_name,
-                prompt=predicted_label,
                 clean_image_b64=image_b64,
                 # Use exact EfficientNet class label for miner targeting and response verification.
                 true_label=predicted_label,
                 epsilon=epsilon,
                 norm_type="Linf",
                 timeout_seconds=self.config.perturb.timeout_seconds,
-                fallback_used=False,
-                verified_by_llm=False,
             )
 
         raise RuntimeError("Unable to build a validated challenge after max attempts")
@@ -754,7 +750,6 @@ class PerturbValidator:
         synapse = AttackChallenge(
             task_id=challenge.task_id,
             model_name=challenge.model_name,
-            prompt=challenge.prompt,
             clean_image_b64=challenge.clean_image_b64,
             true_label=challenge.true_label,
             epsilon=challenge.epsilon,
@@ -1061,11 +1056,8 @@ class PerturbValidator:
                 self._log_summary(
                     "challenge_summary",
                     task_id=challenge.task_id,
-                    prompt=challenge.prompt,
                     epsilon=f"{challenge.epsilon:.4f}",
                     true_label=challenge.true_label,
-                    llm_verified=challenge.verified_by_llm,
-                    fallback_used=challenge.fallback_used,
                 )
 
                 self._log_step_start("loop_discover_miners")

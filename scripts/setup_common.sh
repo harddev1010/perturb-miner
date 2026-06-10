@@ -17,17 +17,16 @@ if [[ "$ROLE" != "miner" && "$ROLE" != "validator" ]]; then
   exit 1
 fi
 
-if [[ "$ROLE" == "validator" ]]; then
-  if ! command -v npm >/dev/null 2>&1; then
-    echo "npm not found. Install Node.js (which includes npm) and rerun."
-    echo "macOS: brew install node"
-    echo "Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y nodejs npm"
-    exit 1
-  fi
-
-  echo "Installing PM2..."
-  npm install -g pm2
+# Both run_validator.sh and run_miner.sh default to PM2 process management.
+if ! command -v npm >/dev/null 2>&1; then
+  echo "npm not found. Install Node.js (which includes npm) and rerun."
+  echo "macOS: brew install node"
+  echo "Ubuntu/Debian: sudo apt-get update && sudo apt-get install -y nodejs npm"
+  exit 1
 fi
+
+echo "Installing PM2..."
+npm install -g pm2
 
 echo "Creating/updating virtual environment..."
 if [[ ! -d ".venv" ]]; then

@@ -8,7 +8,4 @@ logs/
 assets/imagenet-100/
 scripts/miner.env
 scripts/validator.env
-scripts/verifier.env
-scripts/label_matcher.env
-scripts/llm_endpoint.env
 
