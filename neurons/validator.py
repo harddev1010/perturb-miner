@@ -12,11 +12,11 @@ import random
 import time
 from collections import Counter
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Sequence
 
 import bittensor as bt
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 try:
@@ -30,6 +30,7 @@ from perturbnet.model import load_efficientnet_v2_l, normalize_prediction_label,
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
+_SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 @dataclass
@@ -190,6 +191,12 @@ class PerturbValidator:
         self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
         self.reason_counts_total: Counter[str] = Counter()
         self.miner_emission_share = 1
+        self.recent_challenge_image_ids: list[str] = []
+        self.imagenet100_order_ids: list[str] = []
+        self.imagenet100_order_cursor = 0
+        self.imagenet100_order_fingerprint = ""
+        self.imagenet100_order_epoch = 0
+        self._imagenet100_index: list[tuple[str, Path]] = []
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
@@ -277,6 +284,23 @@ class PerturbValidator:
                 value = saved_hotkeys[idx]
                 if isinstance(value, str):
                     self.uid_hotkeys[idx] = value
+        saved_recent_images = state.get("recent_challenge_image_ids", [])
+        if isinstance(saved_recent_images, list):
+            self.recent_challenge_image_ids = [
+                str(value)
+                for value in saved_recent_images
+                if isinstance(value, str) and value.strip()
+            ][-1000:]
+        saved_order_ids = state.get("imagenet100_order_ids", [])
+        if isinstance(saved_order_ids, list):
+            self.imagenet100_order_ids = [
+                str(value)
+                for value in saved_order_ids
+                if isinstance(value, str) and value.strip()
+            ]
+        self.imagenet100_order_cursor = max(0, int(state.get("imagenet100_order_cursor", 0)))
+        self.imagenet100_order_fingerprint = str(state.get("imagenet100_order_fingerprint", "") or "")
+        self.imagenet100_order_epoch = max(0, int(state.get("imagenet100_order_epoch", 0)))
         self._reconcile_uid_identities()
 
     def _save_state(self) -> None:
@@ -289,6 +313,10 @@ class PerturbValidator:
             "processed_counts": self.processed_counts.tolist(),
             "score_histories": [history[-self.config.perturb.history_size :] for history in self.score_histories],
             "uid_hotkeys": self.uid_hotkeys,
+            "imagenet100_order_ids": self.imagenet100_order_ids,
+            "imagenet100_order_cursor": int(self.imagenet100_order_cursor),
+            "imagenet100_order_fingerprint": self.imagenet100_order_fingerprint,
+            "imagenet100_order_epoch": int(self.imagenet100_order_epoch),
         }
         with open(self.state_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -385,118 +413,170 @@ class PerturbValidator:
         # Deterministic epsilon in [0.06, 0.2]
         return 0.06 + (seed % 1400) / 10000.0
 
-    def _choose_prompt(self, seed: int) -> str:
-        _ = seed  # Keep signature stable; prompt selection is intentionally non-deterministic.
-        return self.system_random.choice(list(C.PROMPTS))
+    def _resolve_imagenet100_path(self, raw_path: str) -> Path:
+        path = Path(raw_path).expanduser()
+        if path.is_absolute():
+            return path
+        project_root = Path(__file__).resolve().parents[1]
+        return (project_root / path).resolve()
 
-    def _parse_llm_endpoint_result(self, payload: Any) -> bool | None:
-        if isinstance(payload, bool):
-            return payload
-        if not isinstance(payload, dict):
-            return None
-
-        for key in ("is_match", "match", "ok", "valid"):
-            value = payload.get(key)
-            if isinstance(value, bool):
-                return value
-        return None
-
-    def _llm_endpoint_check(self, predicted_label: str, expected_label: str) -> bool:
-        endpoint = str(
-            getattr(
-                self.config.perturb,
-                "llm_endpoint_url",
-                getattr(self.config.perturb, "label_match_endpoint", ""),
-            )
-            or ""
-        ).strip()
-        normalized_prediction = normalize_prediction_label(predicted_label)
-        if not endpoint:
-            logger.error("LLM endpoint url is empty; rejecting verification check.")
-            return False
-
-        payload = {
-            "prediction": normalized_prediction,
-            "target_label": expected_label,
-            "llm_model": str(
-                getattr(
-                    self.config.perturb,
-                    "llm_endpoint_model",
-                    getattr(self.config.perturb, "label_match_model", C.LLM_ENDPOINT_MODEL),
-                )
-            ),
-        }
-        timeout_seconds = float(
-            getattr(self.config.perturb, "llm_endpoint_timeout_seconds", 20)
-        )
+    def _image_id_for_path(self, path: Path, root: Path) -> str:
         try:
-            response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
-            response.raise_for_status()
-            parsed = self._parse_llm_endpoint_result(response.json())
-            if parsed is None:
-                logger.error("LLM endpoint returned unrecognized payload shape; rejecting check.")
-                return False
-            return bool(parsed)
-        except Exception as exc:
-            logger.error(
-                f"LLM endpoint request failed ({exc}); timeout={timeout_seconds}s; rejecting check."
+            key = path.resolve().relative_to(root.resolve()).as_posix()
+        except ValueError:
+            key = path.resolve().as_posix()
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+    def _iter_manifest_images(self, manifest_path: Path, root: Path) -> list[Path]:
+        raw = manifest_path.read_text(encoding="utf-8")
+        paths: list[Path] = []
+        if manifest_path.suffix.lower() == ".json":
+            payload = json.loads(raw)
+            if not isinstance(payload, list):
+                raise ValueError("ImageNet-100 manifest JSON must be a list")
+            for item in payload:
+                value = item.get("path") if isinstance(item, dict) else item
+                if isinstance(value, str) and value.strip():
+                    candidate = Path(value.strip())
+                    paths.append(candidate if candidate.is_absolute() else root / candidate)
+            return paths
+
+        for line in raw.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            value = stripped.split(",", 1)[0].split()[0]
+            candidate = Path(value)
+            paths.append(candidate if candidate.is_absolute() else root / candidate)
+        return paths
+
+    def _load_imagenet100_index(self) -> list[tuple[str, Path]]:
+        if self._imagenet100_index:
+            return self._imagenet100_index
+
+        root = self._resolve_imagenet100_path(str(getattr(self.config.perturb, "imagenet100_root", "")))
+        manifest_raw = str(getattr(self.config.perturb, "imagenet100_manifest", "") or "").strip()
+        if not manifest_raw and bool(getattr(self.config.perturb, "imagenet100_auto_download", True)):
+            try:
+                from perturbnet.imagenet100_bootstrap import bootstrap_imagenet100
+
+                bootstrap_imagenet100(
+                    root=root,
+                    repo_id=str(getattr(self.config.perturb, "imagenet100_repo_id", "clane9/imagenet-100")),
+                    split=str(getattr(self.config.perturb, "imagenet100_split", "train")),
+                    max_images=int(getattr(self.config.perturb, "imagenet100_max_images", 5000)),
+                    min_images=int(getattr(self.config.perturb, "imagenet100_min_images", 1000)),
+                    force=False,
+                )
+            except Exception as exc:
+                logger.warning(f"ImageNet-100 auto-bootstrap failed; will try existing local cache: {exc}")
+        if manifest_raw:
+            manifest_path = self._resolve_imagenet100_path(manifest_raw)
+            image_paths = self._iter_manifest_images(manifest_path=manifest_path, root=root)
+        else:
+            image_paths = [
+                path
+                for path in root.rglob("*")
+                if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
+            ]
+
+        indexed: list[tuple[str, Path]] = []
+        for path in sorted(image_paths):
+            if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS:
+                indexed.append((self._image_id_for_path(path=path, root=root), path.resolve()))
+        if not indexed:
+            raise RuntimeError(
+                f"No ImageNet-100 images found. Set PERTURB_IMAGENET100_ROOT to a directory with images: {root}"
             )
-            return False
+        self._imagenet100_index = indexed
+        logger.info(f"Loaded ImageNet-100 challenge index images={len(indexed)} root={root}")
+        return self._imagenet100_index
 
-    def _fetch_image_for_prompt(self, prompt: str, seed: int) -> str:
-        endpoint = str(self.config.perturb.image_endpoint).strip()
-        api_key = str(getattr(self.config.perturb, "pexels_api_key", "")).strip()
-        if not api_key:
-            raise ValueError("Missing Pexels API key. Set PERTURB_PEXELS_API_KEY in validator env.")
-        per_page = max(1, min(80, int(getattr(self.config.perturb, "pexels_per_page", 40))))
-        page_span = max(1, int(getattr(self.config.perturb, "pexels_page_span", 10)))
-        image_variant = str(getattr(self.config.perturb, "pexels_image_variant", "medium")).strip().lower()
-        _ = seed  # Keep signature stable; page/photo sampling is intentionally non-deterministic.
-        params = {
-            "query": prompt,
-            "page": self.system_random.randint(1, page_span),
-            "per_page": per_page,
-        }
-        response = requests.get(
-            endpoint,
-            params=params,
-            headers={"Authorization": api_key},
-            timeout=12,
+    def _imagenet100_fingerprint(self, image_ids: Sequence[str]) -> str:
+        digest = hashlib.sha256()
+        for image_id in sorted(image_ids):
+            digest.update(image_id.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _reshuffle_imagenet100_order(self, image_ids: Sequence[str], fingerprint: str) -> None:
+        self.imagenet100_order_ids = list(image_ids)
+        self.system_random.shuffle(self.imagenet100_order_ids)
+        self.imagenet100_order_cursor = 0
+        self.imagenet100_order_fingerprint = fingerprint
+        logger.info(
+            f"Initialized ImageNet-100 random traversal epoch={self.imagenet100_order_epoch} "
+            f"images={len(self.imagenet100_order_ids)}"
         )
-        response.raise_for_status()
-        data = response.json()
-        photos = data.get("photos") if isinstance(data, dict) else None
-        if not isinstance(photos, list) or not photos:
-            raise ValueError("Pexels response has no photos for the requested prompt")
-        photo = photos[self.system_random.randrange(len(photos))]
-        src = photo.get("src", {}) if isinstance(photo, dict) else {}
-        if not isinstance(src, dict):
-            src = {}
-        image_url = (
-            src.get(image_variant)
-            or src.get("medium")
-            or src.get("large")
-            or src.get("large2x")
-            or src.get("original")
+
+    def _ensure_imagenet100_order(self, image_ids: Sequence[str]) -> None:
+        image_id_set = set(image_ids)
+        fingerprint = self._imagenet100_fingerprint(image_ids)
+        if self.imagenet100_order_fingerprint != fingerprint:
+            migrated_used = [
+                image_id
+                for image_id in self.recent_challenge_image_ids
+                if image_id in image_id_set
+            ]
+            seen = set(migrated_used)
+            remaining = [image_id for image_id in image_ids if image_id not in seen]
+            self.system_random.shuffle(remaining)
+            self.imagenet100_order_ids = migrated_used + remaining
+            self.imagenet100_order_cursor = len(migrated_used)
+            self.imagenet100_order_fingerprint = fingerprint
+            self.imagenet100_order_epoch = 0
+            logger.info(
+                f"Initialized ImageNet-100 random traversal images={len(self.imagenet100_order_ids)} "
+                f"already_used={len(migrated_used)}"
+            )
+            return
+
+        valid_order = [image_id for image_id in self.imagenet100_order_ids if image_id in image_id_set]
+        missing = [image_id for image_id in image_ids if image_id not in set(valid_order)]
+        if missing:
+            self.system_random.shuffle(missing)
+            valid_order.extend(missing)
+        self.imagenet100_order_ids = valid_order
+        self.imagenet100_order_cursor = min(
+            max(0, int(self.imagenet100_order_cursor)),
+            len(self.imagenet100_order_ids),
         )
-        if not isinstance(image_url, str) or not image_url.strip():
-            raise ValueError("Pexels photo src is missing usable image URL")
 
-        image_response = requests.get(image_url, timeout=12)
-        image_response.raise_for_status()
-        image_bytes = image_response.content
-        if not image_bytes:
-            raise ValueError("Downloaded Pexels image is empty")
-        return base64.b64encode(image_bytes).decode("utf-8")
+        if self.imagenet100_order_cursor >= len(self.imagenet100_order_ids):
+            self.imagenet100_order_epoch += 1
+            self._reshuffle_imagenet100_order(image_ids=image_ids, fingerprint=fingerprint)
 
-    def _load_fallback_image_b64(self) -> str:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        fallback_path = os.path.join(project_root, C.FALLBACK_IMAGE_RELATIVE_PATH)
-        with open(fallback_path, "rb") as handle:
-            raw = handle.read()
+    def _mark_imagenet100_image_used(self, image_id: str) -> None:
+        if (
+            self.imagenet100_order_cursor < len(self.imagenet100_order_ids)
+            and self.imagenet100_order_ids[self.imagenet100_order_cursor] == image_id
+        ):
+            self.imagenet100_order_cursor += 1
+            return
+        try:
+            idx = self.imagenet100_order_ids.index(image_id, self.imagenet100_order_cursor)
+        except ValueError:
+            logger.warning("Accepted ImageNet-100 image was not found in traversal order; advancing cursor unchanged.")
+            return
+        self.imagenet100_order_ids.pop(idx)
+        self.imagenet100_order_ids.insert(self.imagenet100_order_cursor, image_id)
+        self.imagenet100_order_cursor += 1
+
+    def _sample_imagenet100_image(self) -> tuple[str, str]:
+        index = self._load_imagenet100_index()
+        path_by_id = {image_id: path for image_id, path in index}
+        image_ids = list(path_by_id.keys())
+        self._ensure_imagenet100_order(image_ids=image_ids)
+        if not self.imagenet100_order_ids:
+            raise RuntimeError("ImageNet-100 traversal order is empty")
+        image_id = self.imagenet100_order_ids[self.imagenet100_order_cursor]
+        path = path_by_id[image_id]
+        raw = path.read_bytes()
         if not raw:
-            raise ValueError(f"fallback image is empty: {fallback_path}")
-        return base64.b64encode(raw).decode("utf-8")
+            self._mark_imagenet100_image_used(image_id=image_id)
+            self._save_state()
+            raise ValueError(f"ImageNet-100 image is empty: {path}")
+        return image_id, base64.b64encode(raw).decode("utf-8")
 
     def generate_challenge(self, block: int) -> ChallengeSpec:
         model_name = C.MODEL_NAME
@@ -509,33 +589,23 @@ class PerturbValidator:
         )
         for attempt in range(self.config.perturb.max_challenge_attempts):
             seed = base_seed + attempt
-            chosen_prompt = self._choose_prompt(seed)
             self._log_summary(
                 "challenge_attempt",
                 attempt=attempt + 1,
                 max_attempts=self.config.perturb.max_challenge_attempts,
-                prompt=chosen_prompt,
                 seed=seed,
+                source="imagenet100",
             )
             self._log_step_start(
                 "challenge_attempt_internal",
                 attempt=attempt + 1,
             )
             try:
-                self._log_step_start("challenge_fetch_image", prompt=chosen_prompt, seed=seed)
-                image_b64 = self._fetch_image_for_prompt(prompt=chosen_prompt, seed=seed)
-                effective_prompt = chosen_prompt
-                used_fallback = False
+                self._log_step_start("challenge_sample_imagenet100", seed=seed)
+                image_id, image_b64 = self._sample_imagenet100_image()
             except Exception as exc:
-                logger.warning(f"Challenge image fetch failed ({exc}), using fallback dog image.")
-                try:
-                    self._log_step_start("challenge_load_fallback_image", label=C.FALLBACK_LABEL)
-                    image_b64 = self._load_fallback_image_b64()
-                    effective_prompt = C.FALLBACK_LABEL
-                    used_fallback = True
-                except Exception as fallback_exc:
-                    logger.warning(f"Fallback image load failed, retrying: {fallback_exc}")
-                    continue
+                logger.warning(f"ImageNet-100 challenge image sample failed, retrying: {exc}")
+                continue
 
             epsilon = self._sample_epsilon(seed)
             task_id = f"{block}-{seed}"
@@ -546,31 +616,27 @@ class PerturbValidator:
                 image = decode_image_b64(image_b64).to(self.device)
                 predicted = predict_label(self.model, image)
                 predicted_label = normalize_prediction_label(predicted)
-                self._log_summary("challenge_model_output", predicted_label=predicted_label)
+                self._log_summary("challenge_model_output", image_id=image_id, predicted_label=predicted_label)
             except Exception as exc:
                 logger.warning(f"Challenge decode/model validation failed, retrying: {exc}")
+                self._mark_imagenet100_image_used(image_id=image_id)
+                self._save_state()
                 continue
 
-            # Verify the candidate by semantically checking model output against the API prompt label.
-            verify_ok = self._llm_endpoint_check(predicted_label, effective_prompt)
-            self._log_summary("challenge_llm_verify", passed=verify_ok)
-            if not verify_ok:
-                logger.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
-                time.sleep(60)
-                continue
-
+            self._mark_imagenet100_image_used(image_id=image_id)
+            self._save_state()
             return ChallengeSpec(
                 task_id=task_id,
                 model_name=model_name,
-                prompt=effective_prompt,
+                prompt=predicted_label,
                 clean_image_b64=image_b64,
                 # Use exact EfficientNet class label for miner targeting and response verification.
                 true_label=predicted_label,
                 epsilon=epsilon,
                 norm_type="Linf",
                 timeout_seconds=self.config.perturb.timeout_seconds,
-                fallback_used=used_fallback,
-                verified_by_llm=True,
+                fallback_used=False,
+                verified_by_llm=False,
             )
 
         raise RuntimeError("Unable to build a validated challenge after max attempts")

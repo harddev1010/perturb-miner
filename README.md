@@ -6,16 +6,15 @@ This repository provides:
 
 - validator node implementation (`neurons/validator.py`)
 - baseline miner implementation (`neurons/miner.py`)
-- validator-side local LLM semantic verification service (`tools/llm_endpoint_service.py`)
+- optional local semantic verification tooling (`tools/llm_endpoint_service.py`)
 - one-command launchers for validator, miner, and llm endpoint
 
 ## Architecture
 
 ### Validator responsibilities
 
-- Pull challenge images from Pexels Search API (`PERTURB_IMAGE_ENDPOINT`)
+- Sample challenge images from a local ImageNet-100 dataset (`PERTURB_IMAGENET100_ROOT`)
 - Run fixed classifier (`EfficientNetV2-L`) on pulled image
-- Verify semantic consistency of model output vs prompt label through local `llm_endpoint`
 - Build and broadcast `AttackChallenge` synapse to selected miners
 - Verify miner responses and compute rewards
 - Maintain rolling histories and set on-chain weights periodically
@@ -29,13 +28,10 @@ This repository provides:
 
 ### Challenge lifecycle
 
-1. Validator samples a prompt from `perturbnet/constants.py` (`PROMPTS`)
-2. Validator fetches image from Pexels using `query=<prompt>` and random page/photo selection
-3. If API pull fails, validator falls back to `assets/dog_1.jpg` and sets prompt to `dog`
-4. Validator runs `EfficientNetV2-L` and gets exact model label string
-5. Validator calls local `llm_endpoint` (`POST /verify-label`) to confirm semantic match between model label and prompt
-6. On success, validator creates challenge where `true_label` is the exact EfficientNet label
-7. Validator sends challenge to sampled miners and scores returned perturbations
+1. Validator samples a local image from a persisted random ImageNet-100 traversal order
+2. Validator runs `EfficientNetV2-L` and gets exact model label string
+3. Validator creates challenge where `prompt` and `true_label` use the exact EfficientNet label
+4. Validator sends challenge to sampled miners and scores returned perturbations
 
 ## Hardware and System Requirements
 
@@ -49,7 +45,7 @@ This repository provides:
 - Minimum: 8 vCPU, 32 GB RAM, NVIDIA GPU with 12+ GB VRAM, 100 GB SSD
 - Recommended: 16 vCPU, 64 GB RAM, NVIDIA GPU with 24+ GB VRAM, 200 GB SSD
 
-### Validator-side llm_endpoint
+### Optional llm_endpoint
 
 - Minimum: 2 vCPU, 4 GB RAM (assuming model already served by Ollama)
 - Recommended: run on same private network/host as validator for low latency
@@ -86,7 +82,7 @@ bash ./scripts/setup_common.sh validator
 `setup_common.sh` behavior by role:
 
 - `miner`: creates `.venv`, installs Python/Bittensor dependencies only
-- `validator`: also installs PM2, Ollama, starts `perturb-ollama`, and pulls `PERTURB_LLM_ENDPOINT_MODEL`
+- `validator`: also installs PM2 for process management
 
 If `npm: command not found`, install Node.js first, then rerun:
 
@@ -113,9 +109,21 @@ bash ./scripts/setup_common.sh validator
 
 This section is specifically for validator operators.
 
-### 1) Configure and run local llm_endpoint
+### 1) ImageNet-100 challenge data
 
-Create endpoint config:
+Validator setup automatically bootstraps a local ImageNet-100 challenge cache from Hugging Face. By default it downloads from `clane9/imagenet-100`, exports a shuffled multi-class sample of the train split into:
+
+```bash
+assets/imagenet-100
+```
+
+This happens during `bash ./scripts/setup_common.sh validator` and is checked again by `bash ./scripts/run_validator.sh`. The validator recursively scans common image extensions (`jpg`, `jpeg`, `png`, `webp`, `bmp`). You may still provide a custom local directory or manifest if needed.
+
+### 2) Optional: configure and run local llm_endpoint
+
+The validator no longer needs `llm_endpoint` to build challenges. The endpoint remains useful for manual label-similarity testing.
+
+Create endpoint config if needed:
 
 ```bash
 cp scripts/llm_endpoint.env.example scripts/llm_endpoint.env
@@ -140,7 +148,7 @@ Health check:
 curl "http://127.0.0.1:8081/health"
 ```
 
-### 2) Configure validator runtime
+### 3) Configure validator runtime
 
 Create validator env:
 
@@ -157,13 +165,13 @@ Edit required fields in `scripts/validator.env`:
 
 Important validator-specific fields:
 
-- `PERTURB_IMAGE_ENDPOINT`
-- `PERTURB_PEXELS_API_KEY` (required)
-- `PERTURB_PEXELS_PER_PAGE`
-- `PERTURB_PEXELS_PAGE_SPAN`
-- `PERTURB_PEXELS_IMAGE_VARIANT` (`medium`, `large`, `original`, etc.)
-- `PERTURB_LLM_ENDPOINT_URL` (must point to your running llm endpoint, e.g. `http://127.0.0.1:8081/verify-label`)
-- `PERTURB_LLM_ENDPOINT_MODEL`
+- `PERTURB_IMAGENET100_ROOT` (directory containing ImageNet-100 images)
+- `PERTURB_IMAGENET100_MANIFEST` (optional manifest path)
+- `PERTURB_IMAGENET100_AUTO_DOWNLOAD` (`true` by default)
+- `PERTURB_IMAGENET100_REPO_ID` (default `clane9/imagenet-100`)
+- `PERTURB_IMAGENET100_SPLIT` (default `train`)
+- `PERTURB_IMAGENET100_MAX_IMAGES` (default `5000`)
+- `PERTURB_IMAGENET100_MIN_IMAGES` (default `1000`)
 - `PERTURB_K_MINERS`
 - `PERTURB_HISTORY_SIZE`
 - `PERTURB_MIN_PROCESSED_COUNT`
@@ -174,7 +182,7 @@ Important validator-specific fields:
 - `PERTURB_WANDB_LOG_CONSOLE` (`true` to forward validator console logs to W&B as well)
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
 
-### 3) Start validator stack (llm_endpoint + validator)
+### 4) Start validator
 
 ```bash
 bash ./scripts/run_validator.sh
@@ -187,10 +195,10 @@ Expected log behavior:
 - per-miner score logs
 - periodic `set_weights` attempts
 
-### 4) Validator-side notes
+### 5) Validator-side notes
 
-- Verification is LLM-only by design; if llm_endpoint is down, challenge verification fails.
-- Keep fallback image `assets/dog_1.jpg` present for external image API outage handling.
+- Challenge generation no longer depends on external image APIs or LLM verification.
+- ImageNet-100 selection walks every cached image once in random order before reshuffling for the next epoch.
 
 ## Installation and Setup (Miner Side)
 
@@ -231,19 +239,22 @@ Expected log behavior:
 ### 3) Miner-side notes
 
 - Baseline miner is intentionally simple; competitive miners should optimize attack logic.
-- Miner does not run llm_endpoint; semantic verification is validator-side only.
+- Miner does not run llm_endpoint; validators handle all challenge verification and scoring.
 
 ## API and Protocol Contracts
 
-### Image API contract (validator input source)
+### ImageNet-100 input contract (validator challenge source)
 
-- Pexels endpoint: `GET https://api.pexels.com/v1/search`
-- Required header: `Authorization: <PEXELS_API_KEY>` (raw key, no Bearer prefix)
-- Validator sends params: `query`, `page`, `per_page`
-- Validator reads `photos[].src.<variant>` and downloads the selected image bytes
-- No custom `image_base64` API response is required; validator converts downloaded image bytes to base64 internally.
+- The normal setup/start scripts automatically populate `PERTURB_IMAGENET100_ROOT` from Hugging Face if the local cache is missing or too small.
+- The default source is `clane9/imagenet-100`, split `train`, capped at `5000` exported images. The export interleaves parquet shards and shuffles the stream so the capped cache spans many classes instead of only the first few.
+- Optional: export `HF_TOKEN` before setup for faster, higher-rate-limit downloads from Hugging Face.
+- `PERTURB_IMAGENET100_ROOT` points to the local image cache directory.
+- Optional `PERTURB_IMAGENET100_MANIFEST` points to a text manifest with one image path per line.
+- Validator persists the shuffled image order, cursor, dataset fingerprint, and epoch in state, so restarts/resumes continue the traversal without duplicate selections until the cache is exhausted.
+- Validator converts image bytes to base64 internally.
+- The model-predicted EfficientNet label becomes both `prompt` and `true_label`.
 
-### llm_endpoint contract (validator verification)
+### llm_endpoint contract (optional manual verification tooling)
 
 - Endpoint: `POST /verify-label`
 - Request JSON:
@@ -277,7 +288,7 @@ Key fields sent to miners:
 
 - `task_id`
 - `model_name` (fixed `EfficientNetV2-L`)
-- `prompt` (broad label)
+- `prompt` (exact EfficientNet class label)
 - `clean_image_b64`
 - `true_label` (exact EfficientNet class label)
 - `epsilon`, `norm_type`, `min_delta`, `timeout_seconds`
@@ -313,7 +324,7 @@ Weight setting:
 
 ## Integration Smoke Test
 
-Run after llm_endpoint is up:
+Run after setup or validator startup has prepared the ImageNet-100 cache:
 
 ```bash
 python scripts/integration_smoke_test.py
@@ -321,18 +332,16 @@ python scripts/integration_smoke_test.py
 
 The smoke test validates:
 
-- llm_endpoint health and semantic sanity checks
-- image fetch from configured image endpoint
+- ImageNet-100 local image load
 - local EfficientNetV2-L inference path
-- challenge semantic verification through llm endpoint
+- direct challenge label selection from model prediction
 
 ## Troubleshooting
 
-- Validator fails verification loop: check `PERTURB_LLM_ENDPOINT_URL` and llm_endpoint health.
-- Frequent image API failures: verify `PERTURB_IMAGE_ENDPOINT` and `PERTURB_PEXELS_API_KEY`; fallback should load `assets/dog_1.jpg`.
+- Validator cannot generate challenges: verify internet access to Hugging Face for first bootstrap, or check `PERTURB_IMAGENET100_ROOT` / optional manifest paths.
 - No miner scoring activity: ensure miner hotkeys are registered and publicly reachable.
 - Dependency install issues: install CUDA/CPU-specific PyTorch build compatible with your host.
-- Slow verifier responses: reduce model size or place llm_endpoint closer to validator process.
+- Slow optional verifier responses: reduce model size or place llm_endpoint closer to the caller.
 
 ## Readiness
 
@@ -345,10 +354,10 @@ Use `docs/READINESS_CHECKLIST.md` before long-run validation or deployment.
 - `perturbnet/protocol.py`: `AttackChallenge` synapse schema
 - `perturbnet/model.py`: EfficientNet model load and label prediction helpers
 - `perturbnet/image_io.py`: base64 image encode/decode helpers
-- `tools/llm_endpoint_service.py`: validator-side semantic verification service
+- `tools/llm_endpoint_service.py`: optional semantic verification service
 - `scripts/run_llm_endpoint.sh`: start/restart llm endpoint with PM2 (auto-ensures Ollama + model)
 - `scripts/run_validator.sh`: start/restart validator with PM2
 - `scripts/run_miner.sh`: start/restart miner with PM2
-- `scripts/setup_common.sh`: role-aware bootstrap (`miner` = Python deps only, `validator` = adds PM2/Ollama/model)
+- `scripts/setup_common.sh`: role-aware bootstrap (`miner` = Python deps only, `validator` = adds PM2)
 - `scripts/integration_smoke_test.py`: local integration test
 

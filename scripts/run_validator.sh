@@ -49,6 +49,11 @@ python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
 
+if [[ "${PERTURB_IMAGENET100_AUTO_DOWNLOAD:-true}" != "false" && "${PERTURB_SKIP_IMAGENET100_BOOTSTRAP:-false}" != "true" ]]; then
+  echo "Checking ImageNet-100 challenge cache..."
+  python scripts/bootstrap_imagenet100.py
+fi
+
 if [[ "${1:-}" == "--foreground" ]]; then
   echo "Starting validator (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK)..."
   python neurons/validator.py \

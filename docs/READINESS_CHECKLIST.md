@@ -5,20 +5,20 @@ Use this before long validator uptime tests or mainnet deployment.
 ## 1) Environment
 
 - [ ] Wallet hotkeys are registered for validator and miners on target `NETUID`
-- [ ] `scripts/validator.env`, `scripts/miner.env`, and `scripts/llm_endpoint.env` are configured
+- [ ] `scripts/validator.env` and `scripts/miner.env` are configured
+- [ ] First validator setup/start can reach Hugging Face, or `PERTURB_IMAGENET100_ROOT` already has a populated cache
 - [ ] GPU drivers/CUDA stack matches installed PyTorch build
 
-## 2) LLM Endpoint Service
+## 2) Optional LLM Endpoint Service
 
-- [ ] Local llm_endpoint starts with `./scripts/run_llm_endpoint.sh`
-- [ ] `GET /health` returns `status=ok`
-- [ ] `POST /verify-label` returns deterministic JSON with `is_match`
-- [ ] `GET /metrics` increments `total_requests`
+- [ ] If using manual verifier checks, local llm_endpoint starts with `./scripts/run_llm_endpoint.sh`
+- [ ] If running, `GET /health` returns `status=ok`
 
 ## 3) Validator + Miner Launch
 
 - [ ] Miner starts with `bash ./scripts/run_miner.sh`
 - [ ] Validator starts with `bash ./scripts/run_validator.sh`
+- [ ] Validator setup/start logs that the ImageNet-100 challenge cache is ready
 - [ ] Validator logs challenge creation and miner selection each loop
 - [ ] Validator logs periodic `set_weights` attempts
 
@@ -27,21 +27,19 @@ Use this before long validator uptime tests or mainnet deployment.
 - [ ] Run:
   - `python scripts/integration_smoke_test.py`
 - [ ] Check output reports:
-  - llm_endpoint health success
-  - semantic sanity checks pass
+  - ImageNet-100 image load succeeds
   - EfficientNetV2-L prediction succeeds
-  - challenge semantic verification passes
+  - challenge target label is selected from model prediction
   - validator logs include `ssim` and `psnr_db` for scored responses
 
 ## 5) Long-Run Reliability
 
-- [ ] Run validator/miner/llm_endpoint together for 6-24 hours
-- [ ] `llm_failures` in llm_endpoint metrics stay low and explainable
+- [ ] Run validator/miner together for 6-24 hours
 - [ ] No repeated validator crash loops
-- [ ] No persistent image endpoint failures
+- [ ] No persistent ImageNet-100 loading failures
 
 ## 6) Operational Guardrails
 
 - [ ] Log rotation policy configured for long-running nodes
-- [ ] Alerting in place for llm_endpoint downtime and validator exceptions
+- [ ] Alerting in place for validator exceptions
 - [ ] Backups enabled for validator state/log artifacts if required
