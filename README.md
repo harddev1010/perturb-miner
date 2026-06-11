@@ -1,6 +1,17 @@
 # Perturb Subnet
 
-Perturb is a Bittensor subnet where validators create adversarial-image challenges and miners return perturbed images under bounded distortion constraints.
+Perturb is a decentralized adversarial robustness network built on Bittensor. Miners compete to find adversarial examples — imperceptible input perturbations that cause state-of-the-art image classifiers to fail — while validators construct challenges from real images, verify every response with mathematical precision, and reward the best attackers with on-chain emissions.
+
+Modern AI models achieve remarkable accuracy on clean data yet remain catastrophically brittle: a perturbation invisible to any human observer can make a production classifier misclassify a tumor scan, a stop sign, or a fraudulent transaction. The tooling to systematically discover these vulnerabilities is fragmented, expensive, and static. Perturb replaces it with a financially incentivized, continuously improving adversarial testing network — every day miners compete, attacks get stronger and the network's outputs get more valuable.
+
+The network produces two commercially valuable outputs:
+
+- **Adversarial training dataset** — a continuously growing corpus of verified adversarial examples, the raw material for adversarial training (the most effective known defense)
+- **Model robustness certificates** — on-chain, auditable proof of adversarial evaluation, relevant to EU AI Act conformity and enterprise AI procurement
+
+Why Bittensor: finding an adversarial example is computationally hard, but verifying one is trivially cheap — run the model, compare the prediction, measure the perturbation norm. This verification asymmetry makes the incentive mechanism clean, objective, and manipulation-resistant, while TAO emissions drive a level of continuous attack research no salaried red team can match.
+
+Read the full vision and roadmap in the [Perturb whitepaper](https://www.perturbai.io/whitepaper).
 
 This repository provides:
 
