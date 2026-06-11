@@ -38,6 +38,14 @@ python -m pip install bittensor bittensor-cli
 python -m pip install -e .
 
 if [[ "$ROLE" == "validator" ]]; then
+  VALIDATOR_ENV_FILE="$ROOT_DIR/scripts/validator.env"
+  if [[ -f "$VALIDATOR_ENV_FILE" ]]; then
+    # shellcheck disable=SC1090
+    source "$VALIDATOR_ENV_FILE"
+  fi
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    export HF_TOKEN
+  fi
   echo "Preparing ImageNet-100 challenge dataset..."
   python scripts/bootstrap_imagenet100.py
 fi

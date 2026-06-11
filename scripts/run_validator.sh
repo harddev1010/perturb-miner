@@ -30,6 +30,10 @@ VALIDATOR_EXTRA_ARGS="${VALIDATOR_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN
+fi
+
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
   exit 1
