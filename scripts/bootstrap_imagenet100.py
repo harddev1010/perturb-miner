@@ -1,27 +1,21 @@
 from __future__ import annotations
 
-import argparse
 import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from perturbnet.imagenet100_bootstrap import (
-    DEFAULT_REPO_ID,
-    DEFAULT_SPLIT,
-    load_imagenet100,
-)
+from perturbnet.constants import IMAGENET100_REPO_ID, IMAGENET100_SPLIT
+from perturbnet.imagenet100_bootstrap import load_imagenet100
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Pre-download the full ImageNet-100 split for validator challenges")
-    parser.add_argument("--repo-id", default=os.getenv("PERTURB_IMAGENET100_REPO_ID", DEFAULT_REPO_ID))
-    parser.add_argument("--split", default=os.getenv("PERTURB_IMAGENET100_SPLIT", DEFAULT_SPLIT))
-    args = parser.parse_args()
-
-    dataset = load_imagenet100(repo_id=str(args.repo_id), split=str(args.split))
-    print(f"ImageNet-100 ready: repo={args.repo_id} split={args.split} images={int(dataset.num_rows)}")
+    dataset = load_imagenet100(repo_id=IMAGENET100_REPO_ID, split=IMAGENET100_SPLIT)
+    print(
+        f"ImageNet-100 ready: repo={IMAGENET100_REPO_ID} split={IMAGENET100_SPLIT} "
+        f"images={int(dataset.num_rows)}"
+    )
     return 0
 
 

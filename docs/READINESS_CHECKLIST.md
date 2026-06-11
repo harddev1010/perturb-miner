@@ -6,7 +6,7 @@ Use this before long validator uptime tests or mainnet deployment.
 
 - [ ] Wallet hotkeys are registered for validator and miners on target `NETUID`
 - [ ] `scripts/validator.env` and `scripts/miner.env` are configured
-- [ ] First validator setup/start can reach Hugging Face to download the full ImageNet-100 train split (~8 GB), or a local image set is configured (`PERTURB_IMAGENET100_AUTO_DOWNLOAD=false` + `PERTURB_IMAGENET100_ROOT`)
+- [ ] First validator setup/start can reach Hugging Face to download the full ImageNet-100 train split (~8 GB)
 - [ ] GPU drivers/CUDA stack matches installed PyTorch build
 
 ## 2) Validator + Miner Launch

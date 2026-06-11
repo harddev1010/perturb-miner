@@ -106,8 +106,7 @@ This section is specifically for validator operators.
 ### 1) ImageNet-100 challenge data
 
 Validator setup automatically downloads the **full ImageNet-100 train split** (~126k images, ~8 GB download, ~17 GB on disk including the converted Arrow cache) from Hugging Face (`clane9/imagenet-100`) into the local Hugging Face cache. The download happens once during `bash ./scripts/setup_common.sh validator` and is re-checked by `bash ./scripts/run_validator.sh`; subsequent starts reuse the cache instantly. Validators traverse all images in a persisted random order with no repeats until the entire split has been used, then reshuffle for the next epoch.
-
-To use a custom local image set instead, set `PERTURB_IMAGENET100_AUTO_DOWNLOAD=false` and point `PERTURB_IMAGENET100_ROOT` (or `PERTURB_IMAGENET100_MANIFEST`) at your images (`jpg`, `jpeg`, `png`, `webp`, `bmp`).
+Optionally export `HF_TOKEN` for a faster first download.
 
 ### 2) Configure validator runtime
 
@@ -126,10 +125,7 @@ Edit required fields in `scripts/validator.env`:
 
 Important validator-specific fields:
 
-- `PERTURB_IMAGENET100_AUTO_DOWNLOAD` (`true` by default: use the full Hugging Face train split)
-- `PERTURB_IMAGENET100_REPO_ID` (default `clane9/imagenet-100`)
-- `PERTURB_IMAGENET100_SPLIT` (default `train`)
-- `PERTURB_IMAGENET100_ROOT` / `PERTURB_IMAGENET100_MANIFEST` (local image set, used when auto-download is `false`)
+- `HF_TOKEN` (optional, speeds up the one-time ImageNet-100 download)
 - `PERTURB_K_MINERS`
 - `PERTURB_HISTORY_SIZE`
 - `PERTURB_MIN_PROCESSED_COUNT`
@@ -203,10 +199,9 @@ Expected log behavior:
 
 ### ImageNet-100 input contract (validator challenge source)
 
-- The default source is the full `clane9/imagenet-100` train split (~126k images), downloaded once into the local Hugging Face cache (~8 GB download, ~17 GB on disk) and accessed by row index at runtime.
+- The source is the full `clane9/imagenet-100` train split (~126k images), fixed in `perturbnet/constants.py`, downloaded once into the local Hugging Face cache (~8 GB download, ~17 GB on disk) and accessed by row index at runtime.
 - Optional: export `HF_TOKEN` before setup for faster, higher-rate-limit downloads from Hugging Face.
 - Validator persists the traversal seed, cursor, dataset fingerprint, and epoch in state; the shuffled order is rebuilt deterministically from the seed, so restarts/resumes continue the traversal without duplicate selections until the full split is exhausted.
-- Local override: set `PERTURB_IMAGENET100_AUTO_DOWNLOAD=false` with `PERTURB_IMAGENET100_ROOT` (image directory) or `PERTURB_IMAGENET100_MANIFEST` (one image path per line).
 - Validator converts image bytes to base64 internally.
 - The model-predicted EfficientNet label becomes `true_label`.
 
@@ -264,7 +259,7 @@ The smoke test validates:
 
 ## Troubleshooting
 
-- Validator cannot generate challenges: verify internet access to Hugging Face for the first dataset download, or check `PERTURB_IMAGENET100_ROOT` / manifest paths when using a local image set.
+- Validator cannot generate challenges: verify internet access to Hugging Face for the first dataset download.
 - No miner scoring activity: ensure miner hotkeys are registered and publicly reachable.
 - Dependency install issues: install CUDA/CPU-specific PyTorch build compatible with your host.
 

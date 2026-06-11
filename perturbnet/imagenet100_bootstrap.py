@@ -1,34 +1,12 @@
 from __future__ import annotations
 
 import hashlib
-import os
-from pathlib import Path
 from typing import Any
 
-DEFAULT_REPO_ID = "clane9/imagenet-100"
-DEFAULT_SPLIT = "train"
-SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+from perturbnet.constants import IMAGENET100_REPO_ID, IMAGENET100_SPLIT
 
 
-def env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None or not raw.strip():
-        return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-def project_root() -> Path:
-    return Path(__file__).resolve().parents[1]
-
-
-def resolve_repo_path(raw_path: str) -> Path:
-    path = Path(raw_path).expanduser()
-    if path.is_absolute():
-        return path
-    return (project_root() / path).resolve()
-
-
-def load_imagenet100(repo_id: str = DEFAULT_REPO_ID, split: str = DEFAULT_SPLIT) -> Any:
+def load_imagenet100(repo_id: str = IMAGENET100_REPO_ID, split: str = IMAGENET100_SPLIT) -> Any:
     """Download (once) and open the full ImageNet-100 split with random access.
 
     Uses the non-streaming `datasets` path: parquet shards are cached locally

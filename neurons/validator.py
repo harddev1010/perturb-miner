@@ -13,7 +13,6 @@ import random
 import time
 from collections import Counter
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Sequence
 
 import bittensor as bt
@@ -31,7 +30,6 @@ from perturbnet.model import load_efficientnet_v2_l, normalize_prediction_label,
 from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
-_SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 
 
 @dataclass
@@ -193,7 +191,7 @@ class PerturbValidator:
         self.imagenet100_order_cursor = 0
         self.imagenet100_order_fingerprint = ""
         self.imagenet100_order_epoch = 0
-        self._imagenet100_index: list[tuple[str, Any]] = []
+        self._imagenet100_index: list[tuple[str, int]] = []
         self._imagenet100_dataset: Any | None = None
         self._imagenet100_order_cache: list[str] = []
         self._imagenet100_order_cache_key: tuple[str, int] = ("", 0)
@@ -411,92 +409,24 @@ class PerturbValidator:
         # Deterministic epsilon in [0.06, 0.2]
         return 0.06 + (seed % 1400) / 10000.0
 
-    def _resolve_imagenet100_path(self, raw_path: str) -> Path:
-        path = Path(raw_path).expanduser()
-        if path.is_absolute():
-            return path
-        project_root = Path(__file__).resolve().parents[1]
-        return (project_root / path).resolve()
-
-    def _image_id_for_path(self, path: Path, root: Path) -> str:
-        try:
-            key = path.resolve().relative_to(root.resolve()).as_posix()
-        except ValueError:
-            key = path.resolve().as_posix()
-        return hashlib.sha256(key.encode("utf-8")).hexdigest()
-
-    def _iter_manifest_images(self, manifest_path: Path, root: Path) -> list[Path]:
-        raw = manifest_path.read_text(encoding="utf-8")
-        paths: list[Path] = []
-        if manifest_path.suffix.lower() == ".json":
-            payload = json.loads(raw)
-            if not isinstance(payload, list):
-                raise ValueError("ImageNet-100 manifest JSON must be a list")
-            for item in payload:
-                value = item.get("path") if isinstance(item, dict) else item
-                if isinstance(value, str) and value.strip():
-                    candidate = Path(value.strip())
-                    paths.append(candidate if candidate.is_absolute() else root / candidate)
-            return paths
-
-        for line in raw.splitlines():
-            stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
-                continue
-            value = stripped.split(",", 1)[0].split()[0]
-            candidate = Path(value)
-            paths.append(candidate if candidate.is_absolute() else root / candidate)
-        return paths
-
-    def _load_imagenet100_index(self) -> list[tuple[str, Any]]:
-        """Build the challenge image index.
-
-        Default mode (`imagenet100_auto_download=true`, no manifest) opens the
-        full Hugging Face split (~126k train images) with random access; ids
-        map to dataset row indices. Otherwise a local directory/manifest of
-        image files is indexed.
-        """
+    def _load_imagenet100_index(self) -> list[tuple[str, int]]:
+        """Open the full ImageNet-100 train split (~126k images) with random
+        access; ids map to dataset row indices."""
         if self._imagenet100_index:
             return self._imagenet100_index
 
-        manifest_raw = str(getattr(self.config.perturb, "imagenet100_manifest", "") or "").strip()
-        auto_download = bool(getattr(self.config.perturb, "imagenet100_auto_download", True))
-        indexed: list[tuple[str, Any]] = []
-        if manifest_raw or not auto_download:
-            root = self._resolve_imagenet100_path(str(getattr(self.config.perturb, "imagenet100_root", "")))
-            if manifest_raw:
-                manifest_path = self._resolve_imagenet100_path(manifest_raw)
-                image_paths = self._iter_manifest_images(manifest_path=manifest_path, root=root)
-            else:
-                image_paths = [
-                    path
-                    for path in root.rglob("*")
-                    if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS
-                ]
-            for path in sorted(image_paths):
-                if path.is_file() and path.suffix.lower() in _SUPPORTED_IMAGE_EXTENSIONS:
-                    indexed.append((self._image_id_for_path(path=path, root=root), path.resolve()))
-            if not indexed:
-                raise RuntimeError(
-                    f"No ImageNet-100 images found. Set PERTURB_IMAGENET100_ROOT to a directory with images: {root}"
-                )
-            logger.info(f"Loaded ImageNet-100 challenge index images={len(indexed)} root={root}")
-        else:
-            from perturbnet.imagenet100_bootstrap import imagenet100_dataset_version, load_imagenet100
+        from perturbnet.imagenet100_bootstrap import imagenet100_dataset_version, load_imagenet100
 
-            repo_id = str(getattr(self.config.perturb, "imagenet100_repo_id", "clane9/imagenet-100"))
-            split = str(getattr(self.config.perturb, "imagenet100_split", "train"))
-            dataset = load_imagenet100(repo_id=repo_id, split=split)
-            version = imagenet100_dataset_version(dataset=dataset, repo_id=repo_id, split=split)
-            total_rows = int(dataset.num_rows)
-            if total_rows <= 0:
-                raise RuntimeError(f"ImageNet-100 dataset is empty: repo={repo_id} split={split}")
-            self._imagenet100_dataset = dataset
-            indexed = [(f"hf-{version}-{row:07d}", row) for row in range(total_rows)]
-            logger.info(
-                f"Loaded ImageNet-100 challenge index images={total_rows} repo={repo_id} split={split}"
-            )
-        self._imagenet100_index = indexed
+        repo_id = str(getattr(self.config.perturb, "imagenet100_repo_id", C.IMAGENET100_REPO_ID))
+        split = str(getattr(self.config.perturb, "imagenet100_split", C.IMAGENET100_SPLIT))
+        dataset = load_imagenet100(repo_id=repo_id, split=split)
+        version = imagenet100_dataset_version(dataset=dataset, repo_id=repo_id, split=split)
+        total_rows = int(dataset.num_rows)
+        if total_rows <= 0:
+            raise RuntimeError(f"ImageNet-100 dataset is empty: repo={repo_id} split={split}")
+        self._imagenet100_dataset = dataset
+        self._imagenet100_index = [(f"hf-{version}-{row:07d}", row) for row in range(total_rows)]
+        logger.info(f"Loaded ImageNet-100 challenge index images={total_rows} repo={repo_id} split={split}")
         return self._imagenet100_index
 
     def _imagenet100_fingerprint(self, image_ids: Sequence[str]) -> str:
@@ -545,9 +475,7 @@ class PerturbValidator:
             logger.warning("Accepted ImageNet-100 image does not match traversal cursor; advancing anyway.")
         self.imagenet100_order_cursor += 1
 
-    def _imagenet100_image_bytes(self, source: Any) -> bytes:
-        if isinstance(source, Path):
-            return source.read_bytes()
+    def _imagenet100_image_bytes(self, source: int) -> bytes:
         if self._imagenet100_dataset is None:
             raise RuntimeError("ImageNet-100 dataset is not loaded")
         example = self._imagenet100_dataset[int(source)]
@@ -1052,7 +980,14 @@ class PerturbValidator:
                 self._log_step_start("loop_get_current_block")
                 block = self.subtensor.get_current_block()
                 self._log_step_start("loop_generate_challenge", block=block)
-                challenge = self.generate_challenge(block=block)
+                try:
+                    challenge = self.generate_challenge(block=block)
+                except Exception as exc:
+                    logger.warning(
+                        f"Challenge generation failed; retrying in {C.CHALLENGE_RETRY_DELAY_SECONDS}s: {exc}"
+                    )
+                    time.sleep(C.CHALLENGE_RETRY_DELAY_SECONDS)
+                    continue
                 self._log_summary(
                     "challenge_summary",
                     task_id=challenge.task_id,

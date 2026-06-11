@@ -37,8 +37,8 @@ python -m pip install --upgrade pip
 python -m pip install bittensor bittensor-cli
 python -m pip install -e .
 
-if [[ "$ROLE" == "validator" && "${PERTURB_SKIP_IMAGENET100_BOOTSTRAP:-false}" != "true" ]]; then
-  echo "Preparing ImageNet-100 challenge cache..."
+if [[ "$ROLE" == "validator" ]]; then
+  echo "Preparing ImageNet-100 challenge dataset..."
   python scripts/bootstrap_imagenet100.py
 fi
 

@@ -45,11 +45,13 @@ MODEL_NAME = "EfficientNetV2-L"
 VALIDATOR_STATE_FILENAME = "perturb_validator_state.json"
 
 # Validator runtime constants.
-IMAGENET100_ROOT = os.getenv("PERTURB_IMAGENET100_ROOT", "assets/imagenet-100")
-IMAGENET100_MANIFEST = os.getenv("PERTURB_IMAGENET100_MANIFEST", "").strip()
-IMAGENET100_REPO_ID = os.getenv("PERTURB_IMAGENET100_REPO_ID", "clane9/imagenet-100").strip()
-IMAGENET100_SPLIT = os.getenv("PERTURB_IMAGENET100_SPLIT", "train").strip()
-IMAGENET100_AUTO_DOWNLOAD = _env_bool("PERTURB_IMAGENET100_AUTO_DOWNLOAD", True)
+# Challenge dataset is fixed: full ImageNet-100 train split from Hugging Face,
+# auto-downloaded once into the local cache.
+IMAGENET100_REPO_ID = "clane9/imagenet-100"
+IMAGENET100_SPLIT = "train"
+# If challenge generation fails (e.g. transient dataset issue), sleep this
+# long and try again; there is no fallback image.
+CHALLENGE_RETRY_DELAY_SECONDS = _env_int("PERTURB_CHALLENGE_RETRY_DELAY_SECONDS", 180)
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
 TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 15)
 QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 120)
@@ -72,11 +74,8 @@ WANDB_MODE = os.getenv("PERTURB_WANDB_MODE", "online").strip()
 WANDB_LOG_CONSOLE = _env_bool("PERTURB_WANDB_LOG_CONSOLE", True)
 
 VALIDATOR_CONFIG = {
-    "imagenet100_root": IMAGENET100_ROOT,
-    "imagenet100_manifest": IMAGENET100_MANIFEST,
     "imagenet100_repo_id": IMAGENET100_REPO_ID,
     "imagenet100_split": IMAGENET100_SPLIT,
-    "imagenet100_auto_download": IMAGENET100_AUTO_DOWNLOAD,
     "image_size": IMAGE_SIZE,
     "timeout_seconds": TIMEOUT_SECONDS,
     "query_interval_seconds": QUERY_INTERVAL_SECONDS,

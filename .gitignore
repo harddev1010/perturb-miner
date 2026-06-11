@@ -5,7 +5,6 @@ __pycache__/
 .DS_Store
 *.npz
 logs/
-assets/imagenet-100/
 scripts/miner.env
 scripts/validator.env
 
