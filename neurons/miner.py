@@ -59,14 +59,20 @@ def _make_subtensor(config):
         return subtensor_cls(config=config)
 
 
-def _make_axon(wallet, port: int):
-    resolved_port = int(port)
+def _make_axon(wallet, config):
+    resolved_config = config() if callable(config) else config
     if hasattr(bt, "axon"):
-        return bt.axon(wallet=wallet, port=resolved_port)
+        try:
+            return bt.axon(wallet=wallet, config=resolved_config)
+        except Exception:
+            return bt.axon(wallet=wallet)
     axon_cls = getattr(bt, "Axon", None)
     if axon_cls is None:
         raise RuntimeError("No axon constructor found in bittensor.")
-    return axon_cls(wallet=wallet, port=resolved_port)
+    try:
+        return axon_cls(wallet=wallet, config=resolved_config)
+    except Exception:
+        return axon_cls(wallet=wallet)
 
 
 def _configure_log_level(level_raw: str) -> None:
@@ -91,8 +97,7 @@ class PerturbMiner:
 
         self.model = load_efficientnet_v2_l(self.device)
 
-        axon_port = int(getattr(getattr(self.config, "axon", object()), "port", 9000))
-        self.axon = _make_axon(wallet=self.wallet, port=axon_port)
+        self.axon = _make_axon(wallet=self.wallet, config=self.config)
         self.axon.attach(
             forward_fn=self.forward,
             blacklist_fn=self.blacklist,
