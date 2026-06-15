@@ -30,6 +30,10 @@ VALIDATOR_EXTRA_ARGS="${VALIDATOR_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
 
+if [[ -n "${HF_TOKEN:-}" ]]; then
+  export HF_TOKEN
+fi
+
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
   exit 1
@@ -48,6 +52,9 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -e .
+
+echo "Checking ImageNet-100 challenge dataset..."
+python scripts/bootstrap_imagenet100.py
 
 if [[ "${1:-}" == "--foreground" ]]; then
   echo "Starting validator (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK)..."
