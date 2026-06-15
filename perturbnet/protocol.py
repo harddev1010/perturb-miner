@@ -16,6 +16,7 @@ class AttackChallenge(bt.Synapse):
 
     task_id: str
     model_name: str = MODEL_NAME
+    prompt: str
     clean_image_b64: str
     true_label: str
     epsilon: float = 0.12
