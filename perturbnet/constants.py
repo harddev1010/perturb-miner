@@ -40,54 +40,24 @@ def _env_first(names: tuple[str, ...], default: str) -> str:
 # Shared subnet identity/constants.
 SUBNET_NAMESPACE = "perturb"
 MODEL_NAME = "EfficientNetV2-L"
-PROMPTS = (
-    # ── Animals ──────────────────────────────────────────
-    "dog", "cat", "bird", "fish", "snake", "frog", "butterfly",
-    "spider", "crab", "jellyfish", "monkey", "hamster", "rabbit",
-    "horse", "cow", "sheep", "elephant", "lion", "tiger", "bear",
-    # ── Vehicles ──────────────────────────────────────────
-    "sports car", "truck", "bus", "motorcycle", "bicycle", "airplane",
-    "helicopter", "sailboat", "canoe", "train",
-    # ── Food ──────────────────────────────────────────────
-    "banana", "strawberry", "orange", "broccoli", "mushroom", "pizza",
-    "cheeseburger", "ice cream", "coffee mug", "wine bottle",
-    # ── Everyday Objects ──────────────────────────────────
-    "chair", "lamp", "clock", "backpack", "umbrella", "sunglasses",
-    "shoe", "hat", "vase", "television",
-    # ── Electronics & Instruments ─────────────────────────
-    "keyboard", "mouse", "camera", "guitar", "drum", "violin",
-    "telescope", "microscope",
-    # ── Sports & Recreation ───────────────────────────────
-    "soccer ball", "basketball", "tennis ball", "baseball bat",
-    "skateboard", "surfboard", "parachute",
-)
 
 # Validator runtime state files.
 VALIDATOR_STATE_FILENAME = "perturb_validator_state.json"
-FALLBACK_IMAGE_RELATIVE_PATH = "assets/dog_1.jpg"
-FALLBACK_LABEL = "dog"
 
 # Validator runtime constants.
-IMAGE_ENDPOINT = os.getenv("PERTURB_IMAGE_ENDPOINT", "https://api.pexels.com/v1/search")
-PEXELS_API_KEY = _env_first(("PERTURB_PEXELS_API_KEY", "PEXELS_API_KEY"), "")
-PEXELS_PER_PAGE = _env_int("PERTURB_PEXELS_PER_PAGE", 40)
-PEXELS_PAGE_SPAN = _env_int("PERTURB_PEXELS_PAGE_SPAN", 10)
-PEXELS_IMAGE_VARIANT = os.getenv("PERTURB_PEXELS_IMAGE_VARIANT", "medium")
+# Challenge dataset is fixed: full ImageNet-100 train split from Hugging Face,
+# auto-downloaded once into the local cache.
+IMAGENET100_REPO_ID = "clane9/imagenet-100"
+IMAGENET100_SPLIT = "train"
+# If challenge generation fails (e.g. transient dataset issue), sleep this
+# long and try again; there is no fallback image.
+CHALLENGE_RETRY_DELAY_SECONDS = _env_int("PERTURB_CHALLENGE_RETRY_DELAY_SECONDS", 180)
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
-TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 15)
+TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 20)
 QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 120)
 K_MINERS = _env_int("PERTURB_K_MINERS", 100)
 HISTORY_SIZE = _env_int("PERTURB_HISTORY_SIZE", 50)
 MIN_PROCESSED_COUNT = _env_int("PERTURB_MIN_PROCESSED_COUNT", 50)
-LLM_ENDPOINT_URL = _env_first(
-    ("PERTURB_LLM_ENDPOINT_URL", "PERTURB_LABEL_MATCH_ENDPOINT", "PERTURB_LLM_VERIFY_ENDPOINT"),
-    "http://127.0.0.1:8081/verify-label",
-)
-LLM_ENDPOINT_MODEL = _env_first(
-    ("PERTURB_LLM_ENDPOINT_MODEL", "PERTURB_LABEL_MATCH_MODEL", "PERTURB_LLM_VERIFY_MODEL"),
-    "Qwen2.5-1.5B-Instruct",
-)
-LLM_ENDPOINT_TIMEOUT_SECONDS = _env_int("PERTURB_LLM_ENDPOINT_TIMEOUT_SECONDS", 20)
 MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.003)
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)
 MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
@@ -104,20 +74,14 @@ WANDB_MODE = os.getenv("PERTURB_WANDB_MODE", "online").strip()
 WANDB_LOG_CONSOLE = _env_bool("PERTURB_WANDB_LOG_CONSOLE", True)
 
 VALIDATOR_CONFIG = {
-    "image_endpoint": IMAGE_ENDPOINT,
-    "pexels_api_key": PEXELS_API_KEY,
-    "pexels_per_page": PEXELS_PER_PAGE,
-    "pexels_page_span": PEXELS_PAGE_SPAN,
-    "pexels_image_variant": PEXELS_IMAGE_VARIANT,
+    "imagenet100_repo_id": IMAGENET100_REPO_ID,
+    "imagenet100_split": IMAGENET100_SPLIT,
     "image_size": IMAGE_SIZE,
     "timeout_seconds": TIMEOUT_SECONDS,
     "query_interval_seconds": QUERY_INTERVAL_SECONDS,
     "k_miners": K_MINERS,
     "history_size": HISTORY_SIZE,
     "min_processed_count": MIN_PROCESSED_COUNT,
-    "llm_endpoint_url": LLM_ENDPOINT_URL,
-    "llm_endpoint_model": LLM_ENDPOINT_MODEL,
-    "llm_endpoint_timeout_seconds": LLM_ENDPOINT_TIMEOUT_SECONDS,
     "min_linf_delta": MIN_LINF_DELTA,
     "max_linf_delta": MAX_LINF_DELTA,
     "min_ssim": MIN_SSIM,
