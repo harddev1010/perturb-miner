@@ -1,25 +1,69 @@
 """
-miner.py — Perturb subnet miner (netuid 26).
+miner.py — Perturb subnet miner (netuid 26) — v6: transfer-safe margin-gated flips
 
-Core attack (Approach 5.4 hybrid): minimum-L0 flip under a FIXED ±1/255 unit step.
-  prefix-sum target init -> margin-budgeted greedy growth (CW margin objective, boundary
-  gradient periodically re-linearized) -> forward verify on the PNG round-trip under a
-  TF32 on/off numeric envelope -> backward reduction -> Sparse-RS swap polish.
+OBJECTIVE (from the live validator's scoring):
+  effective_max = min(epsilon, 0.03) = 0.03 always; min_linf = 0.003; SPEED_WEIGHT = 0.
+  A single ±1/255 sparse step gives norm = 0.003922 -> linf_score ~= 0.933, the maximum
+  achievable; total score ~= 0.94 for a transferring flip. Driving pixel count below
+  "reasonably sparse" gains < 0.01 total, and a NON-transferring flip scores 0. So we
+  optimize for RELIABILITY OF TRANSFER, not minimal pixel count.
 
-Each channel is ternary {-1,0,+1}·(1/255): the optimizer chooses WHICH channels to move and
-their sign, never the magnitude (L_inf is pinned at 1/255 -> constant linf_score ~= 0.933).
-L0 (rmse) is the only graded differentiator, but a NON-transferring flip scores 0, so transfer
-reliability comes first: a candidate is banked only when its worst-case CW margin (over the
-TF32 envelope) is <= -MARGIN_BUFFER on the PNG round-trip, not merely argmax != true. Greedy
-growth may over-include channels; backward reduction + swap are where most of the L0 shrink
-is realized. Pixel-count is the gentle tiebreaker, transfer the hard gate.
+TRANSFER-SAFETY MODEL:
+  The validator detects a flip as a strict argmax change with no margin tolerance, on a
+  lossless PNG round-trip (±1/255 survives exactly). To survive transfer to the
+  validator's exact weights we require the CW margin m = logit[true] - max_{j!=true}
+  logit[j] to be <= -PERTURB_MINER_MARGIN_BUFFER on our own PNG round-trip — not merely
+  argmax != true. Numeric parity (TF32 off, deterministic cuDNN) is pinned at import.
+
+APPROACH: Quantization-aware sparse binary search with three stacked improvements,
+every candidate routed through one margin-buffer gate:
+
+  Strategy 1 — Target class selection (before Phase 1):
+    Probe the N closest wrong classes, pick the one that requires the fewest channels to
+    flip to (lowest estimated sparse cost), and use its gradient for the Phase 1 binary
+    search.  Expected gain: 20–60% fewer channels when the nearest boundary ≠ max-logit.
+
+  Strategy 2 — Re-linearise at boundary (after Phase 1):
+    Once Phase 1 finds a valid candidate, bisect on the line clean→adv to locate the
+    decision boundary x_bnd, recompute the gradient at x_bnd, and run a second binary
+    search.  The boundary gradient is tangent to the true decision surface.
+    Expected gain: 10–40% additional reduction on top of Strategy 1.
+
+  Strategy 3 — FMN-L0 alternative phase (Strategy 2 → Phase 2b):
+    Run foolbox L0FMNAttack and snap the result to ±1/255.  L0FMN explicitly minimises
+    the number of changed channels via iterative projected gradient descent, providing a
+    completely independent path from the gradient-sorted binary search.
+    Expected gain: wins on images where both Phase 1 and re-linearize miss a sparser path.
+
+PHASE ORDER (m0 > 0, true class still on top):
+  bank-a-flip sweep → [target selection] → Phase 1 minimal-flip binary search
+  → [re-linearize] → FMN-L0 → FMN-LInf → PGD fallback → safety-grow → gated finalize
+ALREADY-MISCLASSIFIED (m0 <= 0):
+  bank-a-flip sweep → minimal ±1/255 sparse top-saliency search → safety-grow → finalize
+
+The search phases accept on the FLIP itself (fast, fewer forwards) so a gated flip is
+banked early and a clean-tier (score 0) return is impossible whenever a flip is reachable.
+consider() keeps the best soft flip (m < 0) by (linf, rmse); safety-grow then deepens it
+to the margin-safe tier (m <= -buffer) with leftover budget — separating "find the flip"
+from "deepen the margin" so the clock is never spent chasing depth before banking score.
+
+FINALIZE (gated, never an ungated dense FGSM image):
+  best margin-safe flip → else best soft flip → else the clean image (verbatim bytes).
+  Safety-grow promotes a thin flip (m > -2*buffer) by appending up to ~64 extra
+  top-saliency ±1/255 channels until m <= -buffer, keeping linf at the 0.933 optimum.
+
+SCORING (validator mirror):
+  score = 0.7 * linf_score + 0.3 * rmse_score
+  linf_score = (1 - (norm - MIN) / (effective_max - MIN))^2
+  rmse_score = (1 - rmse / effective_max)^2
+  effective_max = min(epsilon, 0.03)   [SPEED_WEIGHT=0, speed is irrelevant]
 
 TUNABLE ENV VARS:
-  PERTURB_MINER_MARGIN_BUFFER   (0.01) transfer-safety margin kappa (require m <= -buffer)
-  PERTURB_TARGET_PROBE_N        (10)   wrong classes probed for target selection
-  PERTURB_TARGET_KEEP_N         (3)    top targets kept for real-forward greedy growth
-  PERTURB_PRUNE_ENABLE          (1)    backward reduction of unneeded channels
-  PERTURB_MINER_RESERVE_SECONDS (2.5)  deadline headroom
+  PERTURB_MINER_MARGIN_BUFFER     (default 0.01) — transfer-safety margin (m <= -buffer)
+  PERTURB_TARGET_PROBE_N          (default 10)   — wrong classes to probe for target sel.
+  PERTURB_RELINEARIZE_BISECT_STEPS (default 6)   — boundary bisection steps
+  PERTURB_FMN_L0_TIME_FRAC        (default 0.35) — fraction of remaining time for L0FMN
+  PERTURB_MINER_RESERVE_SECONDS   (default 2.5)  — deadline headroom
 """
 
 import argparse
@@ -33,6 +77,11 @@ import bittensor as bt
 import torch
 import torch.nn.functional as F
 
+try:
+    import foolbox as fb
+except Exception:
+    fb = None
+
 from perturbnet import constants as _C
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, resolve_target_index
@@ -40,9 +89,10 @@ from perturbnet.protocol import AttackChallenge
 
 logger = pylogging.getLogger(__name__)
 
-# Numeric parity baseline: deterministic, TF32-off kernels — the conservative end of the
-# transfer envelope. The verifier additionally re-checks each candidate with TF32 ON (see
-# _margin_envelope) so the banked flip survives whichever setting the validator's GPU uses.
+# Numeric parity with the live validator (deterministic matmul / conv kernels).
+# The validator decodes lossless PNG and runs a single forward; any TF32 / autotuned
+# kernel divergence between miner and validator can silently flip a borderline margin,
+# so we pin the exact same numerics the validator uses.
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
 torch.backends.cudnn.benchmark = False
@@ -65,14 +115,14 @@ _MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)
 _MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
 _MIN_PSNR_DB = _env_float("PERTURB_MIN_PSNR_DB", 38.0)
 _RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 2.5)
-# Transfer-safety margin (kappa): a flip is "margin-safe" only when the worst-case CW margin
-# over the TF32 envelope is <= -buffer, pushing it past the boundary so it survives transfer
-# to the validator's exact weights. A reverted flip scores 0; rmse_score is near-flat, so a
-# few extra channels of margin cost almost nothing — lean generous.
+# Transfer-safety margin buffer. A candidate counts as a "margin-safe" flip only when
+# the CW margin m = logit[true] - max_{j!=true} logit[j] is <= -buffer on the PNG
+# round-trip, not merely argmax != true. This deepens the flip past the local decision
+# boundary so it is far likelier to survive transfer to the validator's exact weights.
 _MARGIN_BUFFER = _env_float("PERTURB_MINER_MARGIN_BUFFER", 0.01)
 _TARGET_PROBE_N = int(os.getenv("PERTURB_TARGET_PROBE_N", "10"))
-_TARGET_KEEP_N = max(1, int(os.getenv("PERTURB_TARGET_KEEP_N", "3")))
-_PRUNE_ENABLE = os.getenv("PERTURB_PRUNE_ENABLE", "1").strip().lower() in {"1", "true", "yes", "on"}
+_RELINEARIZE_BISECT_STEPS = int(os.getenv("PERTURB_RELINEARIZE_BISECT_STEPS", "6"))
+_FMN_L0_TIME_FRAC = float(os.getenv("PERTURB_FMN_L0_TIME_FRAC", "0.35"))
 
 
 def _estimate_validator_score(norm: float, rmse: float, synapse_epsilon: float) -> float:
@@ -85,6 +135,15 @@ def _estimate_validator_score(norm: float, rmse: float, synapse_epsilon: float) 
     rmse_score = (1.0 - rmse_ratio) ** 2
     total_w = max(1e-12, _C.LINF_COMPONENT_WEIGHT + _C.RMSE_COMPONENT_WEIGHT)
     return (_C.LINF_COMPONENT_WEIGHT * linf_score + _C.RMSE_COMPONENT_WEIGHT * rmse_score) / total_w
+
+
+class _PreprocessedModel(torch.nn.Module):
+    def __init__(self, base: torch.nn.Module) -> None:
+        super().__init__()
+        self.base = base
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return logits_for_images(model=self.base, image_bchw=x)
 
 
 def _png_roundtrip(image_chw: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -112,15 +171,8 @@ def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
     return 10.0 * math.log10(1.0 / mse)
 
 
-def _cw_margin(logits: torch.Tensor, target_index: int) -> float:
-    """CW margin m = logit[true] - max_{j!=true} logit[j]; m < 0 means flipped."""
-    others = logits.clone()
-    others[target_index] = float("-inf")
-    return float((logits[target_index] - others.max()).item())
-
-
 def _margin_and_grad(model, x_chw, target_index):
-    """CW margin and its input gradient (boundary direction ∇ℓ_true - ∇max_other)."""
+    """Untargeted CW margin: logit[true] - max_{j≠true} logit[j]."""
     x = x_chw.detach().clone().requires_grad_(True)
     logits = logits_for_images(model=model, image_bchw=x.unsqueeze(0))[0]
     true_logit = logits[target_index]
@@ -132,7 +184,7 @@ def _margin_and_grad(model, x_chw, target_index):
 
 
 def _targeted_margin_and_grad(model, x_chw, true_index, attack_class):
-    """Targeted boundary margin/gradient for one rival class: logit[true] - logit[attack]."""
+    """Targeted margin: logit[true] - logit[attack_class]."""
     x = x_chw.detach().clone().requires_grad_(True)
     logits = logits_for_images(model=model, image_bchw=x.unsqueeze(0))[0]
     margin = logits[true_index] - logits[attack_class]
@@ -141,7 +193,7 @@ def _targeted_margin_and_grad(model, x_chw, true_index, attack_class):
 
 
 def _build_sparse_order(grad_flat, clean_flat):
-    """Descending-|g| channel order, masking signs that would clip at the [0,1] box edge."""
+    """Gradient-sorted order and valid-move mask for sparse perturbation."""
     direction_sign = -grad_flat.sign()
     can_move = (
         ((direction_sign > 0) & (clean_flat < 1.0)) |
@@ -154,61 +206,48 @@ def _build_sparse_order(grad_flat, clean_flat):
     return g_abs, order, valid_count
 
 
-def _margin_envelope(model, seen, target_index, device):
-    """Worst-case (least negative) CW margin across the TF32 on/off numeric envelope.
+def _run_sparse_binary_search(clean, g_flat, k_min, valid_count, sparse_order, g_abs_valid,
+                               m_use, consider, time_left, t_png, accept_key="soft"):
+    """Exponential doubling + binary search for the minimum channel count that flips.
 
-    The validator's GPU/library numerics are unknown and TF32 is the dominant divergence axis.
-    Requiring the flip under BOTH settings (return the max margin) covers that variance directly,
-    so the additive buffer only needs to absorb residual ~1e-3 drift.
+    The accept predicate is consider(...)[accept_key] — by default "soft" (an in-band,
+    quality-passing argmax flip). We deliberately search on the flip itself, NOT on
+    margin-safety: locking the minimal flip fast is what banks score under the clock;
+    deepening the margin to m <= -buffer is left to the safety-grow step afterwards.
     """
-    with torch.no_grad():
-        m_off = _cw_margin(logits_for_images(model=model, image_bchw=seen.unsqueeze(0))[0], target_index)
-    if device.type != "cuda":
-        return m_off
-    prev_mm, prev_cu = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    try:
-        with torch.no_grad():
-            m_on = _cw_margin(logits_for_images(model=model, image_bchw=seen.unsqueeze(0))[0], target_index)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32 = prev_mm
-        torch.backends.cudnn.allow_tf32 = prev_cu
-    return max(m_off, m_on)
+    threshold = m_use / max(k_min * _Q, 1e-12)
+    cumsum = torch.cumsum(g_abs_valid[sparse_order], dim=0)
+    n_base = min(int((cumsum < threshold).sum().item()) + 1, valid_count)
+    n_base = max(n_base, 1)
+
+    def _make_sparse(n):
+        d = torch.zeros_like(g_flat)
+        d[sparse_order[:n]] = -(k_min * _Q) * g_flat[sparse_order[:n]].sign()
+        return (clean + d.view_as(clean)).clamp(0.0, 1.0)
+
+    lo, hi = n_base, n_base
+    first_flip_n = None
+    while hi <= valid_count and time_left() > 1.3 * t_png:
+        if consider(_make_sparse(hi))[accept_key]:
+            first_flip_n = hi
+            break
+        lo = hi + 1
+        hi = min(hi * 2, valid_count)
+
+    if first_flip_n is not None:
+        blo, bhi = lo, first_flip_n
+        while blo < bhi and time_left() > 1.3 * t_png:
+            mid = (blo + bhi) // 2
+            if consider(_make_sparse(mid))[accept_key]:
+                bhi = mid
+            else:
+                blo = mid + 1
+
+    return first_flip_n
 
 
-def _evaluate(model, clean, cand_chw, target_index, device, floor, cap, buffer):
-    """Grade a candidate on the validator-faithful PNG round-trip + TF32 envelope.
-
-    soft  — argmax wrong (m<0) and SSIM/PSNR pass: a usable but boundary-thin flip.
-    valid — margin-safe: soft AND worst-case m <= -buffer; the only tier trusted to transfer.
-    """
-    seen = _png_roundtrip(cand_chw, device)
-    diff = seen - clean
-    linf = float(diff.abs().max().item())
-    rmse = float(torch.sqrt(torch.mean(diff * diff)).item())
-    in_band = floor <= linf <= cap
-    margin = _margin_envelope(model, seen, target_index, device)
-    flipped = margin < 0.0
-    soft, valid, ssim, psnr = False, False, None, None
-    if in_band and flipped:
-        ssim = _compute_ssim(clean, seen)
-        psnr = _compute_psnr_db(clean, seen)
-        quality = ssim >= _MIN_SSIM and psnr >= _MIN_PSNR_DB
-        soft = quality
-        valid = quality and margin <= -buffer
-    return {"cand": cand_chw, "linf": linf, "rmse": rmse, "flipped": flipped, "margin": margin,
-            "soft": soft, "valid": valid, "ssim": ssim, "psnr": psnr}
-
-
-def _select_best_targets(model, clean, true_index, device, k_min, n_probe, keep_n, time_budget):
-    """Approach 5.0 step 2 — rank wrong classes by the prefix-sum cost estimate n_t and keep top-N.
-
-    n_t is the first-order count k* = min{k : Σ_{i<=k}|g_(i)| > φ}: a CHEAP RANKING SIGNAL only
-    (channels interact, the gradient shifts as channels move), so we keep keep_n candidates and
-    let the real PNG-round-trip forwards in greedy growth pick the winner. Each entry carries the
-    target's gradient, order, valid count, margin and n_est for warm-starting growth directly.
-    """
+def _select_best_target(model, clean, true_index, device, k_min, n_probe, time_budget):
+    """Pick the wrong class that minimises the estimated sparse channel count."""
     with torch.no_grad():
         all_logits = logits_for_images(model=model, image_bchw=clean.unsqueeze(0))[0]
     n_classes = all_logits.shape[0]
@@ -216,8 +255,13 @@ def _select_best_targets(model, clean, true_index, device, k_min, n_probe, keep_
         [(float(all_logits[true_index].item() - all_logits[i].item()), i)
          for i in range(n_classes) if i != true_index]
     )
+    best_n = float("inf")
+    best_class = None
+    best_grad = None
+    best_order = None
+    best_g_abs = None
+    best_vc = 0
     clean_flat = clean.view(-1)
-    scored = []
     for margin_t, t in candidates[:min(n_probe, len(candidates))]:
         if time.time() + 0.001 > time_budget:
             break
@@ -230,151 +274,88 @@ def _select_best_targets(model, clean, true_index, device, k_min, n_probe, keep_
         threshold_t = m_t / max(k_min * _Q, 1e-12)
         cumsum_t = torch.cumsum(g_abs_t[order_t], dim=0)
         n_t = min(int((cumsum_t < threshold_t).sum().item()) + 1, vc_t)
-        scored.append({"cls": t, "n_est": n_t, "margin": m_t, "grad": g_t,
-                       "order": order_t, "g_abs": g_abs_t, "vc": vc_t})
-    scored.sort(key=lambda d: d["n_est"])
-    return scored[:max(1, keep_n)]
+        if n_t < best_n:
+            best_n = n_t
+            best_class = t
+            best_grad = g_t
+            best_order = order_t
+            best_g_abs = g_abs_t
+            best_vc = vc_t
+    return best_class, best_grad, best_order, best_g_abs, best_vc
 
 
-def _greedy_grow(model, clean, target_index, grad0, order0, valid_count, k_min, n_start,
-                 consider, time_left, t_step, t_png, reeval_every=4, batch=8):
-    """Approach 5.0 steps 3-4 — margin-budgeted greedy growth.
+def _signed_step(clean, grad, radius):
+    return (clean - radius * grad.sign()).clamp(0.0, 1.0)
 
-    Add the top-|g| feasible channels in batches, each stepped -sign(g)·(1/255) along the
-    boundary gradient, periodically re-linearizing g at the current point (the boundary direction
-    shifts as channels move), until consider() reports a PNG-verified margin-safe flip. Stops at
-    the first valid candidate (or budget exhaustion) — over-inclusion is trimmed by reduction.
-    """
-    if valid_count <= 0:
+
+def _scale_dir(clean, direction, base_linf, target_linf):
+    return (clean + direction * (target_linf / base_linf)).clamp(0.0, 1.0)
+
+
+def _fmn_direction(model, clean, target_index, device, steps):
+    """FMN-LInf minimum-norm direction (Phase 2 fallback)."""
+    if fb is None:
         return None
-    q = k_min * _Q
-    clean_flat = clean.view(-1)
-    grad = grad0.view(-1)
-    delta = torch.zeros_like(grad)
-    selected = set()
-
-    def try_add(idx):
-        if idx in selected:
-            return False
-        g = float(grad[idx])
-        if g == 0.0:
-            return False
-        s = -1.0 if g > 0.0 else 1.0
-        if (s > 0.0 and clean_flat[idx] >= 1.0) or (s < 0.0 and clean_flat[idx] <= 0.0):
-            return False
-        delta[idx] = s * q
-        selected.add(idx)
-        return True
-
-    def cand():
-        return (clean + delta.view_as(clean)).clamp(0.0, 1.0)
-
-    olist = order0.tolist()
-    ptr = 0
-    while len(selected) < max(1, n_start) and ptr < len(olist):
-        try_add(olist[ptr])
-        ptr += 1
-    if not selected:
+    try:
+        fmodel = fb.PyTorchModel(_PreprocessedModel(model).to(device).eval(), bounds=(0.0, 1.0))
+        attack = fb.attacks.LInfFMNAttack(steps=int(steps))
+        labels = torch.tensor([int(target_index)], device=device)
+        raw_advs, _, _ = attack(fmodel, clean.unsqueeze(0), labels, epsilons=None)
+        return raw_advs.squeeze(0) - clean
+    except Exception:
         return None
-    res = consider(cand())
-    batches = 0
-    while not res["valid"] and time_left() > 1.3 * t_png and len(selected) < valid_count:
-        if batches and batches % reeval_every == 0 and time_left() > t_step + 1.3 * t_png:
-            # Re-linearize: recompute the boundary gradient at the current point and re-rank
-            # the still-unselected channels against it.
-            _, g_new = _margin_and_grad(model, cand(), target_index)
-            grad = g_new.view(-1)
-            g_abs = grad.abs().clone()
-            if selected:
-                g_abs[torch.tensor(sorted(selected), device=g_abs.device)] = -1.0
-            olist = torch.argsort(g_abs, descending=True).tolist()
-            ptr = 0
-        added = 0
-        while added < batch and ptr < len(olist):
-            if try_add(olist[ptr]):
-                added += 1
-            ptr += 1
-        if added == 0:
-            break
-        res = consider(cand())
-        batches += 1
-    return res
 
 
-def _prune(clean, anchor, tier_key, grad_use, k_min, consider, time_left, t_png):
-    """Approach 5.0 step 5 — backward reduction. Drop the least-salient changed channels in
-    batches while the candidate stays in its tier (the bulk of the L0 shrink). linf is unchanged
-    (survivors stay ±1/255); rmse falls with fewer channels, a direct rmse_score gain.
+def _fmn_l0_snapped(model, clean, target_index, device, steps):
+    """L0FMNAttack result snapped to ±1/255 on changed channels."""
+    if fb is None:
+        return None
+    try:
+        L0Attack = getattr(fb.attacks, "L0FMNAttack", None)
+        if L0Attack is None:
+            return None
+        fmodel = fb.PyTorchModel(_PreprocessedModel(model).to(device).eval(), bounds=(0.0, 1.0))
+        attack = L0Attack(steps=int(steps))
+        labels = torch.tensor([int(target_index)], device=device)
+        raw_advs, _, _ = attack(fmodel, clean.unsqueeze(0), labels, epsilons=None)
+        delta = raw_advs.squeeze(0) - clean
+        mask = delta.abs() > 1e-9
+        snapped_delta = torch.zeros_like(delta)
+        snapped_delta[mask] = delta[mask].sign() * _Q
+        return (clean + snapped_delta).clamp(0.0, 1.0)
+    except Exception:
+        return None
+
+
+def _evaluate(model, clean, cand_chw, target_index, device, floor, cap, buffer):
+    """Evaluate a candidate on the validator-faithful PNG round-trip.
+
+    Computes the CW margin m = logit[true] - max_{j!=true} logit[j] on the decoded image.
+    Returns two grades:
+      soft  — argmax already wrong (m < 0) and SSIM/PSNR pass: a usable but boundary-thin flip.
+      valid — margin-safe: soft AND m <= -buffer, i.e. pushed past the boundary by the buffer.
+    Only margin-safe candidates are trusted to transfer; soft flips are a fallback tier.
     """
-    cur = (anchor["cand"].detach() - clean).view(-1).clone()
-    changed = (cur.abs() > 0.5 * _Q).nonzero(as_tuple=False).view(-1).tolist()
-    if len(changed) <= 1:
-        return
-    g = grad_use.view(-1).abs()
-    changed.sort(key=lambda i: float(g[i]))  # least salient first
-    for batch in (16, 4, 1):
-        i = 0
-        while i < len(changed) and time_left() > 1.3 * t_png:
-            grp = [idx for idx in changed[i:i + batch] if cur[idx].abs() > 0.5 * _Q]
-            i += batch
-            if not grp:
-                continue
-            trial = cur.clone()
-            for idx in grp:
-                trial[idx] = 0.0
-            if consider((clean + trial.view_as(clean)).clamp(0.0, 1.0))[tier_key]:
-                cur = trial  # accept removal; keep shrinking
-
-
-def _sparse_rs_swap(clean, anchor, tier_key, grad_use, k_min, sparse_order, consider, time_left, t_png):
-    """Approach 5.2 — Sparse-RS swap polish. At fixed |S|, swap a low-saliency changed channel out
-    for a high-saliency unchanged one; keep the swap only if the candidate stays in tier. Escapes
-    orderings greedy+reduction get stuck in; |S| is unchanged but a deeper margin can unlock a
-    further removal in the reduction pass that follows.
-    """
-    q = k_min * _Q
-    clean_flat = clean.view(-1)
-    g = grad_use.view(-1)
-    cur = (anchor["cand"].detach() - clean).view(-1).clone()
-    changed = (cur.abs() > 0.5 * q).nonzero(as_tuple=False).view(-1).tolist()
-    if len(changed) <= 1:
-        return
-    changed.sort(key=lambda i: float(g[i].abs()))  # least salient -> swap out first
-    incoming = [int(i) for i in sparse_order[:4096].tolist() if cur[int(i)].abs() <= 0.5 * q]
-    ci = 0
-    for out_idx in changed:
-        if time_left() <= 1.3 * t_png or ci >= len(incoming):
-            break
-        in_idx = incoming[ci]
-        ci += 1
-        s = -1.0 if float(g[in_idx]) > 0.0 else 1.0
-        if (s > 0.0 and clean_flat[in_idx] >= 1.0) or (s < 0.0 and clean_flat[in_idx] <= 0.0):
-            continue
-        trial = cur.clone()
-        trial[out_idx] = 0.0
-        trial[in_idx] = s * q
-        if consider((clean + trial.view_as(clean)).clamp(0.0, 1.0))[tier_key]:
-            cur = trial  # accept swap
-
-
-def _kfixed_feasible(model, clean, target_index, k_min, time_left, t_step, t_png, max_iters=4):
-    """Can ANY ±(k_min/255) L∞ perturbation flip the argmax at all? Iterated FGSM in the ball is
-    the strongest such attack; if it never drives the CW margin below 0, no sparse subset exists
-    either and we skip the search to return clean fast. DENSE probe — feasibility only, never emitted.
-    """
-    r = k_min * _Q
-    delta = torch.zeros_like(clean)
-    for _ in range(max(1, max_iters)):
-        if time_left() <= t_step + 1.3 * t_png:
-            break
-        x = (clean + delta).clamp(0.0, 1.0)
-        m, g = _margin_and_grad(model, x, target_index)
-        if m < 0.0:
-            return True
-        delta = ((clean + delta - r * g.sign()).clamp(0.0, 1.0) - clean).clamp(-r, r)
-    x = (clean + delta).clamp(0.0, 1.0)
-    m, _ = _margin_and_grad(model, x, target_index)
-    return m < 0.0
+    seen = _png_roundtrip(cand_chw, device)
+    diff = seen - clean
+    linf = float(diff.abs().max().item())
+    rmse = float(torch.sqrt(torch.mean(diff * diff)).item())
+    in_band = floor <= linf <= cap
+    with torch.no_grad():
+        logits = logits_for_images(model=model, image_bchw=seen.unsqueeze(0))[0]
+    others = logits.clone()
+    others[target_index] = float("-inf")
+    margin = float((logits[target_index] - others.max()).item())
+    flipped = margin < 0.0
+    soft, valid, ssim, psnr = False, False, None, None
+    if in_band and flipped:
+        ssim = _compute_ssim(clean, seen)
+        psnr = _compute_psnr_db(clean, seen)
+        quality = ssim >= _MIN_SSIM and psnr >= _MIN_PSNR_DB
+        soft = quality
+        valid = quality and margin <= -buffer
+    return {"cand": cand_chw, "linf": linf, "rmse": rmse, "flipped": flipped, "margin": margin,
+            "soft": soft, "valid": valid, "ssim": ssim, "psnr": psnr}
 
 
 def perturb(
@@ -389,9 +370,7 @@ def perturb(
     start_time: float | None = None,
     steps: int | None = None,
 ) -> torch.Tensor:
-    """Minimum-L0 unit-step flip (Approach 5.4 hybrid): prefix-sum target init -> margin-budgeted
-    greedy growth (re-linearized) -> TF32-envelope PNG verify -> backward reduction -> swap polish,
-    gated on a calibrated transfer margin within the deadline."""
+    """Sparse minimum-RMSE L∞ flip: target class selection + re-linearize + FMN-L0 (all three)."""
     t_start = start_time if start_time is not None else time.time()
     clean = clean.to(device).clamp(0.0, 1.0)
 
@@ -399,7 +378,9 @@ def perturb(
     cap = min(float(epsilon), float(_MAX_LINF_DELTA))
     if floor > cap:
         floor = cap
-    k_min = max(1, int(math.ceil(floor * 255.0 - 1e-6)))  # fixed unit step (typically 1)
+    k_min = max(1, int(math.ceil(floor * 255.0 - 1e-6)))
+    k_max = max(k_min, int(math.floor(cap * 255.0 + 1e-6)))
+    levels = list(range(k_min, k_max + 1))
 
     g_t0 = time.time()
     m0, grad0 = _margin_and_grad(model, clean, target_index)
@@ -415,12 +396,15 @@ def perturb(
     def time_left():
         return deadline - time.time()
 
-    # Two gated trackers — best_safe (margin-safe, trusted) and best_soft (boundary-thin fallback),
-    # each kept by (linf, rmse). From the moment either is set a gated candidate is always ready.
+    # Two gated trackers — never an ungated image.
+    #   best_safe : best margin-safe flip (m <= -buffer), by (linf, rmse) lexicographically.
+    #   best_soft : best soft flip (m < 0 but margin-thin), the fallback tier.
+    # The anytime invariant: from the moment either tracker is set, a gated candidate is
+    # always ready to return; until then the clean image is the gated fallback.
     best_safe = None
     best_soft = None
-    n_evals = 0
-    best_margin_seen = m0
+    n_evals = 0                  # diagnostics: number of consider() forward passes
+    best_margin_seen = m0        # diagnostics: deepest (most negative) margin observed
 
     def consider(cand_chw):
         nonlocal best_safe, best_soft, t_png, n_evals, best_margin_seen
@@ -436,82 +420,190 @@ def perturb(
             best_safe = res
         return res
 
+    # Default sparse order from the untargeted gradient; target selection may override it.
     grad_use = grad0
     g_abs_use, sparse_order_use, valid_count_use = _build_sparse_order(grad0.view(-1), clean.view(-1))
 
-    # ---- anytime floor: bank some gated flip fast (transfer reliability before minimization) ----
-    full_step_flipped = False
+    # =========================== BANK A FLIP ASAP (anytime floor) ======================
+    # Before spending budget on target selection / minimisation, lock in *some* gated flip
+    # so a clean-tier (score 0) return is impossible whenever a flip is reachable. A small
+    # escalating sweep of top-saliency ±1/255 channels stops at the first soft flip; the
+    # minimisation phases below then drive the channel count (and rmse) back down.
     if valid_count_use > 0:
         for frac in (0.02, 0.1, 0.4, 1.0):
             if best_soft is not None or time_left() <= 1.3 * t_png:
                 break
             n = max(1, min(valid_count_use, int(frac * valid_count_use)))
-            sel = sparse_order_use[:n]
             d = torch.zeros_like(grad0.view(-1))
-            d[sel] = -(k_min * _Q) * grad0.view(-1)[sel].sign()
-            res_b = consider((clean + d.view_as(clean)).clamp(0.0, 1.0))
-            if n >= valid_count_use:
-                full_step_flipped = res_b["flipped"]
+            d[sparse_order_use[:n]] = -(k_min * _Q) * grad0.view(-1)[sparse_order_use[:n]].sign()
+            consider((clean + d.view_as(clean)).clamp(0.0, 1.0))
+        if best_soft is not None:
+            logger.debug(f"[bank] flip banked n_evals={n_evals} margin={best_soft['margin']:.4f}")
 
-    # ---- k=1 feasibility gate: skip the search (return clean fast) if no 1/255 flip exists ----
-    feasible = True
     if m0 > 0.0:
-        feasible = full_step_flipped
-        if not feasible and time_left() > 4 * t_step:
-            feasible = _kfixed_feasible(model, clean, target_index, k_min, time_left, t_step, t_png)
-        if not feasible:
-            logger.info(f"[feasibility] unflippable at k={k_min} (best_margin_seen={best_margin_seen:.4f}) -> clean")
-
-    if m0 > 0.0 and feasible:
-        # ---- step 2: prefix-sum target selection (keep top-N cheapest rivals) ----
-        target_list = []
+        # =================== STRATEGY 1: TARGET CLASS SELECTION =========================
         if time_left() > (_TARGET_PROBE_N + 2) * t_step:
-            probe_end = time.time() + _TARGET_PROBE_N * t_step * 1.5
-            target_list = _select_best_targets(model, clean, target_index, device, k_min,
-                                                n_probe=_TARGET_PROBE_N, keep_n=_TARGET_KEEP_N,
-                                                time_budget=min(probe_end, deadline - 3 * t_step))
-            if target_list:
-                logger.debug(f"[target_sel] classes={[d['cls'] for d in target_list]} "
-                             f"n_est={[d['n_est'] for d in target_list]}")
+            probe_budget_end = time.time() + _TARGET_PROBE_N * t_step * 1.5
+            best_t, best_tgrad, best_torder, best_tg_abs, best_tvc = _select_best_target(
+                model, clean, target_index, device, k_min,
+                n_probe=_TARGET_PROBE_N,
+                time_budget=min(probe_budget_end, deadline - 3 * t_step),
+            )
+            if best_tgrad is not None and best_tvc > 0:
+                grad_use = best_tgrad
+                sparse_order_use = best_torder
+                g_abs_use = best_tg_abs
+                valid_count_use = best_tvc
+                logger.debug(f"[target_sel] chose class={best_t}")
 
-        # ---- steps 3-4: greedy growth per kept target; real forwards pick the winner ----
-        if target_list:
-            for tinfo in target_list:
-                if time_left() <= 2.0 * t_png:
+        # =================== PHASE 1: minimal-flip sparse top-k binary search ===========
+        # The search accept predicate is the flip itself ("soft"): it finds the smallest
+        # channel count whose ±1/255 perturbation flips the argmax. Margin-deepening to
+        # m <= -buffer is handled afterwards by safety-grow, so the search isn't slowed
+        # chasing depth.
+        g_flat = grad_use.view(-1)
+        if valid_count_use > 0:
+            _run_sparse_binary_search(clean, g_flat, k_min, valid_count_use,
+                                      sparse_order_use, g_abs_use, m0, consider, time_left, t_png)
+
+        # Gated FGSM probe — only if no flip has been banked yet.
+        if best_soft is None:
+            for k in levels[:3]:
+                if time_left() <= 1.3 * t_png:
                     break
-                _greedy_grow(model, clean, target_index, tinfo["grad"], tinfo["order"], tinfo["vc"],
-                             k_min, tinfo["n_est"], consider, time_left, t_step, t_png)
-                if best_safe is not None:  # adopt the winning target's order for reduction/swap
-                    grad_use, sparse_order_use = tinfo["grad"], tinfo["order"]
-        else:
-            _greedy_grow(model, clean, target_index, grad0, sparse_order_use, valid_count_use,
-                         k_min, 1, consider, time_left, t_step, t_png)
-    elif m0 <= 0.0:
-        # ---- already misclassified: deepen a sparse ±1/255 flip into the margin-safe tier ----
-        logger.debug(f"[already_misclassified] m0={m0:.4f}")
-        _greedy_grow(model, clean, target_index, grad0, sparse_order_use, valid_count_use,
-                     k_min, 1, consider, time_left, t_step, t_png)
+                if consider(_signed_step(clean, grad0, k * _Q))["soft"]:
+                    break
 
-    # ---- step 5: backward reduction (where most L0 shrink is realized) ----
-    if _PRUNE_ENABLE and sparse_order_use is not None and time_left() > 2.0 * t_png:
-        if best_safe is not None:
-            _prune(clean, best_safe, "valid", grad_use, k_min, consider, time_left, t_png)
-        elif best_soft is not None:
-            _prune(clean, best_soft, "soft", grad_use, k_min, consider, time_left, t_png)
-
-    # ---- Sparse-RS swap polish + a final reduction pass on any margin unlocked by the swaps ----
-    if sparse_order_use is not None and time_left() > 3.0 * t_png:
-        tier = "valid" if best_safe is not None else "soft"
+        # =================== STRATEGY 2: RE-LINEARIZE AT BOUNDARY =======================
+        _bisect_steps = _RELINEARIZE_BISECT_STEPS
+        needed_2 = _bisect_steps * t_png + t_step + 4 * t_png
         anchor = best_safe if best_safe is not None else best_soft
-        if anchor is not None:
-            _sparse_rs_swap(clean, anchor, tier, grad_use, k_min, sparse_order_use, consider, time_left, t_png)
-            if _PRUNE_ENABLE and time_left() > 2.0 * t_png:
-                anchor = best_safe if best_safe is not None else best_soft
-                _prune(clean, anchor, "valid" if best_safe is not None else "soft",
-                       grad_use, k_min, consider, time_left, t_png)
+        if anchor is not None and time_left() > needed_2:
+            delta_dir = anchor["cand"].detach() - clean
+            lam_lo, lam_hi = 0.0, 1.0
+            for _ in range(_bisect_steps):
+                if time_left() <= t_step + 3 * t_png:
+                    break
+                lam_mid = (lam_lo + lam_hi) / 2.0
+                x_mid = (clean + lam_mid * delta_dir).clamp(0.0, 1.0)
+                x_mid_png = _png_roundtrip(x_mid, device)
+                if predict_index(model=model, image_chw=x_mid_png) != target_index:
+                    lam_hi = lam_mid
+                else:
+                    lam_lo = lam_mid
 
-    # ---- gated tiered finalize: margin-safe -> soft -> clean (never an ungated dense image) ----
-    diag = f"best_margin_seen={best_margin_seen:.4f} n_evals={n_evals} time_left={time_left():.2f}s"
+            if time_left() > t_step + 2 * t_png:
+                x_bnd = (clean + lam_hi * delta_dir).clamp(0.0, 1.0)
+                m_bnd, grad_bnd = _margin_and_grad(model, x_bnd, target_index)
+                logger.debug(f"[relinearize] lam_hi={lam_hi:.4f} m_bnd={m_bnd:.4f}")
+                if m_bnd < 1.0 and time_left() > 2 * t_png:
+                    g2 = grad_bnd.view(-1)
+                    g2_valid, ord2, vc2 = _build_sparse_order(g2, clean.view(-1))
+                    if vc2 > 0:
+                        m2 = max(abs(m_bnd), 0.05)
+                        _run_sparse_binary_search(clean, g2, k_min, vc2, ord2, g2_valid,
+                                                  m2, consider, time_left, t_png)
+                        # Re-linearized gradient is tangent to the true surface: prefer its
+                        # order for safety-grow below.
+                        grad_use, sparse_order_use = grad_bnd, ord2
+
+        # =================== STRATEGY 3: FMN-L0 (optional, same gate) ===================
+        # A sparse ±1/255 flip already sits at the linf optimum; only run FMN when we have
+        # no flip at the k_min step yet.
+        best_any = best_safe if best_safe is not None else best_soft
+        won_k_min = best_any is not None and best_any["linf"] <= k_min * _Q + 1e-9
+        if not won_k_min and _FMN_L0_TIME_FRAC > 0.0 and time_left() > 2 * t_step:
+            l0_time = _FMN_L0_TIME_FRAC * time_left()
+            l0_steps = max(20, int(l0_time / t_step))
+            logger.debug(f"[fmn_l0] steps={l0_steps} budget={l0_time:.2f}s")
+            cand_l0 = _fmn_l0_snapped(model, clean, target_index, device, l0_steps)
+            if cand_l0 is not None and time_left() > 1.3 * t_png:
+                res_l0 = consider(cand_l0)
+                logger.debug(f"[fmn_l0] valid={res_l0['valid']} linf={res_l0['linf']:.6f} rmse={res_l0['rmse']:.6f}")
+
+        # =================== PHASE 2: FMN-LInf (optional, same gate) ====================
+        best_any = best_safe if best_safe is not None else best_soft
+        won_k_min = best_any is not None and best_any["linf"] <= k_min * _Q + 1e-9
+        affordable = int(0.55 * time_left() / t_step)
+        if not won_k_min and affordable >= 4:
+            fmn_steps = int(steps) if steps else min(60, affordable)
+            direction = _fmn_direction(model, clean, target_index, device, fmn_steps)
+            if direction is not None:
+                base_linf = float(direction.abs().max().item())
+                if base_linf > 1e-12:
+                    for k in levels:
+                        if time_left() <= 1.3 * t_png:
+                            break
+                        if best_any is not None and k * _Q >= best_any["linf"] - 1e-12:
+                            break
+                        if consider(_scale_dir(clean, direction, base_linf, k * _Q))["soft"]:
+                            break
+
+        # =================== PHASE 3: PGD fallback (same gate) ==========================
+        if best_safe is None and best_soft is None:
+            delta = torch.zeros_like(clean)
+            for k in levels:
+                r = k * _Q
+                alpha = max(_Q, r / 4.0)
+                delta = delta.clamp(-r, r)
+                local = 0
+                while time_left() > t_step + 1.3 * t_png and local < 12:
+                    x = (clean + delta).clamp(0.0, 1.0)
+                    margin, grad = _margin_and_grad(model, x, target_index)
+                    if margin < 0.0 and consider(x)["soft"]:
+                        break
+                    delta = ((clean + delta - alpha * grad.sign()).clamp(0.0, 1.0) - clean).clamp(-r, r)
+                    local += 1
+                if best_soft is not None:
+                    break
+    else:
+        # =================== ALREADY MISCLASSIFIED (m0 <= 0) ===========================
+        # The clean image is already wrong. Emit a minimal ±1/255 sparse perturbation on
+        # the top-saliency channels that keeps the argmax wrong with m <= -buffer and
+        # norm >= min_delta, routed through the same gate. No dense FGSM fallback.
+        logger.debug(f"[already_misclassified] m0={m0:.4f}")
+        g_flat = grad0.view(-1)
+        g_abs_use, sparse_order_use, valid_count_use = _build_sparse_order(g_flat, clean.view(-1))
+        if valid_count_use > 0:
+            _run_sparse_binary_search(clean, g_flat, k_min, valid_count_use,
+                                      sparse_order_use, g_abs_use, max(abs(m0), 0.05),
+                                      consider, time_left, t_png)
+
+    # =========================== SAFETY-GROW ==========================================
+    # The minimisation phases search on the flip itself, so the best flip we hold may be a
+    # thin soft flip (m < 0 but > -buffer) rather than margin-safe. Here we deepen it: append
+    # up to ~64 additional top-saliency ±1/255 channels until m <= -buffer (ideally
+    # <= -2*buffer). linf stays at k_min/255 (the 0.933 optimum); only rmse rises a little.
+    # This is what promotes a soft flip into the trusted margin-safe tier. No elimination.
+    anchor = best_safe if best_safe is not None else best_soft
+    if (anchor is not None and sparse_order_use is not None
+            and anchor["margin"] > -2.0 * _MARGIN_BUFFER):
+        grad_flat = grad_use.view(-1)
+        cur_delta = (anchor["cand"].detach() - clean).view(-1).clone()
+        changed = cur_delta.abs() > (0.5 * _Q)
+        n_changed = int(changed.sum().item())
+        window = min(sparse_order_use.numel(), n_changed + 4096)
+        to_add = []
+        for idx in sparse_order_use[:window].tolist():
+            if len(to_add) >= 64:
+                break
+            if not changed[idx]:
+                to_add.append(idx)
+        i, batch = 0, 16
+        while i < len(to_add) and time_left() > 1.3 * t_png:
+            for idx in to_add[i:i + batch]:
+                cur_delta[idx] = -(k_min * _Q) * grad_flat[idx].sign()
+            i += batch
+            cand_g = (clean + cur_delta.view_as(clean)).clamp(0.0, 1.0)
+            res_g = consider(cand_g)
+            if res_g["valid"] and (best_safe is None or res_g["margin"] < best_safe["margin"]):
+                best_safe = res_g
+            if best_safe is not None and best_safe["margin"] <= -2.0 * _MARGIN_BUFFER:
+                break
+
+    # =========================== GATED TIERED FINALIZE ================================
+    diag = (f"best_margin_seen={best_margin_seen:.4f} n_evals={n_evals} "
+            f"time_left={time_left():.2f}s deadline_hit={time_left() <= 1.3 * t_png}")
     if best_safe is not None:
         logger.info(f"[finalize] tier=margin_safe margin={best_safe['margin']:.4f} "
                     f"linf={best_safe['linf']:.6f} rmse={best_safe['rmse']:.6f} {diag}")
@@ -520,30 +612,16 @@ def perturb(
         logger.info(f"[finalize] tier=soft_flip margin={best_soft['margin']:.4f} "
                     f"linf={best_soft['linf']:.6f} rmse={best_soft['rmse']:.6f} {diag}")
         return best_soft["cand"].detach().clamp(0.0, 1.0)
-    logger.info(f"[finalize] tier=clean (no gated flip found) {diag}")
+    logger.info(f"[finalize] tier=clean (no gated flip found; returning clean image) {diag}")
     return clean.detach().clamp(0.0, 1.0)
 
 
 def _warmup(model: torch.nn.Module, device: torch.device) -> None:
-    """Warm CUDA kernels / allocator / cuDNN at first load so the first real challenge does not
-    pay JIT + autotune latency. Exercises the exact inference path: preprocess + forward +
-    backward + PNG round-trip, under both TF32 settings (the verifier toggles both at runtime)."""
-    t0 = time.time()
     try:
-        logger.info(f"[MINER] warmup start device={device.type}")
-        for tf32 in (False, True):
-            if device.type == "cuda":
-                torch.backends.cuda.matmul.allow_tf32 = tf32
-                torch.backends.cudnn.allow_tf32 = tf32
-            x = torch.rand(1, 3, 480, 480, device=device, requires_grad=True)
-            logits_for_images(model=model, image_bchw=x).sum().backward()
-        if device.type == "cuda":
-            torch.backends.cuda.matmul.allow_tf32 = False
-            torch.backends.cudnn.allow_tf32 = False
-        _ = _png_roundtrip(torch.rand(3, 480, 480, device=device), device)
+        x = torch.rand(1, 3, 480, 480, device=device, requires_grad=True)
+        logits_for_images(model=model, image_bchw=x).sum().backward()
         if device.type == "cuda":
             torch.cuda.synchronize()
-        logger.info(f"[MINER] warmup done device={device.type} elapsed={time.time() - t0:.2f}s")
     except Exception as err:
         logger.warning(f"[MINER] warmup skipped: {err}")
 
@@ -633,11 +711,6 @@ class PerturbMiner:
         self.subtensor = self._init_subtensor_with_retry()
         self.metagraph = self._init_metagraph_with_retry()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        logger.info(
-            f"[MINER] compute device={self.device.type} "
-            f"cuda_available={torch.cuda.is_available()} "
-            f"cuda_device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}"
-        )
 
         self.model = load_efficientnet_v2_l(self.device)
         _warmup(self.model, self.device)
