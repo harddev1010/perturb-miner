@@ -14,6 +14,11 @@ TF32 envelope) is <= -MARGIN_BUFFER on the PNG round-trip, not merely argmax != 
 growth may over-include channels; backward reduction + swap are where most of the L0 shrink
 is realized. Pixel-count is the gentle tiebreaker, transfer the hard gate.
 
+FALLBACK: if no verified flip exists at the unit step, perturb_fallback() escalates to the
+next quantization level (±2/255) and re-runs the same hybrid (target select -> greedy growth
+-> reduction) at that larger step. This trades linf_score (2/255 -> ~0.67) for the ability to
+flip images the unit step cannot — a low-score flip still beats a score-0 clean return.
+
 TUNABLE ENV VARS:
   PERTURB_MINER_MARGIN_BUFFER   (0.01) transfer-safety margin kappa (require m <= -buffer)
   PERTURB_TARGET_PROBE_N        (10)   wrong classes probed for target selection
@@ -520,8 +525,95 @@ def perturb(
         logger.info(f"[finalize] tier=soft_flip margin={best_soft['margin']:.4f} "
                     f"linf={best_soft['linf']:.6f} rmse={best_soft['rmse']:.6f} {diag}")
         return best_soft["cand"].detach().clamp(0.0, 1.0)
+
+    # ---- no verified flip at the unit step: escalate to a larger step (k+1, i.e. ±2/255) ----
+    k_fb = min(k_min + 1, int(math.floor(cap * 255.0 + 1e-6)))
+    if k_fb > k_min and time_left() > 4.0 * t_png:
+        logger.info(f"[finalize] no unit-step flip -> fallback k={k_fb} {diag}")
+        fb = perturb_fallback(model, clean, target_index, floor, cap, device,
+                              deadline, t_step, t_png, k_fb, grad0=grad0)
+        if fb is not None:
+            return fb
+
     logger.info(f"[finalize] tier=clean (no gated flip found) {diag}")
     return clean.detach().clamp(0.0, 1.0)
+
+
+def perturb_fallback(model, clean, target_index, floor, cap, device, deadline,
+                     t_step, t_png, k_step, grad0=None):
+    """Larger-step fallback when the unit step cannot flip the image.
+
+    Runs the same proper hybrid as perturb() — prefix-sum target selection -> margin-budgeted
+    greedy growth (re-linearized, TF32-envelope verified) -> backward reduction — but with a
+    fixed k_step·(1/255) step instead of 1/255. linf jumps to k_step/255 the moment any channel
+    moves (so linf_score drops), but reduction still minimizes the changed-channel count (rmse).
+    Returns a gated candidate tensor (margin-safe preferred, else soft), or None if even k_step
+    yields no verified flip (caller then returns the clean image).
+    """
+    def time_left():
+        return deadline - time.time()
+
+    if grad0 is None:
+        _, grad0 = _margin_and_grad(model, clean, target_index)
+
+    # Dense feasibility at k_step: if iterated FGSM in the ±(k_step/255) ball never flips,
+    # no sparse subset exists at this step either — bail before burning the budget.
+    if not _kfixed_feasible(model, clean, target_index, k_step, time_left, t_step, t_png):
+        logger.info(f"[fallback k={k_step}] unflippable even at this step")
+        return None
+
+    best_safe = None
+    best_soft = None
+
+    def consider(cand_chw):
+        nonlocal best_safe, best_soft
+        res = _evaluate(model, clean, cand_chw, target_index, device, floor, cap, _MARGIN_BUFFER)
+        if res["soft"] and (best_soft is None or (res["linf"], res["rmse"]) < (best_soft["linf"], best_soft["rmse"])):
+            best_soft = res
+        if res["valid"] and (best_safe is None or (res["linf"], res["rmse"]) < (best_safe["linf"], best_safe["rmse"])):
+            best_safe = res
+        return res
+
+    g_abs_use, order_use, valid_count = _build_sparse_order(grad0.view(-1), clean.view(-1))
+    if valid_count == 0:
+        return None
+    grad_use = grad0
+
+    # Target selection + greedy growth at the larger step.
+    target_list = []
+    if time_left() > (_TARGET_PROBE_N + 2) * t_step:
+        target_list = _select_best_targets(model, clean, target_index, device, k_step,
+                                            n_probe=_TARGET_PROBE_N, keep_n=_TARGET_KEEP_N,
+                                            time_budget=deadline - 3 * t_step)
+    if target_list:
+        for tinfo in target_list:
+            if time_left() <= 2.0 * t_png:
+                break
+            _greedy_grow(model, clean, target_index, tinfo["grad"], tinfo["order"], tinfo["vc"],
+                         k_step, tinfo["n_est"], consider, time_left, t_step, t_png)
+            if best_safe is not None:
+                grad_use, order_use = tinfo["grad"], tinfo["order"]
+    else:
+        _greedy_grow(model, clean, target_index, grad0, order_use, valid_count,
+                     k_step, 1, consider, time_left, t_step, t_png)
+
+    # Backward reduction.
+    if _PRUNE_ENABLE and time_left() > 2.0 * t_png:
+        if best_safe is not None:
+            _prune(clean, best_safe, "valid", grad_use, k_step, consider, time_left, t_png)
+        elif best_soft is not None:
+            _prune(clean, best_soft, "soft", grad_use, k_step, consider, time_left, t_png)
+
+    if best_safe is not None:
+        logger.info(f"[fallback k={k_step}] tier=margin_safe margin={best_safe['margin']:.4f} "
+                    f"linf={best_safe['linf']:.6f} rmse={best_safe['rmse']:.6f}")
+        return best_safe["cand"].detach().clamp(0.0, 1.0)
+    if best_soft is not None:
+        logger.info(f"[fallback k={k_step}] tier=soft_flip margin={best_soft['margin']:.4f} "
+                    f"linf={best_soft['linf']:.6f} rmse={best_soft['rmse']:.6f}")
+        return best_soft["cand"].detach().clamp(0.0, 1.0)
+    logger.info(f"[fallback k={k_step}] no flip found")
+    return None
 
 
 def _warmup(model: torch.nn.Module, device: torch.device) -> None:
