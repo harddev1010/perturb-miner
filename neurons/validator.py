@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import base64
 import hashlib
+import io
 import json
 import logging as pylogging
 import math
@@ -16,7 +17,6 @@ from typing import Any, Sequence
 
 import bittensor as bt
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 try:
@@ -36,14 +36,11 @@ logger = pylogging.getLogger(__name__)
 class ChallengeSpec:
     task_id: str
     model_name: str
-    prompt: str
     clean_image_b64: str
     true_label: str
     epsilon: float
     norm_type: str
     timeout_seconds: int
-    fallback_used: bool = False
-    verified_by_llm: bool = True
 
 
 @dataclass
@@ -190,6 +187,14 @@ class PerturbValidator:
         self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
         self.reason_counts_total: Counter[str] = Counter()
         self.miner_emission_share = 1
+        self.imagenet100_order_seed = 0
+        self.imagenet100_order_cursor = 0
+        self.imagenet100_order_fingerprint = ""
+        self.imagenet100_order_epoch = 0
+        self._imagenet100_index: list[tuple[str, int]] = []
+        self._imagenet100_dataset: Any | None = None
+        self._imagenet100_order_cache: list[str] = []
+        self._imagenet100_order_cache_key: tuple[str, int] = ("", 0)
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
@@ -253,8 +258,13 @@ class PerturbValidator:
     def _load_state(self) -> None:
         if not os.path.exists(self.state_path):
             return
-        with open(self.state_path, "r", encoding="utf-8") as handle:
-            state = json.load(handle)
+        try:
+            with open(self.state_path, "r", encoding="utf-8") as handle:
+                state = json.load(handle)
+        except Exception as exc:
+            # Saves are atomic, so this should never happen; never brick startup on it.
+            logger.error(f"Validator state file is unreadable, starting fresh: {self.state_path} ({exc})")
+            return
         self.step = int(state.get("step", 0))
         self.last_weight_block = int(state.get("last_weight_block", 0))
 
@@ -277,6 +287,10 @@ class PerturbValidator:
                 value = saved_hotkeys[idx]
                 if isinstance(value, str):
                     self.uid_hotkeys[idx] = value
+        self.imagenet100_order_seed = max(0, int(state.get("imagenet100_order_seed", 0)))
+        self.imagenet100_order_cursor = max(0, int(state.get("imagenet100_order_cursor", 0)))
+        self.imagenet100_order_fingerprint = str(state.get("imagenet100_order_fingerprint", "") or "")
+        self.imagenet100_order_epoch = max(0, int(state.get("imagenet100_order_epoch", 0)))
         self._reconcile_uid_identities()
 
     def _save_state(self) -> None:
@@ -289,9 +303,19 @@ class PerturbValidator:
             "processed_counts": self.processed_counts.tolist(),
             "score_histories": [history[-self.config.perturb.history_size :] for history in self.score_histories],
             "uid_hotkeys": self.uid_hotkeys,
+            "imagenet100_order_seed": int(self.imagenet100_order_seed),
+            "imagenet100_order_cursor": int(self.imagenet100_order_cursor),
+            "imagenet100_order_fingerprint": self.imagenet100_order_fingerprint,
+            "imagenet100_order_epoch": int(self.imagenet100_order_epoch),
         }
-        with open(self.state_path, "w", encoding="utf-8") as handle:
+        # Atomic write: a crash mid-save must never corrupt the state file,
+        # otherwise a restart could reset the traversal and repeat images.
+        tmp_path = f"{self.state_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, self.state_path)
 
     def _init_wandb(self) -> None:
         if not bool(getattr(self.config.perturb, "wandb_enabled", False)):
@@ -385,118 +409,101 @@ class PerturbValidator:
         # Deterministic epsilon in [0.06, 0.2]
         return 0.06 + (seed % 1400) / 10000.0
 
-    def _choose_prompt(self, seed: int) -> str:
-        _ = seed  # Keep signature stable; prompt selection is intentionally non-deterministic.
-        return self.system_random.choice(list(C.PROMPTS))
+    def _load_imagenet100_index(self) -> list[tuple[str, int]]:
+        """Open the full ImageNet-100 train split (~126k images) with random
+        access; ids map to dataset row indices."""
+        if self._imagenet100_index:
+            return self._imagenet100_index
 
-    def _parse_llm_endpoint_result(self, payload: Any) -> bool | None:
-        if isinstance(payload, bool):
-            return payload
-        if not isinstance(payload, dict):
-            return None
+        from perturbnet.imagenet100_bootstrap import imagenet100_dataset_version, load_imagenet100
 
-        for key in ("is_match", "match", "ok", "valid"):
-            value = payload.get(key)
-            if isinstance(value, bool):
-                return value
-        return None
+        repo_id = str(getattr(self.config.perturb, "imagenet100_repo_id", C.IMAGENET100_REPO_ID))
+        split = str(getattr(self.config.perturb, "imagenet100_split", C.IMAGENET100_SPLIT))
+        dataset = load_imagenet100(repo_id=repo_id, split=split)
+        version = imagenet100_dataset_version(dataset=dataset, repo_id=repo_id, split=split)
+        total_rows = int(dataset.num_rows)
+        if total_rows <= 0:
+            raise RuntimeError(f"ImageNet-100 dataset is empty: repo={repo_id} split={split}")
+        self._imagenet100_dataset = dataset
+        self._imagenet100_index = [(f"hf-{version}-{row:07d}", row) for row in range(total_rows)]
+        logger.info(f"Loaded ImageNet-100 challenge index images={total_rows} repo={repo_id} split={split}")
+        return self._imagenet100_index
 
-    def _llm_endpoint_check(self, predicted_label: str, expected_label: str) -> bool:
-        endpoint = str(
-            getattr(
-                self.config.perturb,
-                "llm_endpoint_url",
-                getattr(self.config.perturb, "label_match_endpoint", ""),
+    def _imagenet100_fingerprint(self, image_ids: Sequence[str]) -> str:
+        digest = hashlib.sha256()
+        for image_id in sorted(image_ids):
+            digest.update(image_id.encode("utf-8"))
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def _derive_imagenet100_order(self, image_ids: Sequence[str], seed: int) -> list[str]:
+        # Deterministic shuffle from the persisted seed: restarts rebuild the
+        # exact same traversal order without storing ~126k ids in state.
+        order = sorted(image_ids)
+        random.Random(seed).shuffle(order)
+        return order
+
+    def _reset_imagenet100_order(self, fingerprint: str, epoch: int) -> None:
+        self.imagenet100_order_seed = self.system_random.randrange(1, 2**63)
+        self.imagenet100_order_cursor = 0
+        self.imagenet100_order_fingerprint = fingerprint
+        self.imagenet100_order_epoch = epoch
+        self._imagenet100_order_cache = []
+        self._imagenet100_order_cache_key = ("", 0)
+
+    def _ensure_imagenet100_order(self, image_ids: Sequence[str]) -> None:
+        fingerprint = self._imagenet100_fingerprint(image_ids)
+        if self.imagenet100_order_fingerprint != fingerprint or self.imagenet100_order_seed <= 0:
+            self._reset_imagenet100_order(fingerprint=fingerprint, epoch=0)
+            logger.info(f"Initialized ImageNet-100 random traversal images={len(image_ids)}")
+        elif self.imagenet100_order_cursor >= len(image_ids):
+            self._reset_imagenet100_order(fingerprint=fingerprint, epoch=self.imagenet100_order_epoch + 1)
+            logger.info(
+                f"ImageNet-100 traversal exhausted; reshuffled for epoch={self.imagenet100_order_epoch} "
+                f"images={len(image_ids)}"
             )
-            or ""
-        ).strip()
-        normalized_prediction = normalize_prediction_label(predicted_label)
-        if not endpoint:
-            logger.error("LLM endpoint url is empty; rejecting verification check.")
-            return False
+        cache_key = (self.imagenet100_order_fingerprint, int(self.imagenet100_order_seed))
+        if self._imagenet100_order_cache_key != cache_key or not self._imagenet100_order_cache:
+            self._imagenet100_order_cache = self._derive_imagenet100_order(
+                image_ids=image_ids, seed=int(self.imagenet100_order_seed)
+            )
+            self._imagenet100_order_cache_key = cache_key
 
-        payload = {
-            "prediction": normalized_prediction,
-            "target_label": expected_label,
-            "llm_model": str(
-                getattr(
-                    self.config.perturb,
-                    "llm_endpoint_model",
-                    getattr(self.config.perturb, "label_match_model", C.LLM_ENDPOINT_MODEL),
-                )
-            ),
-        }
-        timeout_seconds = float(
-            getattr(self.config.perturb, "llm_endpoint_timeout_seconds", 20)
-        )
+    def _mark_imagenet100_image_used(self, image_id: str) -> None:
+        order = self._imagenet100_order_cache
+        if self.imagenet100_order_cursor < len(order) and order[self.imagenet100_order_cursor] != image_id:
+            logger.warning("Accepted ImageNet-100 image does not match traversal cursor; advancing anyway.")
+        self.imagenet100_order_cursor += 1
+
+    def _imagenet100_image_bytes(self, source: int) -> bytes:
+        if self._imagenet100_dataset is None:
+            raise RuntimeError("ImageNet-100 dataset is not loaded")
+        example = self._imagenet100_dataset[int(source)]
+        image = example.get("image")
+        if image is None:
+            raise ValueError(f"ImageNet-100 row {source} has no image payload")
+        buffer = io.BytesIO()
+        image.convert("RGB").save(buffer, format="JPEG", quality=95)
+        return buffer.getvalue()
+
+    def _sample_imagenet100_image(self) -> tuple[str, str]:
+        index = self._load_imagenet100_index()
+        source_by_id = {image_id: source for image_id, source in index}
+        image_ids = list(source_by_id.keys())
+        self._ensure_imagenet100_order(image_ids=image_ids)
+        if not self._imagenet100_order_cache:
+            raise RuntimeError("ImageNet-100 traversal order is empty")
+        image_id = self._imagenet100_order_cache[self.imagenet100_order_cursor]
         try:
-            response = requests.post(endpoint, json=payload, timeout=timeout_seconds)
-            response.raise_for_status()
-            parsed = self._parse_llm_endpoint_result(response.json())
-            if parsed is None:
-                logger.error("LLM endpoint returned unrecognized payload shape; rejecting check.")
-                return False
-            return bool(parsed)
-        except Exception as exc:
-            logger.error(
-                f"LLM endpoint request failed ({exc}); timeout={timeout_seconds}s; rejecting check."
-            )
-            return False
-
-    def _fetch_image_for_prompt(self, prompt: str, seed: int) -> str:
-        endpoint = str(self.config.perturb.image_endpoint).strip()
-        api_key = str(getattr(self.config.perturb, "pexels_api_key", "")).strip()
-        if not api_key:
-            raise ValueError("Missing Pexels API key. Set PERTURB_PEXELS_API_KEY in validator env.")
-        per_page = max(1, min(80, int(getattr(self.config.perturb, "pexels_per_page", 40))))
-        page_span = max(1, int(getattr(self.config.perturb, "pexels_page_span", 10)))
-        image_variant = str(getattr(self.config.perturb, "pexels_image_variant", "medium")).strip().lower()
-        _ = seed  # Keep signature stable; page/photo sampling is intentionally non-deterministic.
-        params = {
-            "query": prompt,
-            "page": self.system_random.randint(1, page_span),
-            "per_page": per_page,
-        }
-        response = requests.get(
-            endpoint,
-            params=params,
-            headers={"Authorization": api_key},
-            timeout=12,
-        )
-        response.raise_for_status()
-        data = response.json()
-        photos = data.get("photos") if isinstance(data, dict) else None
-        if not isinstance(photos, list) or not photos:
-            raise ValueError("Pexels response has no photos for the requested prompt")
-        photo = photos[self.system_random.randrange(len(photos))]
-        src = photo.get("src", {}) if isinstance(photo, dict) else {}
-        if not isinstance(src, dict):
-            src = {}
-        image_url = (
-            src.get(image_variant)
-            or src.get("medium")
-            or src.get("large")
-            or src.get("large2x")
-            or src.get("original")
-        )
-        if not isinstance(image_url, str) or not image_url.strip():
-            raise ValueError("Pexels photo src is missing usable image URL")
-
-        image_response = requests.get(image_url, timeout=12)
-        image_response.raise_for_status()
-        image_bytes = image_response.content
-        if not image_bytes:
-            raise ValueError("Downloaded Pexels image is empty")
-        return base64.b64encode(image_bytes).decode("utf-8")
-
-    def _load_fallback_image_b64(self) -> str:
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        fallback_path = os.path.join(project_root, C.FALLBACK_IMAGE_RELATIVE_PATH)
-        with open(fallback_path, "rb") as handle:
-            raw = handle.read()
-        if not raw:
-            raise ValueError(f"fallback image is empty: {fallback_path}")
-        return base64.b64encode(raw).decode("utf-8")
+            raw = self._imagenet100_image_bytes(source_by_id[image_id])
+            if not raw:
+                raise ValueError(f"ImageNet-100 image is empty: {image_id}")
+        except Exception:
+            # Skip corrupt/unreadable entries permanently in this traversal.
+            self._mark_imagenet100_image_used(image_id=image_id)
+            self._save_state()
+            raise
+        return image_id, base64.b64encode(raw).decode("utf-8")
 
     def generate_challenge(self, block: int) -> ChallengeSpec:
         model_name = C.MODEL_NAME
@@ -509,33 +516,23 @@ class PerturbValidator:
         )
         for attempt in range(self.config.perturb.max_challenge_attempts):
             seed = base_seed + attempt
-            chosen_prompt = self._choose_prompt(seed)
             self._log_summary(
                 "challenge_attempt",
                 attempt=attempt + 1,
                 max_attempts=self.config.perturb.max_challenge_attempts,
-                prompt=chosen_prompt,
                 seed=seed,
+                source="imagenet100",
             )
             self._log_step_start(
                 "challenge_attempt_internal",
                 attempt=attempt + 1,
             )
             try:
-                self._log_step_start("challenge_fetch_image", prompt=chosen_prompt, seed=seed)
-                image_b64 = self._fetch_image_for_prompt(prompt=chosen_prompt, seed=seed)
-                effective_prompt = chosen_prompt
-                used_fallback = False
+                self._log_step_start("challenge_sample_imagenet100", seed=seed)
+                image_id, image_b64 = self._sample_imagenet100_image()
             except Exception as exc:
-                logger.warning(f"Challenge image fetch failed ({exc}), using fallback dog image.")
-                try:
-                    self._log_step_start("challenge_load_fallback_image", label=C.FALLBACK_LABEL)
-                    image_b64 = self._load_fallback_image_b64()
-                    effective_prompt = C.FALLBACK_LABEL
-                    used_fallback = True
-                except Exception as fallback_exc:
-                    logger.warning(f"Fallback image load failed, retrying: {fallback_exc}")
-                    continue
+                logger.warning(f"ImageNet-100 challenge image sample failed, retrying: {exc}")
+                continue
 
             epsilon = self._sample_epsilon(seed)
             task_id = f"{block}-{seed}"
@@ -546,31 +543,24 @@ class PerturbValidator:
                 image = decode_image_b64(image_b64).to(self.device)
                 predicted = predict_label(self.model, image)
                 predicted_label = normalize_prediction_label(predicted)
-                self._log_summary("challenge_model_output", predicted_label=predicted_label)
+                self._log_summary("challenge_model_output", image_id=image_id, predicted_label=predicted_label)
             except Exception as exc:
                 logger.warning(f"Challenge decode/model validation failed, retrying: {exc}")
+                self._mark_imagenet100_image_used(image_id=image_id)
+                self._save_state()
                 continue
 
-            # Verify the candidate by semantically checking model output against the API prompt label.
-            verify_ok = self._llm_endpoint_check(predicted_label, effective_prompt)
-            self._log_summary("challenge_llm_verify", passed=verify_ok)
-            if not verify_ok:
-                logger.info("Sleeping 60s after llm verify-label failure before next challenge attempt.")
-                time.sleep(60)
-                continue
-
+            self._mark_imagenet100_image_used(image_id=image_id)
+            self._save_state()
             return ChallengeSpec(
                 task_id=task_id,
                 model_name=model_name,
-                prompt=effective_prompt,
                 clean_image_b64=image_b64,
                 # Use exact EfficientNet class label for miner targeting and response verification.
                 true_label=predicted_label,
                 epsilon=epsilon,
                 norm_type="Linf",
                 timeout_seconds=self.config.perturb.timeout_seconds,
-                fallback_used=used_fallback,
-                verified_by_llm=True,
             )
 
         raise RuntimeError("Unable to build a validated challenge after max attempts")
@@ -688,7 +678,6 @@ class PerturbValidator:
         synapse = AttackChallenge(
             task_id=challenge.task_id,
             model_name=challenge.model_name,
-            prompt=challenge.prompt,
             clean_image_b64=challenge.clean_image_b64,
             true_label=challenge.true_label,
             epsilon=challenge.epsilon,
@@ -991,15 +980,19 @@ class PerturbValidator:
                 self._log_step_start("loop_get_current_block")
                 block = self.subtensor.get_current_block()
                 self._log_step_start("loop_generate_challenge", block=block)
-                challenge = self.generate_challenge(block=block)
+                try:
+                    challenge = self.generate_challenge(block=block)
+                except Exception as exc:
+                    logger.warning(
+                        f"Challenge generation failed; retrying in {C.CHALLENGE_RETRY_DELAY_SECONDS}s: {exc}"
+                    )
+                    time.sleep(C.CHALLENGE_RETRY_DELAY_SECONDS)
+                    continue
                 self._log_summary(
                     "challenge_summary",
                     task_id=challenge.task_id,
-                    prompt=challenge.prompt,
                     epsilon=f"{challenge.epsilon:.4f}",
                     true_label=challenge.true_label,
-                    llm_verified=challenge.verified_by_llm,
-                    fallback_used=challenge.fallback_used,
                 )
 
                 self._log_step_start("loop_discover_miners")
@@ -1108,8 +1101,6 @@ class PerturbValidator:
                     self.last_weight_block = block
 
                 self.step += 1
-                self._log_step_start("loop_sleep", seconds=self.config.perturb.query_interval_seconds)
-                time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
                 logger.info("Validator stopped by user.")
                 break
