@@ -1,13 +1,18 @@
-"""CPU smoke test for the neurons/perturb engine.
+"""CPU smoke test for the neurons/perturb engine (three-approach edition).
 
 Patches the single forward choke point (neurons.perturb.utils.logits_for_images) with a small
 differentiable linear stub placed NEAR the decision boundary, so a handful of single-byte flips
-suffice — the regime the miner targets. Exercises perturb() end-to-end plus the switches:
-all three orchestrators, a single-algorithm PIPELINE, and the PERTURB_ALLOW_UNSAFE_FLIP gate.
+suffice — the regime the miner targets. Exercises perturb() end-to-end (which runs the hybrid) plus
+each of the three approaches built against a Context directly:
+
+  1. find_apgd_dlr   — exact-byte APGD-DLR over the full ternary cube.
+  2. find_dct_apgd   — low-frequency filtered-gradient APGD-DLR.
+  3. find_hybrid     — APGD-DLR -> DCT-APGD -> targeted repair -> RMSE prune.
 
 Checks: normal m0>0 image -> sparse, in-band, grid-aligned k=1 flip; already-misclassified image
-keeps >=1 changed channel; byte invariant (max_step==1, on-grid) holds; the unsafe-flip gate
-returns clean when nothing is envelope-safe and ALLOW_UNSAFE_FLIP=0, but flips when =1.
+keeps >=1 changed channel; byte invariant (max_step==1, on-grid) holds; each approach flips; the hybrid
+prune shrinks |S| of a dense seed; the unsafe-flip gate returns clean when nothing is envelope-safe and
+ALLOW_UNSAFE_FLIP=0, but flips when =1.
 """
 import importlib
 import os
@@ -60,7 +65,8 @@ def reset_env(**env):
     U.logits_for_images = stub_logits  # the one patch point all forwards funnel through
 
 
-def run(name, clean, t, m0_target, expect_clean=False, **env):
+def run(name, clean, t, m0_target, **env):
+    """End-to-end perturb() (runs the hybrid) on the stub; report the returned candidate's metrics."""
     reset_env(**env)
     setup_stub(clean, t, m0_target)
     adv = P.perturb(model=None, clean=clean, target_index=t, epsilon=0.03, min_delta=0.003,
@@ -77,109 +83,77 @@ def run(name, clean, t, m0_target, expect_clean=False, **env):
     return nz, linf, on_grid, max_step, flipped
 
 
+def build_ctx(clean, t, m0_target=0.012, **env):
+    """A Context wired to the stub, for exercising a single approach in isolation."""
+    reset_env(**env)
+    setup_stub(clean, t, m0_target)
+    cu8 = torch.round(clean.view(-1) * 255.0)
+    m0, g0 = U.margin_and_grad(None, clean, t)
+    dl = time.time() + 8.0
+    return P.Context(
+        model=None, device=device, clean=clean, clean_u8=cu8, shape=clean.shape,
+        target_index=t, k_min=1, q=1.0 / 255.0, floor=0.003, cap=0.03, kappa=C.MARGIN_BUFFER,
+        skip_roundtrip=C.SKIP_ROUNDTRIP, tf32_on=C.TF32_ON, envelope=False,
+        allow_unsafe=C.ALLOW_UNSAFE_FLIP, deadline=dl, t_step=0.005,
+        time_left=lambda: dl - time.time(), bank=P.Bank(), m0=m0, g0=g0.view(-1),
+    )
+
+
+def nz_grid_step(r, clean):
+    diff = (r["cand"] - clean).reshape(-1)
+    bytes_ = (diff * 255.0).round()
+    on_grid = torch.allclose(diff, bytes_ / 255.0, atol=1e-6)
+    return r["nz"], on_grid, int(bytes_.abs().max().item())
+
+
 def main():
     clean = torch.randint(0, 256, (3, 64, 64)).float() / 255.0  # grid-aligned, like a PNG decode
-    FAST = {"PERTURB_FIND_FLIP_BUDGET": "1.5"}  # keep run_all/Square short on CPU
 
-    print("[1] default (first_safe) — normal flip near boundary")
-    nz, linf, grid, step, flip = run("flip", clean, 7, 0.012, **FAST)
+    print("[1] perturb() end-to-end (hybrid) — normal flip near boundary")
+    nz, linf, grid, step, flip = run("hybrid", clean, 7, 0.012)
     assert flip, "should flip"
     assert grid and step == 1, "must be grid-aligned, one byte per channel"
     assert 0.003 - 1e-9 <= linf <= 0.03 + 1e-9, "L_inf in band"
 
     print("[2] already-misclassified — keep >=1 channel, in band")
-    nz2, linf2, grid2, step2, flip2 = run("alreadywrong", clean, 7, -0.012, **FAST)
+    nz2, linf2, grid2, step2, flip2 = run("alreadywrong", clean, 7, -0.012)
     assert flip2 and nz2 >= 1 and grid2 and step2 == 1
     assert linf2 >= 0.003 - 1e-9
 
-    print("[3] all three orchestrators flip (switchable by the one call-site name)")
-    saved = P.find_flip_first_safe
-    for orch in (P.find_flip_first_safe, P.find_flip_first_hit, P.find_flip_run_all):
-        P.find_flip_first_safe = orch  # perturb() resolves this name at call time
-        _, _, g, s, f = run(orch.__name__, clean, 11, 0.012, **FAST)
-        assert f and g and s == 1, f"{orch.__name__} should flip grid-aligned"
-    P.find_flip_first_safe = saved
+    print("[3] each approach flips grid-aligned (built against a Context)")
+    for finder in (P.find_apgd_dlr, P.find_dct_apgd, P.find_hybrid):
+        torch.manual_seed(100)
+        ctx = build_ctx(clean, 11, 0.012)
+        finder(ctx)
+        r = ctx.bank.result(ctx.allow_unsafe)
+        assert r is not None, f"{finder.__name__} found no safe flip"
+        ref, on_grid, mstep = nz_grid_step(r, clean)
+        print(f"  [{finder.__name__}] |S|={ref} on_grid={on_grid} max_step={mstep}")
+        assert on_grid and mstep == 1, f"{finder.__name__} must keep a grid-aligned one-byte flip"
 
-    print("[4] single-algorithm PIPELINE still flips (comment-out simulation)")
-    saved_pipe = P.PIPELINE
-    for algo in (P.batched_multi_loss_qfgsm, P.quantized_pgd_one_byte,
-                 P.quantized_saliency_greedy):
-        P.PIPELINE = [algo]
-        _, _, g, s, f = run(algo.__name__, clean, 11, 0.012,
-                            PERTURB_ALLOW_UNSAFE_FLIP="1", **FAST)
-        assert f and g and s == 1, f"{algo.__name__} alone should flip"
-    P.PIPELINE = saved_pipe
+    print("[4] compress_l0 (L0 continuation) shrinks |S| of a dense seed")
+    torch.manual_seed(100)
+    ctx = build_ctx(clean, 13, 0.012)
+    _, move_dir, _ = U.loss_grad(ctx.model, ctx.clean, ctx.target_index, "ce")   # dense gradient-sign flip
+    P._eval_deltas(ctx, [move_dir * float(ctx.k_min)])
+    r0 = ctx.bank.result(ctx.allow_unsafe)
+    assert r0 is not None, "dense seed did not produce a safe flip"
+    base = r0["nz"]
+    P.compress_l0(ctx)
+    r1 = ctx.bank.result(ctx.allow_unsafe)
+    ref, on_grid, mstep = nz_grid_step(r1, clean)
+    print(f"  [compress_l0] |S| {base} -> {ref}  (drop {100.0 * (base - ref) / max(1, base):.1f}%) "
+          f"on_grid={on_grid} max_step={mstep}")
+    assert on_grid and mstep == 1, "compress_l0 must keep a grid-aligned one-byte flip"
+    assert ref < base, f"compress_l0 must strictly shrink |S| on the exact-gradient stub ({ref} !< {base})"
 
     print("[5] unsafe-flip gate — kappa beyond the achievable margin swing makes nothing safe")
-    # kappa=50 exceeds the largest swing any single-byte flip can produce here, so no candidate is 'safe'.
     nzg, _, _, _, flipg = run("gate-off", clean, 7, 0.005,
-                              PERTURB_MINER_MARGIN_BUFFER="50.0", PERTURB_ALLOW_UNSAFE_FLIP="0", **FAST)
+                              PERTURB_MINER_MARGIN_BUFFER="50.0", PERTURB_ALLOW_UNSAFE_FLIP="0")
     assert nzg == 0 and not flipg, "ALLOW_UNSAFE_FLIP=0 must return clean when nothing is safe"
     _, _, gg, sg, flipa = run("gate-on", clean, 7, 0.005,
-                              PERTURB_MINER_MARGIN_BUFFER="50.0", PERTURB_ALLOW_UNSAFE_FLIP="1", **FAST)
+                              PERTURB_MINER_MARGIN_BUFFER="50.0", PERTURB_ALLOW_UNSAFE_FLIP="1")
     assert flipa and gg and sg == 1, "ALLOW_UNSAFE_FLIP=1 must return any flip"
-
-    print("[6] RMSE refiners — seed a DENSE flip, then each optim_rmse_* shrinks |S| (Bank-decoupled)")
-    # Built directly against a Context (not the live orchestrator switch), so this stays valid no matter
-    # which finder/refiners perturb()'s switch happens to call. Seed = the full CE-sign dense byte flip.
-    def build_ctx(t):
-        reset_env(PERTURB_FIND_FLIP_BUDGET="5.0")   # also re-patches U.logits_for_images with the stub
-        setup_stub(clean, t, 0.012)
-        cu8 = torch.round(clean.view(-1) * 255.0)
-        m0, g0 = U.margin_and_grad(None, clean, t)
-        dl = time.time() + 8.0
-        return P.Context(
-            model=None, device=device, clean=clean, clean_u8=cu8, shape=clean.shape,
-            target_index=t, k_min=1, q=1.0 / 255.0, floor=0.003, cap=0.03, kappa=C.MARGIN_BUFFER,
-            skip_roundtrip=C.SKIP_ROUNDTRIP, tf32_on=C.TF32_ON, envelope=False,
-            allow_unsafe=C.ALLOW_UNSAFE_FLIP, deadline=dl, t_step=0.005,
-            time_left=lambda: dl - time.time(), bank=P.Bank(), m0=m0, g0=g0.view(-1),
-        )
-
-    def seed_dense(ctx):                            # dense gradient-sign flip as the warm-start
-        _, move_dir, _ = U.loss_grad(ctx.model, ctx.clean, ctx.target_index, "ce")
-        P._eval_deltas(ctx, [move_dir * float(ctx.k_min)])
-
-    def seed_prefix(ctx, k):                         # over-provisioned top-k flip (free channels remain to swap in)
-        _, move_dir, score = U.loss_grad(ctx.model, ctx.clean, ctx.target_index, "ce")
-        _, order, valid = U.build_sparse_order(score, move_dir, ctx.clean.view(-1))
-        d = torch.zeros_like(ctx.clean_u8)
-        idx = order[:min(int(k), valid)]
-        d[idx] = move_dir[idx] * float(ctx.k_min)
-        P._eval_deltas(ctx, [d])
-
-    def nz_grid_step(r):                            # |S|, on-grid, max byte step of a Bank result's candidate
-        diff = (r["cand"] - clean).reshape(-1)
-        bytes_ = (diff * 255.0).round()
-        on_grid = torch.allclose(diff, bytes_ / 255.0, atol=1e-6)
-        return r["nz"], on_grid, int(bytes_.abs().max().item())
-
-    # exchange needs free (unused, movable) channels to swap IN, so seed it over-provisioned, not fully dense.
-    refiners = [
-        ("prune", [P.optim_rmse_prune], seed_dense),
-        ("exchange", [P.optim_rmse_exchange], lambda c: seed_prefix(c, 3000)),
-        ("fmn_l2", [P.optim_rmse_fmn_l2], seed_dense),
-        ("fab_l2", [P.optim_rmse_fab_l2], seed_dense),
-        ("sigma_zero", [P.optim_rmse_sigma_zero], seed_dense),
-        ("fmn_l0", [P.optim_rmse_fmn_l0], seed_dense),
-        ("prune+exchange", [P.optim_rmse_prune, P.optim_rmse_exchange], seed_dense),
-    ]
-    for name, chain, seed in refiners:
-        torch.manual_seed(100)
-        ctx = build_ctx(13)
-        seed(ctx)
-        r0 = ctx.bank.result(ctx.allow_unsafe)
-        assert r0 is not None, f"{name}: seed did not produce a safe flip"
-        base = r0["nz"]
-        for refiner in chain:
-            refiner(ctx)
-        r1 = ctx.bank.result(ctx.allow_unsafe)
-        assert r1 is not None, f"{name} lost the flip"
-        ref, on_grid, step = nz_grid_step(r1)
-        print(f"  [{name}] |S| {base} -> {ref}  (drop {100.0 * (base - ref) / max(1, base):.1f}%) "
-              f"on_grid={on_grid} max_step={step}")
-        assert on_grid and step == 1, f"{name} must keep a grid-aligned one-byte flip"
-        assert ref < base, f"{name} must strictly shrink |S| on the exact-gradient stub ({ref} !< {base})"
 
     print("Smoke test PASSED.")
     return 0

@@ -49,9 +49,9 @@ def load_challenges(input_dir: str):
         if b64 in seen:
             dups += 1
             continue
-        if data.get("processed") is not True:
-            skipped += 1
-            continue
+        # if data.get("processed") is not True:
+        #     skipped += 1
+        #     continue
 
         seen.add(b64)
         challenges.append((path, data))

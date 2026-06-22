@@ -33,6 +33,64 @@ logger = pylogging.getLogger(__name__)
 # debugging/replay. Override the location with PERTURB_ERROR_CASES_DIR.
 _ERROR_CASES_DIR = os.getenv("PERTURB_ERROR_CASES_DIR", "/workspace/Perturb_error_cases")
 
+# Every incoming AttackChallenge is also archived here (one JSON per request). Only the newest
+# _ATTACK_CHALLENGES_KEEP files are retained; older ones are rotated into _ATTACK_HISTORY_DIR.
+_ATTACK_CHALLENGES_DIR = os.getenv("PERTURB_ATTACK_CHALLENGES_DIR", "/workspace/Perturb_attack_challenges")
+_ATTACK_HISTORY_DIR = os.getenv("PERTURB_ATTACK_HISTORY_DIR", "/workspace/Perturb_attack_history")
+_ATTACK_CHALLENGES_KEEP = int(os.getenv("PERTURB_ATTACK_CHALLENGES_KEEP", "200"))
+
+
+def _rotate_attack_challenges() -> None:
+    """Keep only the newest _ATTACK_CHALLENGES_KEEP files in _ATTACK_CHALLENGES_DIR; move the rest
+    (oldest first, by mtime) into _ATTACK_HISTORY_DIR."""
+    entries = [
+        os.path.join(_ATTACK_CHALLENGES_DIR, n)
+        for n in os.listdir(_ATTACK_CHALLENGES_DIR)
+        if n.endswith(".json")
+    ]
+    if len(entries) <= _ATTACK_CHALLENGES_KEEP:
+        return
+    entries.sort(key=os.path.getmtime)  # oldest first
+    overflow = entries[: len(entries) - _ATTACK_CHALLENGES_KEEP]
+    os.makedirs(_ATTACK_HISTORY_DIR, exist_ok=True)
+    for src in overflow:
+        dst = os.path.join(_ATTACK_HISTORY_DIR, os.path.basename(src))
+        try:
+            os.replace(src, dst)
+        except Exception as err:
+            logger.warning(f"[attack-challenge] failed to archive {src}: {err}")
+
+
+def _store_attack_challenge(synapse: AttackChallenge) -> None:
+    """Persist every incoming challenge's AttackChallenge input params to {timestamp}_{task_id}.json
+    under _ATTACK_CHALLENGES_DIR, then rotate so only the latest _ATTACK_CHALLENGES_KEEP remain.
+    Best-effort: failures are logged, never raised, so they can't disturb the response."""
+    try:
+        os.makedirs(_ATTACK_CHALLENGES_DIR, exist_ok=True)
+        task_id = str(getattr(synapse, "task_id", "unknown"))
+        safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id) or "unknown"
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(_ATTACK_CHALLENGES_DIR, f"{timestamp}_{safe_task}.json")
+        # Several requests can share a task_id / land in the same second; don't clobber.
+        if os.path.exists(path):
+            path = os.path.join(_ATTACK_CHALLENGES_DIR, f"{timestamp}_{safe_task}_{os.urandom(3).hex()}.json")
+        payload = {
+            "saved_at": timestamp,
+            "task_id": task_id,
+            "model_name": getattr(synapse, "model_name", None),
+            "true_label": getattr(synapse, "true_label", None),
+            "epsilon": getattr(synapse, "epsilon", None),
+            "norm_type": getattr(synapse, "norm_type", None),
+            "min_delta": getattr(synapse, "min_delta", None),
+            "timeout_seconds": getattr(synapse, "timeout_seconds", None),
+            "clean_image_b64": getattr(synapse, "clean_image_b64", None),
+        }
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        _rotate_attack_challenges()
+    except Exception as err:
+        logger.warning(f"[attack-challenge] failed to store challenge task={getattr(synapse, 'task_id', 'unknown')}: {err}")
+
 
 def _dump_error_case(synapse: AttackChallenge, reason: str) -> None:
     """Persist a no-flip challenge's AttackChallenge input params to {timestamp}_{task_id}.json.
@@ -227,6 +285,7 @@ class PerturbMiner:
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
         )
+        _store_attack_challenge(synapse)
         if synapse.norm_type != "Linf":
             logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
             synapse.perturbed_image_b64 = synapse.clean_image_b64
