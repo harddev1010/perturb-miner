@@ -90,7 +90,20 @@ SKIP_ROUNDTRIP = _env_bool("PERTURB_SKIP_ROUNDTRIP", True)
 # kappa: require margin <= -kappa. With the TF32 envelope on, the dominant drift axis is
 # covered by construction, so kappa drops to the residual cushion.
 MARGIN_BUFFER = _env_float("PERTURB_MINER_MARGIN_BUFFER", 0.01)
-KAPPA_RESID = _env_float("PERTURB_KAPPA_RESID", 0.004)
+KAPPA_RESID = _env_float("PERTURB_KAPPA_RESID", 0.004)   # cold-start kappa for the envelope regime
+# Dynamic kappa (calibration.py): under the TF32 envelope, learn kappa online from the observed residual
+# between the fast proxy margin and the exact validator-faithful margin (PNG round-trip + worst TF32),
+# replacing the fixed KAPPA_RESID with a high-quantile upper bound on real drift. CPU / envelope-off keep
+# the static cushion. KAPPA_RESID stays the cold-start fallback until enough residuals are observed.
+DYNAMIC_KAPPA = _env_bool("PERTURB_DYNAMIC_KAPPA", True)
+KAPPA_FLOOR = _env_float("PERTURB_KAPPA_FLOOR", 0.0005)   # smallest kappa once residuals look stable
+KAPPA_CEILING = _env_float("PERTURB_KAPPA_CEILING", 0.02)  # cap against pathological residual spikes
+KAPPA_QUANTILE = _env_float("PERTURB_KAPPA_QUANTILE", 0.99)  # residual quantile (20+ samples)
+KAPPA_CUSHION = _env_float("PERTURB_KAPPA_CUSHION", 0.0002)  # tiny numerical cushion added to the quantile
+KAPPA_SAMPLES = _env_int("PERTURB_KAPPA_SAMPLES", 256)   # rolling residual-history length
+KAPPA_SPREAD_COEF = _env_float("PERTURB_KAPPA_SPREAD_COEF", 0.5)  # per-candidate TF32-spread weight
+KAPPA_STORE = os.getenv("PERTURB_KAPPA_STORE",
+                        os.path.join(os.path.expanduser("~"), ".cache", "perturb", "kappa_calib.json"))
 # cuDNN-TF32 regime for the TF32-sensitive ops (forward + backward). The validator sets no backend
 # flags, so it runs PyTorch defaults: cuDNN convolutions use TF32, matmul does not. EfficientNetV2-L is
 # conv-dominated, so this mirrors the validator's logits. matmul stays off in all cases (see perturb.py).

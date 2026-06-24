@@ -35,12 +35,14 @@ import time
 import torch
 
 from . import constants as K
+from .calibration import env_fingerprint, get_calibrator
 from .utils import (
     Bank,
     Context,
     apply_delta_bytes,
     batch_eval,
     estimate_k,
+    exact_worst_margin,
     logits_of,
     loss_grad,
     margin_and_grad,
@@ -363,7 +365,16 @@ def perturb(
     # candidates are exactly on the k/255 grid and the PNG round-trip is identity.
     clean_u8 = torch.round(clean.view(-1) * 255.0)
     envelope = K.TF32_ENVELOPE and device.type == "cuda"
-    kappa = K.KAPPA_RESID if envelope else K.MARGIN_BUFFER
+
+    # Accept cushion kappa. Under the TF32 envelope (CUDA), learn it online from observed proxy↔exact
+    # margin residuals (calibration.py); KAPPA_RESID is the cold-start fallback. CPU / envelope-off keep
+    # the static MARGIN_BUFFER. Dynamic kappa also enables the per-candidate TF32-spread tightening.
+    use_dynamic = K.DYNAMIC_KAPPA and envelope
+    calib = get_calibrator(env_fingerprint(model, clean.shape)) if use_dynamic else None
+    if calib is not None:
+        kappa = calib.global_kappa()
+    else:
+        kappa = K.KAPPA_RESID if envelope else K.MARGIN_BUFFER
 
     # One gradient evaluation up front: clean margin m0 + boundary gradient g0, and a t_step gate.
     g_t0 = time.time()
@@ -387,17 +398,30 @@ def perturb(
         target_index=target_index, k_min=k_min, q=q, floor=floor, cap=cap, kappa=kappa,
         skip_roundtrip=K.SKIP_ROUNDTRIP, tf32_on=K.TF32_ON, envelope=envelope,
         allow_unsafe=K.ALLOW_UNSAFE_FLIP, deadline=deadline, t_step=t_step, time_left=time_left,
-        bank=Bank(), m0=m0, g0=g0.view(-1),
+        bank=Bank(), m0=m0, g0=g0.view(-1), dynamic_kappa=use_dynamic,
     )
 
     search(ctx)
 
     chosen = ctx.bank.result(ctx.allow_unsafe)
+
+    # Calibrate kappa from the dangerous residual: the chosen candidate's exact validator-faithful margin
+    # (PNG round-trip + worst TF32) vs the search-time proxy margin. Persisted for later attacks.
+    kappa_n = calib.n_samples if calib is not None else 0
+    if calib is not None and chosen is not None:
+        try:
+            m_exact = exact_worst_margin(ctx, chosen["cand"])
+            calib.update(chosen["margin"], m_exact)
+            calib.save()
+        except Exception as err:
+            logger.debug(f"[kappa] calibration update skipped: {err}")
+
     if chosen is None:
         logger.info(
             f"[perturb] no {'' if ctx.allow_unsafe else 'safe '}flip -> clean "
             f"(m0={m0:.4f} elapsed={time.time() - t_start:.3f}s has_flip: {ctx.bank.has_flip} "
-            f"tf32={'on' if K.TF32_ON else 'off'} envelope={'on' if envelope else 'off'} kappa={kappa:.4f})"
+            f"tf32={'on' if K.TF32_ON else 'off'} envelope={'on' if envelope else 'off'} "
+            f"kappa={kappa:.4f}{f'~n{kappa_n}' if use_dynamic else ''})"
         )
         return clean.detach().clamp(0.0, 1.0)
 
@@ -406,6 +430,6 @@ def perturb(
         f"[perturb] flip channels={chosen['nz']} ({pct:.2f}%) margin={chosen['margin']:.4f} "
         f"rmse={chosen['rmse']:.6f} linf={chosen['linf']:.6f} elapsed={time.time() - t_start:.3f}s "
         f"m0={m0:.4f} tf32={'on' if K.TF32_ON else 'off'} envelope={'on' if envelope else 'off'} "
-        f"kappa={kappa:.4f} safe={chosen is ctx.bank.best_safe}"
+        f"kappa={kappa:.4f}{f'~n{kappa_n}' if use_dynamic else ''} safe={chosen is ctx.bank.best_safe}"
     )
     return chosen["cand"].detach().clamp(0.0, 1.0)

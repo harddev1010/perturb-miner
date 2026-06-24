@@ -20,6 +20,7 @@ from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import logits_for_images
 
 from . import constants as K
+from .calibration import candidate_kappa_vec
 
 
 # ==========================================================================================
@@ -254,6 +255,7 @@ class Context:
     m0: float = 0.0              # clean CW margin
     g0: torch.Tensor | None = None  # clean hard-margin gradient (flat)
     t_eval: float = 0.0          # live EMA of one full-batch eval chunk cost (set by batch_eval)
+    dynamic_kappa: bool = False  # tighten the per-candidate accept cushion by the TF32 spread (envelope)
 
 
 def out_of_budget(ctx: "Context") -> bool:
@@ -308,6 +310,20 @@ def _forward_margins(ctx: Context, batch_bchw: torch.Tensor) -> torch.Tensor:
         return cw_margin_batch(logits, ctx.target_index)
 
 
+def exact_worst_margin(ctx: Context, cand_chw: torch.Tensor) -> float:
+    """Worst-case CW margin on the EXACT validator-faithful path: a real PNG encode/decode round-trip,
+    then the worst of the two TF32 regimes (when the envelope is on). This is the locally-observable
+    proxy for the validator's evaluation — its gap to the search-time (proxy) margin is what calibrates
+    the dynamic kappa (see calibration.py)."""
+    seen = png_roundtrip(cand_chw, ctx.device)
+    batch = seen.unsqueeze(0).to(ctx.device)
+    margins = _forward_margins(ctx, batch)
+    if ctx.envelope and ctx.device.type == "cuda" and float(margins[0].item()) < 0.0:
+        alt = margins_with_tf32(ctx.model, batch, ctx.target_index, not ctx.tf32_on)
+        margins = torch.maximum(margins, alt)
+    return float(margins[0].item())
+
+
 def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
     """Grade candidates on the validator-faithful path with a single (batched) forward.
 
@@ -337,13 +353,21 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
             seen_list = [c if ctx.skip_roundtrip else png_roundtrip(c, ctx.device) for c in chunk]
             batch = torch.stack(seen_list, dim=0).to(ctx.device)
             margins = _forward_margins(ctx, batch)  # ambient regime (= ctx.tf32_on)
+            spread = torch.zeros_like(margins)      # |TF32-on − TF32-off| per flipped candidate
             # Envelope: recompute the flipped subset under the OPPOSITE TF32 regime, keep the worst case,
             # so an accepted flip holds under both TF32 on and off (pre-gated on the flipped subset).
             if ctx.envelope and ctx.device.type == "cuda":
                 flipped_idx = (margins < 0.0).nonzero(as_tuple=True)[0]
                 if flipped_idx.numel() > 0:
                     alt = margins_with_tf32(ctx.model, batch[flipped_idx], ctx.target_index, not ctx.tf32_on)
+                    spread[flipped_idx] = (margins[flipped_idx] - alt).abs()
                     margins[flipped_idx] = torch.maximum(margins[flipped_idx], alt)
+            # Per-candidate accept cushion. Static gate: a single kappa. Dynamic (envelope): tighten kappa
+            # for numerically unstable flips by their TF32 spread (a secondary instability signal).
+            if ctx.dynamic_kappa:
+                kap = candidate_kappa_vec(ctx.kappa, spread, K.KAPPA_SPREAD_COEF, K.KAPPA_FLOOR, K.KAPPA_CEILING)
+            else:
+                kap = None
             for j, seen in enumerate(seen_list):
                 diff = seen - ctx.clean
                 linf = float(diff.abs().max().item())
@@ -351,6 +375,7 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
                 nz = int((diff.abs() > half_q).sum().item())
                 margin = float(margins[j].item())
                 flipped = margin < 0.0
+                kappa_j = float(kap[j].item()) if kap is not None else ctx.kappa
                 in_band = ctx.floor <= linf <= ctx.cap
                 quality = False
                 if flipped and in_band:
@@ -360,7 +385,7 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
                 results.append({
                     "cand": chunk[j], "nz": nz, "linf": linf, "rmse": rmse,
                     "margin": margin, "flipped": flipped,
-                    "safe": flipped and margin <= -ctx.kappa, "quality": quality,
+                    "safe": flipped and margin <= -kappa_j, "quality": quality,
                 })
             i += bs
         except torch.cuda.OutOfMemoryError:  # type: ignore[attr-defined]
