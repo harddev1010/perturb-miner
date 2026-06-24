@@ -41,6 +41,33 @@ def _env_bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_ints(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return tuple(int(p) for p in raw.replace(" ", "").split(",") if p)
+    except ValueError:
+        return default
+
+
+def _env_floats(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return tuple(float(p) for p in raw.replace(" ", "").split(",") if p)
+    except ValueError:
+        return default
+
+
+def _env_strs(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return tuple(p for p in raw.replace(" ", "").split(",") if p)
+
+
 # --- Core -------------------------------------------------------------------------------
 Q = 1.0 / 255.0                                            # one byte in [0,1] space
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)  # validator L∞ cap
@@ -77,7 +104,30 @@ ALLOW_UNSAFE_FLIP = _env_bool("PERTURB_ALLOW_UNSAFE_FLIP", False)
 # Candidates evaluated per forward pass (halved on OOM).
 BATCH_SIZE = _env_int("PERTURB_BATCH_SIZE", 32)
 
-# --- one_shot engine --------------------------------------------------------------------
-# Re-linearization fallback: max iterated-FGSM steps taken when no single clean-gradient prefix flips
-# (curved boundary). Each step re-linearizes in the ±q box; the first float-flip is then sparsified.
-MAX_RELIN = _env_int("PERTURB_MAX_RELIN", 10)
+# --- Cardinality-continuation ternary search (integrated find + sparsify) ----------------
+# Feasibility and L0 minimization are solved together: gradients propose actions, an exact fixed-K
+# ternary projection keeps every candidate legal, real candidates are batch-verified, and the support
+# budget K is grown to find the first flip then shrunk (geometric + bisection) to minimize |S|.
+LOSSES = _env_strs("PERTURB_LOSSES", ("dlr", "soft", "hard", "ce"))  # attack-loss portfolio (rotated)
+TAU = _env_float("PERTURB_TAU", 1.0)                  # soft-margin (logsumexp) temperature
+TOPM = _env_int("PERTURB_TOPM", 6)                    # target pool size (top wrong classes)
+POOL_SEEDS = _env_int("PERTURB_POOL_SEEDS", 4)        # smallest-K̂ targets seeded in Phase A
+# Support ladder: prefix sizes as multiples of the linearized crossing size K̂ (a medium support often
+# beats the fully dense candidate when dense edits interfere destructively).
+K_MULTS = _env_floats("PERTURB_K_MULTS", (0.5, 0.75, 1.0, 1.25, 1.5, 2.0))
+ORDER_VARIANTS = _env_int("PERTURB_ORDER_VARIANTS", 1)  # near-tie randomized orders per ladder size
+TIE_MULT = _env_int("PERTURB_TIE_MULT", 4)            # sample top (mult·K) when benefits tie
+TIE_TEMP = _env_float("PERTURB_TIE_TEMP", 1.0)        # near-tie softmax temperature
+# Fixed-K projected ternary search (APGD on a latent u, projected onto {-1,0,+1}^N with |S|_0<=K).
+FIXED_ITERS = _env_int("PERTURB_FIXED_ITERS", 6)      # re-linearized iterations per fixed-K call
+APGD_ALPHA0 = _env_float("PERTURB_APGD_ALPHA0", 2.0)  # initial latent step (activates top saliency)
+APGD_MIN_ALPHA = _env_float("PERTURB_APGD_MIN_ALPHA", 0.25)
+APGD_MOMENTUM = _env_float("PERTURB_APGD_MOMENTUM", 0.75)
+APGD_PATIENCE = _env_int("PERTURB_APGD_PATIENCE", 2)  # stalled iters before halving alpha
+U_CLAMP = _env_float("PERTURB_U_CLAMP", 4.0)          # latent magnitude clamp
+# Cardinality continuation: shrink factor, near-flip parents kept for seeding, basin-restart cadence.
+CONT_ALPHA = _env_float("PERTURB_CONT_ALPHA", 0.75)   # geometric K shrink on success
+FEAS_GROW = _env_float("PERTURB_FEAS_GROW", 2.0)      # geometric K growth while no flip exists yet
+PARENTS = _env_int("PERTURB_PARENTS", 4)              # diverse near-flip seeds carried forward
+RESTART_EVERY = _env_int("PERTURB_RESTART_EVERY", 12)  # Phase-A restart cadence (new basin)
+CONVERGE_PATIENCE = _env_int("PERTURB_CONVERGE_PATIENCE", 3)  # stalled basins before stopping

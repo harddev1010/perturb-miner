@@ -2,11 +2,11 @@
 
 Patches the single forward choke point (neurons.perturb.utils.logits_for_images) with a small
 differentiable linear stub placed NEAR the decision boundary, so a handful of single-byte flips
-suffice — the regime the miner targets. Exercises perturb() end-to-end (which runs one_shot) and the
-one_shot engine built against a Context directly.
+suffice — the regime the miner targets. Exercises perturb() end-to-end (which runs the search engine) and the
+search engine built against a Context directly.
 
 Checks: normal m0>0 image -> in-band, grid-aligned k=1 flip; already-misclassified image keeps >=1
-changed channel; byte invariant (max_step==1, on-grid) holds; one_shot flips against a Context; the
+changed channel; byte invariant (max_step==1, on-grid) holds; search() flips against a Context; the
 unsafe-flip gate returns clean when nothing is envelope-safe and ALLOW_UNSAFE_FLIP=0, but flips when =1.
 """
 import importlib
@@ -61,7 +61,7 @@ def reset_env(**env):
 
 
 def run(name, clean, t, m0_target, **env):
-    """End-to-end perturb() (runs one_shot) on the stub; report the returned candidate's metrics."""
+    """End-to-end perturb() (runs search) on the stub; report the returned candidate's metrics."""
     reset_env(**env)
     setup_stub(clean, t, m0_target)
     adv = P.perturb(model=None, clean=clean, target_index=t, epsilon=0.03, min_delta=0.003,
@@ -104,7 +104,7 @@ def nz_grid_step(r, clean):
 def main():
     clean = torch.randint(0, 256, (3, 64, 64)).float() / 255.0  # grid-aligned, like a PNG decode
 
-    print("[1] perturb() end-to-end (one_shot) — normal flip near boundary")
+    print("[1] perturb() end-to-end (search) — normal flip near boundary")
     nz, linf, grid, step, flip = run("oneshot", clean, 7, 0.012)
     assert flip, "should flip"
     assert grid and step == 1, "must be grid-aligned, one byte per channel"
@@ -115,15 +115,15 @@ def main():
     assert flip2 and nz2 >= 1 and grid2 and step2 == 1
     assert linf2 >= 0.003 - 1e-9
 
-    print("[3] one_shot flips grid-aligned (built against a Context)")
+    print("[3] search() flips grid-aligned (built against a Context)")
     torch.manual_seed(100)
     ctx = build_ctx(clean, 11, 0.012)
-    P.one_shot(ctx)
+    P.search(ctx)
     r = ctx.bank.result(ctx.allow_unsafe)
-    assert r is not None, "one_shot found no safe flip"
+    assert r is not None, "search() found no safe flip"
     ref, on_grid, mstep = nz_grid_step(r, clean)
-    print(f"  [one_shot] |S|={ref} on_grid={on_grid} max_step={mstep}")
-    assert on_grid and mstep == 1, "one_shot must keep a grid-aligned one-byte flip"
+    print(f"  [search] |S|={ref} on_grid={on_grid} max_step={mstep}")
+    assert on_grid and mstep == 1, "search() must keep a grid-aligned one-byte flip"
 
     print("[4] unsafe-flip gate — kappa beyond the achievable margin swing makes nothing safe")
     nzg, _, _, _, flipg = run("gate-off", clean, 7, 0.005,
