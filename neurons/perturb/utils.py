@@ -65,12 +65,6 @@ def estimate_validator_score(norm: float, rmse: float, synapse_epsilon: float) -
 # ==========================================================================================
 # CW margin (scalar + batched) and loss gradients.
 # ==========================================================================================
-def logits_of(model, x_chw: torch.Tensor) -> torch.Tensor:
-    """Single-image forward -> logits[0] (no grad). One choke point for the algorithms' probes."""
-    with torch.no_grad():
-        return logits_for_images(model=model, image_bchw=x_chw.unsqueeze(0))[0]
-
-
 def cw_margin(logits: torch.Tensor, target_index: int) -> float:
     """CW margin m = logit[true] - max_{j!=true} logit[j]; m < 0 means flipped."""
     others = logits.clone()
@@ -83,13 +77,6 @@ def cw_margin_batch(logits_bxc: torch.Tensor, target_index: int) -> torch.Tensor
     others = logits_bxc.clone()
     others[:, target_index] = float("-inf")
     return logits_bxc[:, target_index] - others.max(dim=1).values
-
-
-def top_wrong_classes(logits: torch.Tensor, target_index: int, m: int) -> list[int]:
-    others = logits.clone()
-    others[target_index] = float("-inf")
-    m = max(1, min(int(m), logits.numel() - 1))
-    return torch.topk(others, m).indices.tolist()
 
 
 def margin_and_grad(model, x_chw: torch.Tensor, target_index: int):
@@ -220,12 +207,6 @@ def apply_byte(clean_u8: torch.Tensor, move_dir_flat: torch.Tensor, mask: torch.
     return (cand_u8 / 255.0).view(shape)
 
 
-def apply_delta_bytes(clean_u8: torch.Tensor, delta_bytes_flat: torch.Tensor, shape) -> torch.Tensor:
-    """Add an arbitrary integer byte delta; clamp [0,255]; return chw float."""
-    cand_u8 = (clean_u8 + delta_bytes_flat).clamp(0.0, 255.0)
-    return (cand_u8 / 255.0).view(shape)
-
-
 # ==========================================================================================
 # Context + Bank + batched evaluator.
 # ==========================================================================================
@@ -260,14 +241,6 @@ def out_of_budget(ctx: "Context") -> bool:
     starts at 0 (== the legacy 2·t_step gate) and grows once batch_eval has measured a chunk, so loops stop
     while there is still time to finish the work they are about to start."""
     return ctx.time_left() <= 2.0 * ctx.t_step + K.OOT_EVAL_MARGIN * ctx.t_eval
-
-
-def eval_budget(ctx: "Context") -> int:
-    """Rough number of candidates still evaluable before the budget guard trips — used to cap the size of
-    heavy candidate lists (e.g. exact leave-one-out) so they are not built and then discarded."""
-    per = (ctx.t_eval / max(1, K.BATCH_SIZE)) if ctx.t_eval > 0.0 else ctx.t_step
-    avail = ctx.time_left() - (2.0 * ctx.t_step + K.OOT_EVAL_MARGIN * ctx.t_eval)
-    return max(1, int(avail / max(per, 1e-6)))
 
 
 def _better(a: dict, b: dict) -> bool:
