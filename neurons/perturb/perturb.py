@@ -392,8 +392,8 @@ def _spatial_children(ctx: Context, move_dir, score) -> list[torch.Tensor]:
 
     p = max(1, int(K.FEASUP_PATCH))
     s2 = sal.view(C, H, W).sum(dim=0, keepdim=True).unsqueeze(0)           # [1,1,H,W] summed over channels
-    pooled = F.avg_pool2d(s2, p, stride=p)[0, 0]                           # [H//p, W//p] mean saliency
-    ph, pw = pooled.shape
+    pooled = F.avg_pool2d(s2, p, stride=p, ceil_mode=True)[0, 0]           # [ceil(H/p), ceil(W/p)] saliency
+    ph, pw = pooled.shape                                                  # ceil_mode => grid covers all of H×W
     flat = pooled.reshape(-1)
     nptch = flat.numel()
     for frac in (0.05, 0.15, 0.40):                                       # cover a few patch budgets
@@ -402,8 +402,8 @@ def _spatial_children(ctx: Context, move_dir, score) -> list[torch.Tensor]:
         mask = torch.zeros(ph * pw, device=flat.device, dtype=torch.bool)
         mask[top] = True
         mask2d = mask.view(ph, pw)
-        full = mask2d.repeat_interleave(p, 0)[:H].repeat_interleave(p, 1)[:, :W]  # upsample to H×W
-        chan_mask = full.unsqueeze(0).expand(C, H, W).reshape(-1) & can
+        full = mask2d.repeat_interleave(p, 0)[:H].repeat_interleave(p, 1)[:, :W]  # upsample, trim to H×W
+        chan_mask = full.reshape(1, H, W).expand(C, H, W).reshape(-1) & can
         idx = chan_mask.nonzero(as_tuple=True)[0]
         if idx.numel():
             deltas.append(_delta_from_idx(ctx, base, idx, move_dir))
