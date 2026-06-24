@@ -285,7 +285,7 @@ class PerturbMiner:
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
         )
-        _store_attack_challenge(synapse)
+        # _store_attack_challenge(synapse)
         if synapse.norm_type != "Linf":
             logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
             synapse.perturbed_image_b64 = synapse.clean_image_b64

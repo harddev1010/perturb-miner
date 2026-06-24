@@ -1,18 +1,14 @@
-"""CPU smoke test for the neurons/perturb engine (three-approach edition).
+"""CPU smoke test for the neurons/perturb engine (Problem 1 / feasibility solver).
 
 Patches the single forward choke point (neurons.perturb.utils.logits_for_images) with a small
 differentiable linear stub placed NEAR the decision boundary, so a handful of single-byte flips
-suffice — the regime the miner targets. Exercises perturb() end-to-end (which runs the hybrid) plus
-each of the three approaches built against a Context directly:
+suffice — the regime the miner targets. Exercises perturb() end-to-end (which runs find_feasible) and
+the solver built against a Context directly.
 
-  1. find_apgd_dlr   — exact-byte APGD-DLR over the full ternary cube.
-  2. find_dct_apgd   — low-frequency filtered-gradient APGD-DLR.
-  3. find_hybrid     — APGD-DLR -> DCT-APGD -> targeted repair -> RMSE prune.
-
-Checks: normal m0>0 image -> sparse, in-band, grid-aligned k=1 flip; already-misclassified image
-keeps >=1 changed channel; byte invariant (max_step==1, on-grid) holds; each approach flips; the hybrid
-prune shrinks |S| of a dense seed; the unsafe-flip gate returns clean when nothing is envelope-safe and
-ALLOW_UNSAFE_FLIP=0, but flips when =1.
+Checks: normal m0>0 image -> in-band, grid-aligned k=1 flip; already-misclassified image keeps >=1
+changed channel; byte invariant (max_step==1, on-grid) holds; find_feasible flips against a Context;
+the unsafe-flip gate returns clean when nothing is envelope-safe and ALLOW_UNSAFE_FLIP=0, but flips
+when =1.
 """
 import importlib
 import os
@@ -109,8 +105,8 @@ def nz_grid_step(r, clean):
 def main():
     clean = torch.randint(0, 256, (3, 64, 64)).float() / 255.0  # grid-aligned, like a PNG decode
 
-    print("[1] perturb() end-to-end (hybrid) — normal flip near boundary")
-    nz, linf, grid, step, flip = run("hybrid", clean, 7, 0.012)
+    print("[1] perturb() end-to-end (find_feasible) — normal flip near boundary")
+    nz, linf, grid, step, flip = run("feasible", clean, 7, 0.012)
     assert flip, "should flip"
     assert grid and step == 1, "must be grid-aligned, one byte per channel"
     assert 0.003 - 1e-9 <= linf <= 0.03 + 1e-9, "L_inf in band"
@@ -120,32 +116,29 @@ def main():
     assert flip2 and nz2 >= 1 and grid2 and step2 == 1
     assert linf2 >= 0.003 - 1e-9
 
-    print("[3] each approach flips grid-aligned (built against a Context)")
-    for finder in (P.find_apgd_dlr, P.find_dct_apgd, P.find_hybrid):
-        torch.manual_seed(100)
-        ctx = build_ctx(clean, 11, 0.012)
-        finder(ctx)
-        r = ctx.bank.result(ctx.allow_unsafe)
-        assert r is not None, f"{finder.__name__} found no safe flip"
-        ref, on_grid, mstep = nz_grid_step(r, clean)
-        print(f"  [{finder.__name__}] |S|={ref} on_grid={on_grid} max_step={mstep}")
-        assert on_grid and mstep == 1, f"{finder.__name__} must keep a grid-aligned one-byte flip"
-
-    print("[4] compress_l0 (L0 continuation) shrinks |S| of a dense seed")
+    print("[3] find_feasible flips grid-aligned (built against a Context)")
     torch.manual_seed(100)
-    ctx = build_ctx(clean, 13, 0.012)
-    _, move_dir, _ = U.loss_grad(ctx.model, ctx.clean, ctx.target_index, "ce")   # dense gradient-sign flip
-    P._eval_deltas(ctx, [move_dir * float(ctx.k_min)])
-    r0 = ctx.bank.result(ctx.allow_unsafe)
-    assert r0 is not None, "dense seed did not produce a safe flip"
-    base = r0["nz"]
-    P.compress_l0(ctx)
-    r1 = ctx.bank.result(ctx.allow_unsafe)
-    ref, on_grid, mstep = nz_grid_step(r1, clean)
-    print(f"  [compress_l0] |S| {base} -> {ref}  (drop {100.0 * (base - ref) / max(1, base):.1f}%) "
-          f"on_grid={on_grid} max_step={mstep}")
-    assert on_grid and mstep == 1, "compress_l0 must keep a grid-aligned one-byte flip"
-    assert ref < base, f"compress_l0 must strictly shrink |S| on the exact-gradient stub ({ref} !< {base})"
+    ctx = build_ctx(clean, 11, 0.012)
+    P.find_feasible(ctx)
+    r = ctx.bank.result(ctx.allow_unsafe)
+    assert r is not None, "find_feasible found no safe flip"
+    ref, on_grid, mstep = nz_grid_step(r, clean)
+    print(f"  [find_feasible] |S|={ref} on_grid={on_grid} max_step={mstep}")
+    assert on_grid and mstep == 1, "find_feasible must keep a grid-aligned one-byte flip"
+
+    print("[4] find_feasible_upgraded flips grid-aligned (built against a Context)")
+    torch.manual_seed(100)
+    ctx = build_ctx(clean, 11, 0.012)
+    P.find_feasible_upgraded(ctx)
+    r = ctx.bank.result(ctx.allow_unsafe)
+    assert r is not None, "find_feasible_upgraded found no safe flip"
+    ref, on_grid, mstep = nz_grid_step(r, clean)
+    print(f"  [find_feasible_upgraded] |S|={ref} on_grid={on_grid} max_step={mstep}")
+    assert on_grid and mstep == 1, "find_feasible_upgraded must keep a grid-aligned one-byte flip"
+
+    print("[4b] perturb() end-to-end via PERTURB_SOLVER=upgraded")
+    nzu, linfu, gridu, stepu, flipu = run("upgraded", clean, 7, 0.012, PERTURB_SOLVER="upgraded")
+    assert flipu and gridu and stepu == 1 and 0.003 - 1e-9 <= linfu <= 0.03 + 1e-9
 
     print("[5] unsafe-flip gate — kappa beyond the achievable margin swing makes nothing safe")
     nzg, _, _, _, flipg = run("gate-off", clean, 7, 0.005,

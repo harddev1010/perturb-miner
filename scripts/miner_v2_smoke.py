@@ -41,7 +41,7 @@ def load_challenges(input_dir: str, status: str = "all"):
     if not root.is_dir():
         return [], 0, 0
     challenges, seen, dups, skipped = [], set(), 0, 0
-    for path in sorted(root.glob("*.json")):
+    for path in sorted(root.glob("*.json"), key=lambda p: p.name, reverse=True):
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except Exception:

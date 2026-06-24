@@ -1,9 +1,9 @@
 """Tunable constants for the perturb attack engine.
 
 Every knob is an env var (PERTURB_*) so behavior is switchable at runtime without a redeploy.
-Grouped by concern: core / accept-gate / per-approach. Defaults are the shipping values.
+Grouped by concern: core / accept-gate / feasibility solver. Defaults are the shipping values.
 
-Only three approaches remain (see perturb.py): find_apgd_dlr, find_dct_apgd, find_hybrid.
+One solver (see perturb.py): find_feasible — Multi-Target Ternary Projected Gradient Search (Problem 1).
 """
 
 from __future__ import annotations
@@ -60,6 +60,13 @@ def _env_floats(name: str, default: tuple[float, ...]) -> tuple[float, ...]:
         return default
 
 
+def _env_strs(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return tuple(p for p in raw.replace(" ", "").split(",") if p)
+
+
 # --- Core -------------------------------------------------------------------------------
 Q = 1.0 / 255.0                                            # one byte in [0,1] space
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)  # validator L∞ cap
@@ -87,65 +94,52 @@ ALLOW_UNSAFE_FLIP = _env_bool("PERTURB_ALLOW_UNSAFE_FLIP", False)
 # Candidates evaluated per forward pass (halved on OOM).
 BATCH_SIZE = _env_int("PERTURB_BATCH_SIZE", 32)
 
-# --- find_apgd_dlr: exact-byte APGD-DLR over the full ternary cube ----------------------
-# Auto-PGD on the DLR loss, every candidate projected to the exact ternary byte cube {-1,0,+1}. Many
-# diverse restarts in one batch (zero / CE / DLR / soft / sparse+dense random); the latent step halves
-# on stall and the population refreshes around the best real-margin candidate. Returns safe on
-# margin<=-kappa, else best margin<0; logs the best margin reached as an infeasibility signal.
-APGD_TOPM = _env_int("PERTURB_APGD_TOPM", 5)
-APGD_TAU = _env_float("PERTURB_APGD_TAU", 1.0)
-APGD_ALPHA0 = _env_float("PERTURB_APGD_ALPHA0", 1.0)          # initial latent step (byte units)
-APGD_MIN_ALPHA = _env_float("PERTURB_APGD_MIN_ALPHA", 0.05)
-APGD_PATIENCE = _env_int("PERTURB_APGD_PATIENCE", 2)          # stalled iters before halving alpha
-APGD_TOPK = _env_int("PERTURB_APGD_TOPK", 4)                  # candidates that get a gradient step per iter
-APGD_SPARSE_STARTS = _env_floats("PERTURB_APGD_SPARSE_STARTS", (0.01, 0.05, 0.20))
-APGD_DENSE_STARTS = _env_int("PERTURB_APGD_DENSE_STARTS", 2)
-APGD_MUT = _env_int("PERTURB_APGD_MUT", 4)                    # ternary mutations around the best each iter
-APGD_MAX_ITERS = _env_int("PERTURB_APGD_MAX_ITERS", 0)        # 0 = until budget
+# --- find_feasible: Multi-Target Ternary Projected Gradient Search (Problem 1) -----------
+# Gradients propose actions/supports; an exact ternary projection keeps candidates legal; real discrete
+# candidates are batch-evaluated and the first envelope-safe flip wins (cost is irrelevant for feasibility).
+FEAS_TOPM = _env_int("PERTURB_FEAS_TOPM", 5)            # top runner-up classes for soft loss + multi-target
+FEAS_TAU = _env_float("PERTURB_FEAS_TAU", 1.0)         # soft-margin (logsumexp) temperature
+FEAS_LOSSES = _env_strs("PERTURB_FEAS_LOSSES", ("dlr", "soft"))  # untargeted losses, rotated in the loop
+# Top-k support sweep: prefix sizes as multiples of the linearized crossing size K_c (medium supports can
+# beat the fully dense candidate when dense edits interfere destructively).
+FEAS_K_MULTS = _env_floats("PERTURB_FEAS_K_MULTS", (0.5, 0.75, 1.0, 1.25, 1.5))
+FEAS_ALPHA0 = _env_float("PERTURB_FEAS_ALPHA0", 1.0)   # initial latent step (byte units)
+FEAS_MIN_ALPHA = _env_float("PERTURB_FEAS_MIN_ALPHA", 0.05)
+FEAS_PATIENCE = _env_int("PERTURB_FEAS_PATIENCE", 2)   # stalled iters before halving alpha + refresh
+FEAS_TOPK = _env_int("PERTURB_FEAS_TOPK", 4)           # lowest-margin parents that get a gradient step
+# Block-coordinate (macro coordinate descent) ladder: switch the top-B salient coords toward the flip.
+FEAS_BLOCKS = _env_ints("PERTURB_FEAS_BLOCKS", (32, 128, 512, 2048))
+FEAS_SPARSE_STARTS = _env_floats("PERTURB_FEAS_SPARSE_STARTS", (0.01, 0.05, 0.20))  # sparse random seeds
+FEAS_DENSE_STARTS = _env_int("PERTURB_FEAS_DENSE_STARTS", 2)   # dense random seeds
+FEAS_MUT = _env_int("PERTURB_FEAS_MUT", 4)             # gradient-free ternary mutations around the best
 
-# --- find_dct_apgd: low-frequency filtered-gradient APGD-DLR (Method A) ------------------
-# Same APGD machinery, but each gradient step is low-pass-filtered through a 2-D DCT: keep a top-left
-# coefficient block, inverse-transform, sign. The mask cycles through DCT_MASK_RATIOS (1/8 -> 1/4 -> 3/8)
-# so it starts very smooth/global and widens toward medium detail. Search magnitude stays ±1 byte.
-DCT_TOPM = _env_int("PERTURB_DCT_TOPM", 5)
-DCT_TAU = _env_float("PERTURB_DCT_TAU", 1.0)
-DCT_ALPHA0 = _env_float("PERTURB_DCT_ALPHA0", 1.0)           # initial latent step (byte units)
-DCT_MIN_ALPHA = _env_float("PERTURB_DCT_MIN_ALPHA", 0.05)
-DCT_PATIENCE = _env_int("PERTURB_DCT_PATIENCE", 2)           # stalled iters before halving alpha
-DCT_TOPK = _env_int("PERTURB_DCT_TOPK", 4)                   # candidates that get a gradient step per iter
-DCT_SPARSE_STARTS = _env_floats("PERTURB_DCT_SPARSE_STARTS", (0.05, 0.20))
-DCT_DENSE_STARTS = _env_int("PERTURB_DCT_DENSE_STARTS", 1)
-DCT_MUT = _env_int("PERTURB_DCT_MUT", 2)                     # ternary mutations around the best each iter
-DCT_MAX_ITERS = _env_int("PERTURB_DCT_MAX_ITERS", 0)        # 0 = until budget
-# Retained low-frequency block per dimension, as a fraction of H/W (top-left ceil(ratio·H)×ceil(ratio·W)).
-DCT_MASK_RATIOS = _env_floats("PERTURB_DCT_MASK_RATIOS", (0.125, 0.25, 0.375))
-# Sparse top-k one-shot probe: keep only the top (ratio·valid) filtered-saliency channels (k-ladder), so
-# the DCT stage can land a SPARSE flip directly instead of signing the whole filtered gradient (dense).
-DCT_PREFIX_RATIOS = _env_floats("PERTURB_DCT_PREFIX_RATIOS", (0.001, 0.003, 0.01, 0.03, 0.10, 0.30))
-
-# --- find_hybrid: APGD-DLR -> DCT-APGD -> targeted-DLR repair -> RMSE prune --------------
-# The recommended configuration. Wall-clock fractions of the remaining budget split phases 1-3; phase 4
-# (pruning) takes the remainder and runs against the real deadline. Any phase that finds an envelope-safe
-# flip short-circuits straight to pruning.
-HYBRID_APGD_FRAC = _env_float("PERTURB_HYBRID_APGD_FRAC", 0.45)     # phase 1: full APGD-DLR
-HYBRID_DCT_FRAC = _env_float("PERTURB_HYBRID_DCT_FRAC", 0.30)       # phase 2: low-frequency DCT-APGD
-HYBRID_REPAIR_FRAC = _env_float("PERTURB_HYBRID_REPAIR_FRAC", 0.10) # phase 3: targeted-DLR repair
-HYBRID_TARGETS = _env_int("PERTURB_HYBRID_TARGETS", 3)             # runner-up classes attacked in repair
-HYBRID_MOMENTUM = _env_float("PERTURB_HYBRID_MOMENTUM", 0.75)      # targeted-repair APGD momentum
-
-# --- compress_l0: exact-byte L0 continuation (the RMSE optimizer, hybrid Phase 4) -------
-# Keeps optimizing the SUPPORT after the first flip (reinforce -> adaptive shrink -> slack-aware group
-# prune -> one-for-many exchange -> exact leave-one-out) under a locked target margin. At q=1,
-# RMSE = q·sqrt(|S|/n), so this is the only stage that actually drives RMSE down. Geometric ladders here
-# share PRUNE_LADDER (below) as their base.
-L0_RHO0 = _env_float("PERTURB_L0_RHO0", 0.8)            # initial shrink budget k_try = floor(rho·k)
-L0_RHO_MIN = _env_float("PERTURB_L0_RHO_MIN", 0.5)      # most aggressive shrink (after repeated success)
-L0_RHO_MAX = _env_float("PERTURB_L0_RHO_MAX", 0.95)     # gentlest shrink (after repeated failure)
-L0_RHO_STEP = _env_float("PERTURB_L0_RHO_STEP", 0.05)   # rho adaptation step
-L0_SWAP_FRACS = _env_floats("PERTURB_L0_SWAP_FRACS", (0.05, 0.10, 0.20))  # weak↔strong swap fractions (reinforce)
-L0_EXCHANGE_ADDS = _env_int("PERTURB_L0_EXCHANGE_ADDS", 32)       # top-N unused channels probed as the addition
-L0_EXCHANGE_MIN_DROP = _env_int("PERTURB_L0_EXCHANGE_MIN_DROP", 2)  # need >=this removals per addition to net-shrink
-L0_LOO_MAX = _env_int("PERTURB_L0_LOO_MAX", 2048)      # max |S| for the exact leave-one-out cleanup pass
-
-# Geometric base for the byte-removal-count ladders (group prune / exchange).
-PRUNE_LADDER = _env_int("PERTURB_PRUNE_LADDER", 2)
+# --- find_feasible_upgraded: portfolio + diverse beam + adaptive blocks (Problem 1) ------
+# Strict superset of find_feasible's ideas: a loss PORTFOLIO with reward-per-second allocation, a
+# dynamically prioritized target pool (by linearized crossing size K̂_c), a diverse de-duplicated beam,
+# many structured restarts, per-parent adaptive block sizes with replacement/reversal moves, gradient-
+# accuracy + stagnation monitoring, gradient ensembles, support-size neighborhoods, near-tie sampling,
+# and spatially structured proposals. Returns the instant an envelope-safe flip is banked.
+# Solver selector: "feasible" (default, the simple solver) or "upgraded".
+SOLVER = _env_strs("PERTURB_SOLVER", ("feasible",))[0]
+FEASUP_LOSSES = _env_strs("PERTURB_FEASUP_LOSSES", ("dlr", "soft", "hard", "ce"))  # rotated portfolio
+FEASUP_ENS_LOSSES = _env_strs("PERTURB_FEASUP_ENS_LOSSES", ("dlr", "soft"))        # ensemble members
+FEASUP_TAU = _env_float("PERTURB_FEASUP_TAU", 1.0)            # soft-margin temperature
+FEASUP_TOPM = _env_int("PERTURB_FEASUP_TOPM", 10)            # target pool size (top wrong classes)
+FEASUP_RAND_TARGETS = _env_int("PERTURB_FEASUP_RAND_TARGETS", 2)  # extra random wrong classes in the pool
+FEASUP_BEAM = _env_int("PERTURB_FEASUP_BEAM", 16)            # diverse near-flip beam capacity
+FEASUP_DUP_JACCARD = _env_float("PERTURB_FEASUP_DUP_JACCARD", 0.9)  # support-overlap dedup threshold
+FEASUP_K_MULTS = _env_floats("PERTURB_FEASUP_K_MULTS", (0.4, 0.6, 0.8, 1.0, 1.25, 1.5, 2.0))
+FEASUP_BLOCK0 = _env_int("PERTURB_FEASUP_BLOCK0", 128)      # initial per-parent block size
+FEASUP_BLOCK_MIN = _env_int("PERTURB_FEASUP_BLOCK_MIN", 16)
+FEASUP_BLOCK_MAX = _env_int("PERTURB_FEASUP_BLOCK_MAX", 32768)
+FEASUP_TIE_TEMP = _env_float("PERTURB_FEASUP_TIE_TEMP", 1.0)   # near-tie softmax temperature
+FEASUP_TIE_MULT = _env_int("PERTURB_FEASUP_TIE_MULT", 4)       # sample top (mult·K) when benefits tie
+FEASUP_TIE_VARIANTS = _env_int("PERTURB_FEASUP_TIE_VARIANTS", 2)  # randomized tie variants per proposal
+FEASUP_ENS_EVERY = _env_int("PERTURB_FEASUP_ENS_EVERY", 3)    # ensemble candidate every N iters
+FEASUP_SPATIAL = _env_bool("PERTURB_FEASUP_SPATIAL", True)    # spatially structured proposals
+FEASUP_PATCH = _env_int("PERTURB_FEASUP_PATCH", 8)           # square patch side for spatial proposals
+FEASUP_STAGNATION = _env_int("PERTURB_FEASUP_STAGNATION", 20)  # evals w/o improvement before rotating
+FEASUP_RESCUE_FRACS = _env_floats("PERTURB_FEASUP_RESCUE_FRACS", (0.05, 0.20))  # rescue mutation fractions
+FEASUP_POOL_REFRESH = _env_int("PERTURB_FEASUP_POOL_REFRESH", 8)  # rebuild target pool every N iters
+FEASUP_SPARSE_STARTS = _env_floats("PERTURB_FEASUP_SPARSE_STARTS", (0.01, 0.05, 0.20))
+FEASUP_DENSE_STARTS = _env_int("PERTURB_FEASUP_DENSE_STARTS", 2)

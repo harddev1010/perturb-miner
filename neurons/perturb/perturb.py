@@ -1,29 +1,40 @@
-"""perturb.py — three q=1 flip-finding approaches + the public entry point.
+"""perturb.py — Problem 1 (feasibility): Multi-Target Ternary Projected Gradient Search.
 
-Only three strategies live here, toggled by commenting/uncommenting one line in perturb():
+ONE solver, `find_feasible`: find ANY byte-valid ternary perturbation S ∈ {-1,0,+1}^N (with
+0 ≤ A_i+S_i ≤ 255) that makes the validator flip the true class, then return immediately. Cost (L0 /
+RMSE) is irrelevant for feasibility, so there is no compression stage — the first envelope-safe,
+in-band, quality flip wins.
 
-  1. find_apgd_dlr   — exact-byte APGD on the DLR loss over the full ternary {-1,0,+1} cube.
-  2. find_dct_apgd   — low-frequency, filtered-gradient APGD-DLR (Method A: DCT-low-pass the gradient).
-  3. find_hybrid     — the recommended combo: APGD-DLR -> DCT-APGD -> targeted-DLR repair -> RMSE prune.
+White-box strategy (the model is open and gradients are available):
+  * gradients PROPOSE actions and supports;
+  * an exact ternary projection keeps every candidate legal (round → clamp → integer byte step);
+  * REAL discrete candidates are batch-evaluated on the validator-faithful path (envelope + SSIM/PSNR);
+  * gradients are recomputed at the current discrete state when the local model goes stale;
+  * randomized ternary mutation rescues the search when gradients stall.
 
-Design: few backward passes, many batched forward checks. Each approach proposes candidate byte
-perturbations, batch-evaluates them on the validator-faithful path (envelope + SSIM/PSNR + kappa),
-and folds survivors into a shared Bank that tracks the sparsest envelope-safe flip. Every edit is an
-exact integer ±k_min byte step on the uint8 grid, so L∞ stays pinned at q and the PNG round-trip is
-identity (see neurons/perturb/utils.py and constants.py).
+Stages (see the analysis):
+  1. Calibration / reserve   — handled by the deadline (RESERVE_SECONDS) and the t_step budget gate.
+  2. Dense one-step          — the ε=1-byte sign-gradient flip for the soft-margin and DLR losses.
+  3. Top-k support sweep     — prefix supports around the linearized crossing size K_c, per target.
+  4. Ternary projected GD    — APGD on a latent u∈[-1,1]; evaluated delta = round(u)·k_min.
+  5. Macro coordinate descent— block-coordinate children (add/remove/reverse the top-B actions).
+  6. Gradient-free rescue    — randomized ternary mutation around the best when gradients stall.
+  7. Exact success handling  — return on the first envelope-safe flip (the Bank holds it).
 
-SWITCHES (no redeploy needed):
-  * Approach: comment/uncomment the one line at the ORCHESTRATOR SWITCH in perturb().
-  * Per-approach tuning + the accept gate: env vars in constants.py.
+Every edit is an exact integer ±k_min byte step on the uint8 grid, so L∞ stays pinned at q and the
+PNG round-trip is identity (see neurons/perturb/utils.py and constants.py). Tuning is via PERTURB_FEAS_*
+env vars in constants.py — no redeploy needed.
 """
 
 from __future__ import annotations
 
 import logging
 import math
+import random
 import time
 
 import torch
+import torch.nn.functional as F
 
 from . import constants as K
 from .utils import (
@@ -31,6 +42,8 @@ from .utils import (
     Context,
     apply_delta_bytes,
     batch_eval,
+    build_sparse_order,
+    estimate_k,
     logits_of,
     loss_grad,
     margin_and_grad,
@@ -82,209 +95,147 @@ def _eval_deltas(ctx: Context, deltas: list[torch.Tensor]) -> list[dict]:
     return res
 
 
-def _mutate_ternary_latent(base: torch.Tensor, dev) -> torch.Tensor:
+def _mutate_ternary_latent(base: torch.Tensor, dev, p: float = 0.05) -> torch.Tensor:
     """Random ternary mutation of a latent u: reset a small random subset to {-1,0,+1}."""
     n = base.numel()
     u = base.clone()
-    m = torch.rand(n, device=dev) < 0.05
+    m = torch.rand(n, device=dev) < p
     u[m] = torch.randint(0, 3, (int(m.sum().item()),), device=dev).float() - 1.0
     return u
 
 
 # ==========================================================================================
-# 1. find_apgd_dlr — exact-byte APGD-DLR with batched restarts (full ternary cube).
+# Candidate construction (gradients propose; the byte grid keeps everything legal)
 # ==========================================================================================
-def find_apgd_dlr(ctx: Context) -> str | None:
-    """Quantized APGD-DLR with batched restarts (standalone approach).
+def _dense_action(ctx: Context, move_dir: torch.Tensor) -> torch.Tensor:
+    """The ε=1-byte sign-gradient candidate: every movable channel stepped one byte toward the flip.
 
-    Auto-PGD on the DLR loss with every candidate projected onto the exact ternary byte cube. Latent
-    u∈[-1,1] per channel; evaluated delta = round(u)·k_min. Starts in one batch: zero, CE-sign, DLR-sign,
-    soft top-M sign, sparse random (1/5/20%), dense random. Each iter: eval the population, track the
-    best REAL margin; if the best stalls APGD_PATIENCE times, halve the latent step and refresh the
-    population around the best; otherwise take a DLR gradient step on the top-APGD_TOPK candidates
-    (+ sign-only and mixed variants) and add ternary mutations around the best. Returns 'safe' on
-    margin<=-kappa, else best margin<0. Logs the best margin as an infeasibility signal (high => the
-    one-byte cube likely has no flip for this image)."""
-    n = ctx.clean_u8.numel()
-    dev = ctx.clean_u8.device
-    km = float(ctx.k_min)
-    top = top_wrong_classes(logits_of(ctx.model, ctx.clean), ctx.target_index, K.APGD_TOPM)
-
-    U = [torch.zeros(n, device=dev)]                                       # zero start
-    _, md_ce, _ = loss_grad(ctx.model, ctx.clean, ctx.target_index, "ce")
-    _, md_dlr, _ = loss_grad(ctx.model, ctx.clean, ctx.target_index, "dlr")
-    _, md_soft, _ = loss_grad(ctx.model, ctx.clean, ctx.target_index, "soft", top_wrong=top, tau=K.APGD_TAU)
-    U += [md_ce.clone(), md_dlr.clone(), md_soft.clone()]                   # gradient-sign starts
-    for p in K.APGD_SPARSE_STARTS:                                         # sparse random starts
-        u = torch.zeros(n, device=dev)
-        m = torch.rand(n, device=dev) < p
-        u[m] = torch.randint(0, 2, (int(m.sum().item()),), device=dev).float() * 2.0 - 1.0
-        U.append(u)
-    for _ in range(K.APGD_DENSE_STARTS):                                   # dense random starts
-        U.append(torch.randint(0, 2, (n,), device=dev).float() * 2.0 - 1.0)
-
-    best_margin = float("inf")
-    best_u = None
-    alpha = K.APGD_ALPHA0
-    stale = 0
-    iters = 0
-    while not _out_of_time(ctx):
-        if K.APGD_MAX_ITERS > 0 and iters >= K.APGD_MAX_ITERS:
-            break
-        iters += 1
-        deltas = [u.round().clamp(-1.0, 1.0) * km for u in U]
-        res = _eval_deltas(ctx, deltas)
-        if ctx.bank.has_safe:
-            return "safe"
-        if not res:
-            break
-        bi = min(range(len(res)), key=lambda i: res[i]["margin"])
-        if res[bi]["margin"] < best_margin - 1e-6:
-            best_margin, best_u, stale = res[bi]["margin"], U[bi].clone(), 0
-        else:
-            stale += 1
-            if stale >= K.APGD_PATIENCE:                                   # APGD stall -> shrink + refresh
-                alpha = max(K.APGD_MIN_ALPHA, alpha * 0.5)
-                stale = 0
-                if best_u is not None:
-                    U = [best_u.clone()] + [_mutate_ternary_latent(best_u, dev) for _ in range(len(U) - 1)]
-                continue
-
-        order = sorted(range(len(res)), key=lambda i: res[i]["margin"])[:K.APGD_TOPK]
-        new_u: list[torch.Tensor] = []
-        if best_u is not None:
-            new_u.append(best_u.clone())
-        for idx in order:
-            if _out_of_time(ctx):
-                break
-            _, md, _ = loss_grad(ctx.model, res[idx]["cand"], ctx.target_index, "dlr")  # DLR attack dir
-            new_u.append((U[idx] + alpha * md).clamp(-1.0, 1.0))
-            new_u.append(md.clone())                                        # sign-only
-            new_u.append((0.5 * U[idx] + 0.5 * md).clamp(-1.0, 1.0))        # mixed
-        for _ in range(K.APGD_MUT):
-            new_u.append(_mutate_ternary_latent(best_u if best_u is not None else U[bi], dev))
-        U = new_u
-
-    if not ctx.bank.has_flip:
-        logger.info(f"[apgd_dlr] no flip; best_margin={best_margin:.4f} "
-                    f"({'likely q=1 infeasible' if best_margin > 2.0 else 'near-miss'})")
-    return _status(ctx)
-
-
-# ==========================================================================================
-# 2. find_dct_apgd — low-frequency filtered-gradient APGD-DLR (Method A).
-# ------------------------------------------------------------------------------------------
-# The search MAGNITUDE is still ±1 byte; only the search DIRECTION is restricted to smooth, coordinated
-# low-frequency patterns. Each step low-pass-filters the DLR descent direction through a 2-D DCT (keep a
-# top-left coefficient block, inverse-transform, take the sign) before the APGD update. Strong on images
-# whose useful gradient energy is diffuse / low-frequency.
-# ==========================================================================================
-_DCT_CACHE: dict = {}
-
-
-def _dct_matrix(n: int, device, dtype) -> torch.Tensor:
-    """Orthonormal DCT-II matrix D[k,m] (rows = frequency k). Orthonormal => inverse is the transpose."""
-    key = (n, str(device), dtype)
-    M = _DCT_CACHE.get(key)
-    if M is None:
-        k = torch.arange(n, device=device, dtype=dtype).view(n, 1)
-        m = torch.arange(n, device=device, dtype=dtype).view(1, n)
-        M = torch.cos(math.pi * (2.0 * m + 1.0) * k / (2.0 * n)) * math.sqrt(2.0 / n)
-        M[0] *= 1.0 / math.sqrt(2.0)
-        _DCT_CACHE[key] = M
-    return M
-
-
-def _dct_lowpass(x_chw: torch.Tensor, ratio: float) -> torch.Tensor:
-    """2-D DCT low-pass per channel: keep the top-left ceil(ratio·H) × ceil(ratio·W) coefficient block."""
-    c, h, w = int(x_chw.shape[0]), int(x_chw.shape[1]), int(x_chw.shape[2])
-    dh = _dct_matrix(h, x_chw.device, x_chw.dtype)
-    dw = _dct_matrix(w, x_chw.device, x_chw.dtype)
-    coef = torch.einsum("kn,cnw->ckw", dh, x_chw)            # DCT along height
-    coef = torch.einsum("lw,ckw->ckl", dw, coef)            # DCT along width
-    rh = max(1, int(math.ceil(ratio * h)))
-    rw = max(1, int(math.ceil(ratio * w)))
-    coef[:, rh:, :] = 0.0                                    # mask high vertical frequencies
-    coef[:, :, rw:] = 0.0                                    # mask high horizontal frequencies
-    coef = torch.einsum("lw,ckl->ckw", dw, coef)            # IDCT along width
-    return torch.einsum("kn,ckw->cnw", dh, coef)            # IDCT along height
-
-
-def _dct_step_dir(ctx: Context, cand: torch.Tensor, ratio: float) -> torch.Tensor:
-    """Filtered DLR descent direction: low-pass the toward-flip gradient, sign it, mask box-clipping moves."""
-    _, move_dir, score = loss_grad(ctx.model, cand, ctx.target_index, "dlr")
-    descent = (move_dir * score).view(ctx.shape)            # signed descent (reduces the DLR loss)
-    low = _dct_lowpass(descent, ratio).reshape(-1)
-    d = low.sign()
-    d[~movable(ctx.clean.view(-1), d)] = 0.0                # drop directions that would clip at [0,1]
+    This is the exact best first-order candidate when sparsity does not matter, and it costs only the
+    one backward pass that produced `move_dir` — the highest-value first probe for feasibility."""
+    clean_flat = ctx.clean.view(-1)
+    mask = movable(clean_flat, move_dir)
+    d = torch.zeros_like(ctx.clean_u8)
+    d[mask] = move_dir[mask] * float(ctx.k_min)
     return d
 
 
-def _dct_sparse_probe(ctx: Context, ratio: float) -> None:
-    """One-shot SPARSE top-k candidates from the low-frequency filtered clean gradient. Signing the whole
-    filtered gradient activates ~every channel; instead keep only the top-k legal channels by filtered
-    saliency over a k-ladder and stop at the first exact-byte flip — sparse-by-construction, not dense."""
+def _supports_around_k(ctx: Context, move_dir: torch.Tensor, score: torch.Tensor,
+                       value: float, mults) -> list[torch.Tensor]:
+    """Top-k support sweep along descending benefit b_i = |g_i| (movable channels only).
+
+    The linearized minimum number of unit actions to cross the y-vs-c boundary is
+    K = min{k : q·Σ_{r≤k} b_(r) ≥ value + κ}. We emit prefix supports at several multiples of K
+    (a medium support often succeeds when the fully dense candidate destructively interferes) plus the
+    full positive-benefit support."""
     clean_flat = ctx.clean.view(-1)
     km = float(ctx.k_min)
-    _, move_dir, score = loss_grad(ctx.model, ctx.clean, ctx.target_index, "dlr")
-    descent = (move_dir * score).view(ctx.shape)
-    low = _dct_lowpass(descent, ratio).reshape(-1)
-    sign = low.sign()
-    sal = low.abs()
-    sal[~movable(clean_flat, sign)] = -1.0                  # legal, box-feasible channels only
-    valid = int((sal > 0).sum().item())
+    masked, order, valid = build_sparse_order(score, move_dir, clean_flat)
     if valid == 0:
-        return
-    order = torch.argsort(sal, descending=True)
-    cands = []
-    for r in K.DCT_PREFIX_RATIOS:
-        k = max(1, min(int(round(r * valid)), valid))
-        d = torch.zeros_like(ctx.clean_u8)
+        return []
+    sorted_score = masked[order][:valid]
+    kc = estimate_k(value + ctx.kappa, sorted_score, ctx.q)
+    ks = {int(round(f * kc)) for f in mults}
+    ks.add(valid)                                            # full positive-benefit support
+    deltas: list[torch.Tensor] = []
+    for k in sorted(k for k in ks if k >= 1):
+        k = min(k, valid)
         idx = order[:k]
-        d[idx] = sign[idx] * km
-        cands.append(d)
-    _eval_deltas(ctx, cands)
+        d = torch.zeros_like(ctx.clean_u8)
+        d[idx] = move_dir[idx] * km
+        deltas.append(d)
+    return deltas
 
 
-def find_dct_apgd(ctx: Context) -> str | None:
-    """Low-frequency filtered-gradient APGD-DLR (standalone approach).
+def _block_children(ctx: Context, u: torch.Tensor, move_dir: torch.Tensor,
+                    score: torch.Tensor, blocks) -> list[torch.Tensor]:
+    """Macro coordinate descent (Stage 5): from a discrete parent S=round(u), switch the top-B coordinates
+    to their toward-flip action move_dir_i, for a geometric ladder of block sizes B.
 
-    Identical APGD-DLR machinery to find_apgd_dlr, but every gradient step direction is first projected
-    onto a retained low-frequency DCT subspace (Method A): DCT2 the descent vector, keep a top-left
-    coefficient block, IDCT2, sign. Cycles the mask through DCT_MASK_RATIOS (1/8 -> 1/4 -> 3/8 by default)
-    so it starts very smooth/global and widens toward medium detail. Latent u∈[-1,1], delta=round(u)·k_min,
-    exact ±k_min byte edits => L∞ stays at q. Returns 'safe' on margin<=-kappa, else best margin<0."""
+    Because move_dir is the best legal action regardless of the current S_i, a switch may ADD an action,
+    REMOVE one (S_i≠0 → toward-clean is never proposed here, but a reverse is), or REVERSE +1↔-1 — so an
+    add-only search cannot get trapped once the gradient direction changes. Ranked by predicted gain
+    q_i = score_i for coordinates not already at move_dir_i and not box-clipped."""
+    clean_flat = ctx.clean.view(-1)
+    s = u.round().clamp(-1.0, 1.0)
+    gain = score.clone()
+    gain[~movable(clean_flat, move_dir)] = -1.0             # box-clipped moves buy nothing
+    gain[s == move_dir] = -1.0                              # already at the toward-flip action
+    order = torch.argsort(gain, descending=True)
+    pos = int((gain > 0).sum().item())
+    children: list[torch.Tensor] = []
+    for b in blocks:
+        b = min(int(b), pos)
+        if b < 1:
+            continue
+        d = s.clone()
+        idx = order[:b]
+        d[idx] = move_dir[idx]
+        children.append(d)
+    return children
+
+
+# ==========================================================================================
+# find_feasible — the Problem 1 solver
+# ==========================================================================================
+def _seed_grad(ctx: Context, x: torch.Tensor, kind: str, targets: list[int]):
+    """Gradient of one attack loss at x: (value, toward-flip move_dir, saliency |g|)."""
+    if kind == "soft":
+        return loss_grad(ctx.model, x, ctx.target_index, "soft", top_wrong=targets, tau=K.FEAS_TAU)
+    return loss_grad(ctx.model, x, ctx.target_index, kind)
+
+
+def find_feasible(ctx: Context) -> str | None:
+    """Multi-Target Ternary Projected Gradient Search — find any envelope-safe q=1 flip, then stop.
+
+    Seeds with the cheap one-backward candidates (dense sign-gradient + top-k support sweeps for the
+    untargeted soft/DLR losses and the top runner-up classes), then runs an adaptive ternary-projected
+    population search: each iteration evaluates the projected population, tracks the best REAL margin,
+    halves the latent step and refreshes around the best on a stall, and otherwise takes a projected
+    gradient step (+ sign-only + block-coordinate children) on the lowest-margin parents, recomputing the
+    gradient at each discrete state. Returns 'safe' the instant an envelope-safe flip is banked; else the
+    best margin<0 if any; else logs the best margin reached as an infeasibility signal."""
     n = ctx.clean_u8.numel()
     dev = ctx.clean_u8.device
     km = float(ctx.k_min)
-    ratios = list(K.DCT_MASK_RATIOS) or [0.25]
-    top = top_wrong_classes(logits_of(ctx.model, ctx.clean), ctx.target_index, K.DCT_TOPM)
+    targets = top_wrong_classes(logits_of(ctx.model, ctx.clean), ctx.target_index, K.FEAS_TOPM)
 
-    _dct_sparse_probe(ctx, ratios[0])                                      # sparse top-k one-shot (cheap)
-    if ctx.bank.has_safe:
-        return "safe"
-
+    # --- Stages 2-3: fast one-backward seeds (dense + top-k sweeps) -------------------------
     U = [torch.zeros(n, device=dev)]                                       # zero start
-    U.append(_dct_step_dir(ctx, ctx.clean, ratios[0]))                     # filtered DLR-sign start
-    for p in K.DCT_SPARSE_STARTS:                                         # sparse random starts
+    for kind in K.FEAS_LOSSES:                                             # untargeted soft-margin + DLR
+        _, move_dir, score = _seed_grad(ctx, ctx.clean, kind, targets)
+        _eval_deltas(ctx, [_dense_action(ctx, move_dir)])
+        if ctx.bank.has_safe:
+            return "safe"
+        _eval_deltas(ctx, _supports_around_k(ctx, move_dir, score, ctx.m0, K.FEAS_K_MULTS))
+        if ctx.bank.has_safe:
+            return "safe"
+        U.append(move_dir.clone())
+
+    for c in targets:                                                      # multi-target pair candidates
+        if _out_of_time(ctx):
+            break
+        value, move_dir, score = loss_grad(ctx.model, ctx.clean, ctx.target_index, f"pair:{c}")
+        _eval_deltas(ctx, _supports_around_k(ctx, move_dir, score, value, K.FEAS_K_MULTS))
+        if ctx.bank.has_safe:
+            return "safe"
+        U.append(move_dir.clone())
+
+    for p in K.FEAS_SPARSE_STARTS:                                         # sparse random starts
         u = torch.zeros(n, device=dev)
         m = torch.rand(n, device=dev) < p
         u[m] = torch.randint(0, 2, (int(m.sum().item()),), device=dev).float() * 2.0 - 1.0
         U.append(u)
-    for _ in range(K.DCT_DENSE_STARTS):                                   # dense random starts
+    for _ in range(K.FEAS_DENSE_STARTS):                                   # dense random starts
         U.append(torch.randint(0, 2, (n,), device=dev).float() * 2.0 - 1.0)
 
+    # --- Stages 4-6: adaptive ternary-projected search -------------------------------------
     best_margin = float("inf")
     best_u = None
-    alpha = K.DCT_ALPHA0
+    alpha = K.FEAS_ALPHA0
     stale = 0
-    iters = 0
+    li = 0
     while not _out_of_time(ctx):
-        if K.DCT_MAX_ITERS > 0 and iters >= K.DCT_MAX_ITERS:
-            break
-        ratio = ratios[iters % len(ratios)]
-        iters += 1
-        deltas = [u.round().clamp(-1.0, 1.0) * km for u in U]
+        deltas = [u.round().clamp(-1.0, 1.0) * km for u in U]              # exact ternary projection
         res = _eval_deltas(ctx, deltas)
         if ctx.bank.has_safe:
             return "safe"
@@ -295,420 +246,374 @@ def find_dct_apgd(ctx: Context) -> str | None:
             best_margin, best_u, stale = res[bi]["margin"], U[bi].clone(), 0
         else:
             stale += 1
-            if stale >= K.DCT_PATIENCE:                                    # APGD stall -> shrink + refresh
-                alpha = max(K.DCT_MIN_ALPHA, alpha * 0.5)
+            if stale >= K.FEAS_PATIENCE:                                   # APGD stall -> shrink + refresh
+                alpha = max(K.FEAS_MIN_ALPHA, alpha * 0.5)
                 stale = 0
                 if best_u is not None:
                     U = [best_u.clone()] + [_mutate_ternary_latent(best_u, dev) for _ in range(len(U) - 1)]
                 continue
 
-        order = sorted(range(len(res)), key=lambda i: res[i]["margin"])[:K.DCT_TOPK]
+        order = sorted(range(len(res)), key=lambda i: res[i]["margin"])[:K.FEAS_TOPK]
+        kind = K.FEAS_LOSSES[li % len(K.FEAS_LOSSES)]                      # rotate the attack loss
+        li += 1
         new_u: list[torch.Tensor] = []
         if best_u is not None:
             new_u.append(best_u.clone())
         for idx in order:
             if _out_of_time(ctx):
                 break
-            d = _dct_step_dir(ctx, res[idx]["cand"], ratio)               # low-frequency DLR attack dir
-            new_u.append((U[idx] + alpha * d).clamp(-1.0, 1.0))
-            new_u.append(d.clone())                                        # sign-only
-            new_u.append((0.5 * U[idx] + 0.5 * d).clamp(-1.0, 1.0))        # mixed
-        for _ in range(K.DCT_MUT):
+            _, move_dir, score = _seed_grad(ctx, res[idx]["cand"], kind, targets)  # grad at this state
+            new_u.append((U[idx] + alpha * move_dir).clamp(-1.0, 1.0))     # Stage 4: projected GD step
+            new_u.append(move_dir.clone())                                 # sign-only
+            new_u += _block_children(ctx, U[idx], move_dir, score, K.FEAS_BLOCKS)  # Stage 5
+        for _ in range(K.FEAS_MUT):                                        # Stage 6: gradient-free rescue
             new_u.append(_mutate_ternary_latent(best_u if best_u is not None else U[bi], dev))
         U = new_u
 
     if not ctx.bank.has_flip:
-        logger.info(f"[dct_apgd] no flip; best_margin={best_margin:.4f} "
+        logger.info(f"[feasible] no flip; best_margin={best_margin:.4f} "
                     f"({'likely q=1 infeasible' if best_margin > 2.0 else 'near-miss'})")
     return _status(ctx)
 
 
 # ==========================================================================================
-# 3. find_hybrid — APGD-DLR -> DCT-APGD -> targeted-DLR repair -> RMSE prune.
+# find_feasible_upgraded — portfolio + diverse beam + adaptive blocks (Problem 1, upgraded)
 # ------------------------------------------------------------------------------------------
-# The recommended configuration: full APGD-DLR as the main finder, low-frequency APGD as the
-# complementary structured search, a short targeted-DLR repair when a clear runner-up exists, and a
-# post-success byte-pruning pass as the actual RMSE optimizer. Time is split by wall-clock fractions of
-# the remaining budget; pruning always runs last on whatever flip the finders banked.
+# A strict superset of find_feasible. Same contract (return on the first envelope-safe flip, cost
+# irrelevant), but every knob the analysis flagged as high-impact is in play: a LOSS PORTFOLIO with
+# reward-per-second allocation, a target pool prioritized by the linearized crossing size K̂_c (rebuilt
+# when the best wrong class changes), a DIVERSE de-duplicated beam, many structured restarts, per-parent
+# ADAPTIVE block sizes with replacement/reversal moves, gradient-accuracy + stagnation monitoring,
+# gradient ENSEMBLES, support-size NEIGHBORHOODS, near-tie sampling, and SPATIALLY structured proposals.
+# Note on item 15 (nondifferentiable preprocessing): the validator path here is differentiable and, for
+# grid-aligned ±k_min edits, the PNG round-trip is identity (skip_roundtrip), so no surrogate is needed.
 # ==========================================================================================
-def _warm_delta(ctx: Context) -> torch.Tensor | None:
-    """Integer byte delta (flat) of the Bank's best flip — safe preferred — or None if no flip yet."""
-    best = ctx.bank.best_safe if ctx.bank.best_safe is not None else ctx.bank.best_flip
-    if best is None:
-        return None
-    cand_u8 = torch.round(best["cand"].view(-1) * 255.0)
-    return cand_u8 - ctx.clean_u8
+def _loss_field(ctx: Context, x: torch.Tensor, kind: str, targets: list[int]):
+    """One loss's (value, toward-flip move_dir sign, saliency |g|). Wraps the soft loss's extra args."""
+    if kind == "soft":
+        return loss_grad(ctx.model, x, ctx.target_index, "soft", top_wrong=targets, tau=K.FEASUP_TAU)
+    return loss_grad(ctx.model, x, ctx.target_index, kind)
 
 
-def _accept(ctx: Context, r: dict) -> bool:
-    """Is candidate r a valid working base to keep refining? Must be a QUALITY (in-band + SSIM/PSNR) flip
-    that is also envelope-safe — or, with PERTURB_ALLOW_UNSAFE_FLIP=1, any quality flip. Requiring quality
-    (not just margin-safe) stops the L0 stages from reverting past the in-band floor toward the clean image
-    (which is 'safe' by margin but out of band). The Bank still independently records the global best."""
-    if r.get("safe") and r.get("quality"):
-        return True
-    return bool(ctx.allow_unsafe and r.get("flipped") and r.get("quality"))
+def _ensemble_field(ctx: Context, x: torch.Tensor, kinds, targets: list[int]):
+    """Gradient ensemble g_ens = Σ_ℓ move_dir_ℓ·score_ℓ / (‖g_ℓ‖₁+ε); consensus sign + |g_ens| saliency.
+    Coordinates where independently-trained losses agree tend to be the most reliable actions (item 8)."""
+    acc = torch.zeros(ctx.clean_u8.numel(), device=ctx.clean_u8.device)
+    for kind in kinds:
+        if _out_of_time(ctx):
+            break
+        _, md, sc = _loss_field(ctx, x, kind, targets)
+        acc += (md * sc) / (sc.sum() + 1e-12)                  # toward-flip signed field, L1-normalized
+    return acc.sign(), acc.abs()
 
 
-def _targeted_repair(ctx: Context) -> str | None:
-    """Phase 3: short targeted Auto-PGD on the targeted-DLR loss against the top runner-up classes.
+def _delta_from_idx(ctx: Context, base: torch.Tensor, idx: torch.Tensor, move_dir: torch.Tensor):
+    """Set the selected flat channels of `base` (a byte delta) to their toward-flip ±k_min action."""
+    d = base.clone()
+    d[idx] = move_dir[idx] * float(ctx.k_min)
+    return d
 
-    Most useful when one competitor is naturally close. Latent u∈[-1,1] per target, momentum + adaptive
-    step + restart-from-best, all batched. delta=round(u)·k_min (exact byte edits). Returns 'safe' on
-    margin<=-kappa, else the best margin<0 in its slice of the budget."""
+
+def _tie_idx(masked: torch.Tensor, order: torch.Tensor, valid: int, k: int,
+             temp: float, mult: int) -> torch.Tensor:
+    """Near-tie sampling (item 10): draw k coords from the top (mult·k) by benefit, with probability
+    ∝ exp(b_i/temp). When many benefits tie the exact top-k ranking is unreliable, so this diversifies
+    while staying strongly gradient-guided."""
+    pool = order[:min(valid, max(k, mult * k))]
+    w = torch.softmax(masked[pool] / max(temp, 1e-6), dim=0)
+    pick = torch.multinomial(w, min(k, pool.numel()), replacement=False)
+    return pool[pick]
+
+
+def _support_neighborhood(ctx: Context, move_dir, score, value, mults, tie_variants):
+    """Support-size neighborhood (items 3/9/10): prefix supports at several multiples of K̂ plus the
+    fully dense legal sign candidate, with a few near-tie-sampled variants per size. Returns byte deltas."""
+    clean_flat = ctx.clean.view(-1)
+    km = float(ctx.k_min)
+    base = torch.zeros_like(ctx.clean_u8)
+    masked, order, valid = build_sparse_order(score, move_dir, clean_flat)
+    if valid == 0:
+        return []
+    kc = estimate_k(value + ctx.kappa, masked[order][:valid], ctx.q)
+    deltas = [_delta_from_idx(ctx, base, movable(clean_flat, move_dir).nonzero(as_tuple=True)[0], move_dir)]
+    seen_k = set()
+    for f in mults:
+        k = min(max(int(round(f * kc)), 1), valid)
+        if k in seen_k:
+            continue
+        seen_k.add(k)
+        deltas.append(_delta_from_idx(ctx, base, order[:k], move_dir))
+        for _ in range(tie_variants):
+            deltas.append(_delta_from_idx(ctx, base, _tie_idx(masked, order, valid, k,
+                                                              K.FEASUP_TIE_TEMP, K.FEASUP_TIE_MULT), move_dir))
+    return deltas
+
+
+def _q_rank(ctx: Context, s_unit: torch.Tensor, move_dir: torch.Tensor, score: torch.Tensor):
+    """Replacement/reversal gain q_i = -g_i(a*_i - S_i) = score_i·(1 - move_dir_i·s_i), masking box-clipped
+    moves (item 6). add (0→±1) scores score_i; reversal (∓1→±1) scores 2·score_i; already-best scores 0."""
+    q = score * (1.0 - move_dir * s_unit)
+    q[~movable(ctx.clean.view(-1), move_dir)] = -1.0
+    return q
+
+
+def _block_moves(ctx: Context, delta: torch.Tensor, move_dir, score, blocks) -> list[torch.Tensor]:
+    """Macro coordinate-descent children (items 5/6): switch the top-B coords (by replacement/reversal
+    gain q) to their toward-flip action, for the given block-size ladder. Operates in byte-delta space
+    (distinct from find_feasible's latent-space _block_children)."""
+    km = float(ctx.k_min)
+    s_unit = delta / km
+    q = _q_rank(ctx, s_unit, move_dir, score)
+    order = torch.argsort(q, descending=True)
+    pos = int((q > 0).sum().item())
+    out: list[torch.Tensor] = []
+    for b in blocks:
+        b = min(int(b), pos)
+        if b < 1:
+            continue
+        d = delta.clone()
+        d[order[:b]] = move_dir[order[:b]] * km
+        out.append(d)
+    return out
+
+
+def _spatial_children(ctx: Context, move_dir, score) -> list[torch.Tensor]:
+    """Spatially structured proposals (item 11): top saliency PATCHES (all channels) and per-RGB-channel
+    dense candidates. Network features are spatially correlated, so a coherent region can beat scattered
+    top-gradient channels."""
+    C, H, W = int(ctx.shape[0]), int(ctx.shape[1]), int(ctx.shape[2])
+    km = float(ctx.k_min)
+    clean_flat = ctx.clean.view(-1)
+    can = movable(clean_flat, move_dir)
+    sal = score.clone()
+    sal[~can] = 0.0
+    base = torch.zeros_like(ctx.clean_u8)
+    deltas: list[torch.Tensor] = []
+
+    p = max(1, int(K.FEASUP_PATCH))
+    s2 = sal.view(C, H, W).sum(dim=0, keepdim=True).unsqueeze(0)           # [1,1,H,W] summed over channels
+    pooled = F.avg_pool2d(s2, p, stride=p)[0, 0]                           # [H//p, W//p] mean saliency
+    ph, pw = pooled.shape
+    flat = pooled.reshape(-1)
+    nptch = flat.numel()
+    for frac in (0.05, 0.15, 0.40):                                       # cover a few patch budgets
+        t = max(1, min(int(round(frac * nptch)), nptch))
+        top = torch.topk(flat, t).indices
+        mask = torch.zeros(ph * pw, device=flat.device, dtype=torch.bool)
+        mask[top] = True
+        mask2d = mask.view(ph, pw)
+        full = mask2d.repeat_interleave(p, 0)[:H].repeat_interleave(p, 1)[:, :W]  # upsample to H×W
+        chan_mask = full.unsqueeze(0).expand(C, H, W).reshape(-1) & can
+        idx = chan_mask.nonzero(as_tuple=True)[0]
+        if idx.numel():
+            deltas.append(_delta_from_idx(ctx, base, idx, move_dir))
+
+    chans = can.view(C, H, W)                                             # per-RGB-channel dense
+    for c in range(C):
+        idx = chans[c].reshape(-1).nonzero(as_tuple=True)[0] + c * H * W
+        if idx.numel():
+            deltas.append(_delta_from_idx(ctx, base, idx, move_dir))
+    return deltas
+
+
+def _rescue_children(ctx: Context, beam: list[dict], dev) -> list[torch.Tensor]:
+    """Gradient-free rescue (item 14): mutate around SEVERAL near-flips — flip a random fraction of active
+    actions, reverse a random subset, or combine the supports of two diverse parents."""
+    km = float(ctx.k_min)
+    out: list[torch.Tensor] = []
+    parents = beam[:min(4, len(beam))]
+    for st in parents:
+        d0 = st["delta"]
+        for frac in K.FEASUP_RESCUE_FRACS:
+            d = d0.clone()
+            m = torch.rand(d.numel(), device=dev) < frac
+            vals = (torch.randint(0, 3, (int(m.sum().item()),), device=dev).float() - 1.0) * km
+            d[m] = vals
+            out.append(d)
+    if len(parents) >= 2:                                                 # combine two diverse supports
+        a, b = parents[0]["delta"], parents[-1]["delta"]
+        take = torch.rand(a.numel(), device=dev) < 0.5
+        out.append(torch.where(take, a, b))
+    return out
+
+
+def _build_target_pool(ctx: Context, x: torch.Tensor, dev) -> list[dict]:
+    """Target pool prioritized by linearized crossing size K̂_c (items 2/9). One pair-loss backward per
+    target; entries carry the cached field so seeding/expansion can reuse them. Smaller K̂_c first."""
+    logits = logits_of(ctx.model, x)
+    cands = top_wrong_classes(logits, ctx.target_index, K.FEASUP_TOPM)
+    extra = [c for c in range(logits.numel())
+             if c != ctx.target_index and c not in cands]
+    random.shuffle(extra)
+    cands += extra[:max(0, K.FEASUP_RAND_TARGETS)]                        # a few random wrong classes
+    clean_flat = ctx.clean.view(-1)
+    pool: list[dict] = []
+    for c in cands:
+        if _out_of_time(ctx):
+            break
+        value, md, sc = loss_grad(ctx.model, x, ctx.target_index, f"pair:{c}")
+        masked, order, valid = build_sparse_order(sc, md, clean_flat)
+        if valid == 0:
+            continue
+        kc = estimate_k(value + ctx.kappa, masked[order][:valid], ctx.q)
+        pool.append({"c": c, "value": value, "move_dir": md, "score": sc, "kc": kc})
+    pool.sort(key=lambda e: e["kc"])                                      # prioritize smallest crossing
+    return pool
+
+
+def _mask_of(delta: torch.Tensor) -> torch.Tensor:
+    return delta != 0
+
+
+def _too_similar(a: torch.Tensor, b: torch.Tensor, thr: float) -> bool:
+    inter = float((a & b).sum().item())
+    union = float((a | b).sum().item())
+    return union > 0 and inter / union > thr
+
+
+def _beam_insert(beam: list[dict], st: dict, cap: int, thr: float) -> None:
+    """Insert a candidate state, rejecting near-duplicate supports of a better state and evicting
+    near-duplicate worse states; keep the `cap` lowest-margin, support-diverse states (item 3)."""
+    st["mask"] = _mask_of(st["delta"])
+    for s in beam:
+        if s["margin"] <= st["margin"] and _too_similar(s["mask"], st["mask"], thr):
+            return
+    beam[:] = [s for s in beam if not (st["margin"] < s["margin"] and _too_similar(st["mask"], s["mask"], thr))]
+    beam.append(st)
+    beam.sort(key=lambda s: s["margin"])
+    del beam[cap:]
+
+
+def find_feasible_upgraded(ctx: Context) -> str | None:
+    """Upgraded Problem 1 solver: loss portfolio + diverse beam + adaptive blocks (see block comment).
+
+    Seeds a diverse beam from structured restarts (dense sign, support neighborhoods, per-target supports,
+    random subsets), then loops: pick a beam parent and a portfolio loss (reward-per-second weighted),
+    recompute the field at that discrete state, batch a speculative set of children (support neighborhoods,
+    adaptive replacement/reversal block moves, near-tie variants, spatial proposals, an occasional
+    ensemble), evaluate them in one forward, fold survivors into the beam, and adapt the parent's block
+    size from realized vs. predicted improvement. On stagnation it rotates loss/target/parent and runs a
+    gradient-free rescue. Returns 'safe' the instant an envelope-safe flip is banked."""
     n = ctx.clean_u8.numel()
     dev = ctx.clean_u8.device
     km = float(ctx.k_min)
-    top = top_wrong_classes(logits_of(ctx.model, ctx.clean), ctx.target_index,
-                            max(K.HYBRID_TARGETS, K.DCT_TOPM))
-    kinds = [f"dlrt:{t}" for t in top[:max(1, K.HYBRID_TARGETS)]]
-    states = [{"u": torch.zeros(n, device=dev), "prev": torch.zeros(n, device=dev),
-               "alpha": K.APGD_ALPHA0, "best": float("inf"), "stale": 0,
-               "ubest": torch.zeros(n, device=dev), "kind": k} for k in kinds]
+    kinds = list(K.FEASUP_LOSSES)
+
+    pool = _build_target_pool(ctx, ctx.clean, dev)
+    targets = [e["c"] for e in pool] or top_wrong_classes(logits_of(ctx.model, ctx.clean),
+                                                           ctx.target_index, K.FEASUP_TOPM)
+
+    # --- Structured restarts (items 4/12): one batched seed population --------------------
+    seeds: list[torch.Tensor] = []
+    for kind in kinds:                                                    # untargeted portfolio losses
+        if _out_of_time(ctx):
+            break
+        value, md, sc = _loss_field(ctx, ctx.clean, kind, targets)
+        seeds += _support_neighborhood(ctx, md, sc, ctx.m0, K.FEASUP_K_MULTS, K.FEASUP_TIE_VARIANTS)
+    for e in pool[:min(5, len(pool))]:                                    # smallest-K̂ targeted supports
+        seeds += _support_neighborhood(ctx, e["move_dir"], e["score"], e["value"],
+                                       K.FEASUP_K_MULTS, K.FEASUP_TIE_VARIANTS)
+    for p in K.FEASUP_SPARSE_STARTS:                                      # sparse random subsets
+        d = torch.zeros_like(ctx.clean_u8)
+        m = torch.rand(n, device=dev) < p
+        d[m] = (torch.randint(0, 2, (int(m.sum().item()),), device=dev).float() * 2.0 - 1.0) * km
+        seeds.append(d)
+    for _ in range(K.FEASUP_DENSE_STARTS):
+        seeds.append((torch.randint(0, 2, (n,), device=dev).float() * 2.0 - 1.0) * km)
+
+    beam: list[dict] = []
+    res = _eval_deltas(ctx, seeds)
+    if ctx.bank.has_safe:
+        return "safe"
+    for r in res:
+        _beam_insert(beam, {"delta": r["delta"], "margin": r["margin"], "block": K.FEASUP_BLOCK0,
+                            "fail": 0}, K.FEASUP_BEAM, K.FEASUP_DUP_JACCARD)
+    if not beam:                                                          # degenerate: seed from clean
+        _beam_insert(beam, {"delta": torch.zeros_like(ctx.clean_u8), "margin": ctx.m0,
+                            "block": K.FEASUP_BLOCK0, "fail": 0}, K.FEASUP_BEAM, K.FEASUP_DUP_JACCARD)
+
+    # --- Adaptive portfolio / beam search --------------------------------------------------
+    reward = {k: 0.0 for k in kinds}                                      # margin-drop per second (EMA)
+    best_margin = beam[0]["margin"]
+    pi = ti = it = 0                                                      # parent / target / iter cursors
+    stagnant = 0
+    init_best_wrong = targets[0] if targets else None
 
     while not _out_of_time(ctx):
-        deltas = [s["u"].round().clamp(-1.0, 1.0) * km for s in states]
-        res = _eval_deltas(ctx, deltas)
+        it += 1
+        parent = beam[pi % len(beam)]
+        pi += 1
+        # loss selection weighted by reward-per-second, with an exploration floor (item 1)
+        w = torch.tensor([max(reward[k], 0.0) + 0.1 for k in kinds])
+        kind = kinds[int(torch.multinomial(w / w.sum(), 1).item())]
+        ent = pool[ti % len(pool)] if pool else None                     # rotate targets by priority
+        ti += 1
+
+        x = apply_delta_bytes(ctx.clean_u8, parent["delta"], ctx.shape)
+        t0 = time.time()
+        if K.FEASUP_ENS_EVERY > 0 and it % K.FEASUP_ENS_EVERY == 0:       # ensemble field (item 8)
+            move_dir, score = _ensemble_field(ctx, x, K.FEASUP_ENS_LOSSES, targets)
+            value = ctx.m0
+        else:
+            value, move_dir, score = _loss_field(ctx, x, kind, targets)
+
+        children: list[torch.Tensor] = []
+        children += _block_moves(ctx, parent["delta"], move_dir, score,
+                                 (parent["block"] // 2, parent["block"], parent["block"] * 2))
+        children += _support_neighborhood(ctx, move_dir, score, value, K.FEASUP_K_MULTS,
+                                           K.FEASUP_TIE_VARIANTS)
+        if ent is not None:                                              # targeted support neighborhood
+            children += _support_neighborhood(ctx, ent["move_dir"], ent["score"], ent["value"],
+                                              K.FEASUP_K_MULTS, K.FEASUP_TIE_VARIANTS)
+        if K.FEASUP_SPATIAL:
+            children += _spatial_children(ctx, move_dir, score)
+
+        res = _eval_deltas(ctx, children)
         if ctx.bank.has_safe:
             return "safe"
         if not res:
             break
-        for s, r in zip(states, res):
-            if r["margin"] < s["best"] - 1e-6:
-                s["best"], s["stale"], s["ubest"] = r["margin"], 0, s["u"].clone()
-            else:
-                s["stale"] += 1
-                if s["stale"] >= K.APGD_PATIENCE:            # halve step + restart from this state's best
-                    s["alpha"] = max(K.APGD_MIN_ALPHA, s["alpha"] * 0.5)
-                    s["stale"], s["u"] = 0, s["ubest"].clone()
-        for s, r in zip(states, res):
-            if _out_of_time(ctx):
-                break
-            _, move_dir, _ = loss_grad(ctx.model, r["cand"], ctx.target_index, s["kind"])
-            z = (s["u"] + s["alpha"] * move_dir).clamp(-1.0, 1.0)            # APGD step (sign direction)
-            u_new = (z + K.HYBRID_MOMENTUM * (s["u"] - s["prev"])).clamp(-1.0, 1.0)  # momentum
-            s["prev"], s["u"] = s["u"], u_new
-    return _status(ctx)
+        bi = min(range(len(res)), key=lambda i: res[i]["margin"])
+        child_best = res[bi]["margin"]
+        dt = max(time.time() - t0, 1e-3)
+        reward[kind] = 0.7 * reward[kind] + 0.3 * max(0.0, parent["margin"] - child_best) / dt
 
+        for r in res:
+            _beam_insert(beam, {"delta": r["delta"], "margin": r["margin"], "block": parent["block"],
+                                "fail": 0}, K.FEASUP_BEAM, K.FEASUP_DUP_JACCARD)
 
-# ------------------------------------------------------------------------------------------
-# compress_l0 — exact-byte L0 continuation (THE RMSE optimizer).
-# ------------------------------------------------------------------------------------------
-# At q=1 every active channel has magnitude exactly one byte, so RMSE = q·sqrt(|S|/n) and the real
-# objective is min |S| s.t. the flip holds — NOT "find any flip in the L∞ box" (what the finders do).
-# This stage keeps OPTIMIZING THE SUPPORT itself rather than only pruning the support the finders
-# happened to land on, escaping the subset trap that plateaus plain backward pruning. Each round, under
-# a LOCKED target margin h_t = z_y − z_t (stable support ranking, vs untargeted DLR whose argmax/denom
-# switch), it runs:
-#   A reinforce the margin at fixed |S| (re-sign + swap weak↔strong) to create deletion slack;
-#   B adaptively shrink the cardinality budget k (cheap-subset drop + a fresh relocate candidate);
-#   C slack-aware group pruning (revert a whole low-cost group in one forward, β-budgeted by the slack);
-#   D one-for-many support exchange (add 1 strong unused channel, drop ≥2 weak) — escapes the subset trap;
-#   E exact batched leave-one-out cleanup for the final, uncertain channels.
-# Candidates flow through the validator-faithful envelope eval, so the Bank independently records the
-# sparsest envelope-safe flip; gradients only RANK/PREDICT. (Our delta is over d=3HW individual channel-
-# values, so every top-k op is channel-sparse — never auto-flips all 3 channels of a pixel.)
-# ------------------------------------------------------------------------------------------
-def _l0_pair(ctx: Context, delta: torch.Tensor, t: int):
-    """Locked-target margin h_t=z_y−z_t, its toward-flip move dir, and |∂h_t/∂x| at clean+delta."""
-    x = apply_delta_bytes(ctx.clean_u8, delta, ctx.shape)
-    return loss_grad(ctx.model, x, ctx.target_index, f"pair:{t}")
-
-
-def _revert_cost(move_dir, score, delta, idx, km, q) -> torch.Tensor:
-    """First-order Δh_t from reverting each channel in idx one byte toward clean. Negative => reverting
-    also helps the flip (do it first); positive => it costs margin slack."""
-    return move_dir[idx] * score[idx] * torch.sign(delta[idx]) * km * q
-
-
-def _l0_pick(ctx: Context, res: list[dict], max_k: int, require_accept: bool) -> dict | None:
-    """Lowest hard-margin (envelope) candidate that still flips, with |S|<=max_k and (optionally) safe."""
-    best = None
-    for r in res:
-        if not r.get("flipped") or r["nz"] > max_k:
-            continue
-        if require_accept and not _accept(ctx, r):
-            continue
-        if best is None or r["margin"] < best["margin"]:
-            best = r
-    return best
-
-
-def _l0_reinforce(ctx: Context, delta: torch.Tensor, t: int, km: float) -> torch.Tensor:
-    """A: at FIXED |S|, re-sign active channels to the toward-flip direction and swap the weakest active
-    channels for the strongest unused ones, keeping the equal-k candidate with the most negative margin.
-    Does not shrink |S| — it manufactures the slack that lets later stages delete."""
-    clean_flat = ctx.clean.view(-1)
-    _, move_dir, score = _l0_pair(ctx, delta, t)
-    active = delta != 0
-    k = int(active.sum().item())
-    cands = [delta]                                            # keep the current base in the race
-    d = torch.zeros_like(delta)                               # (1) re-sign all active to toward-flip
-    d[active] = move_dir[active] * km
-    cands.append(d)
-    act_idx = active.nonzero(as_tuple=True)[0]
-    if act_idx.numel() > 0:                                    # (2) swap weak active <-> strong unused
-        weak = act_idx[torch.argsort(score[act_idx])]
-        gabs = score.clone()
-        gabs[active] = -1.0
-        gabs[~movable(clean_flat, move_dir)] = -1.0
-        n_un = int((gabs > 0).sum().item())
-        for frac in K.L0_SWAP_FRACS:
-            cnt = min(int(frac * act_idx.numel()) + 1, int(weak.numel()), n_un)
-            if cnt < 1:
-                continue
-            strong = torch.topk(gabs, cnt).indices
-            d = delta.clone()
-            d[weak[:cnt]] = 0.0
-            d[strong] = move_dir[strong] * km
-            cands.append(d)
-    res = _eval_deltas(ctx, cands)
-    pick = _l0_pick(ctx, res, max_k=k, require_accept=False)   # equal-k, just want more slack
-    return pick["delta"] if pick is not None else delta
-
-
-def _l0_shrink(ctx: Context, delta: torch.Tensor, t: int, km: float, q: float, rho: float):
-    """B: try a smaller cardinality budget k_try=floor(ρ·k). Two candidates: drop the cheapest (k−k_try)
-    active channels (subset), and a FRESH top-k_try support from the gradient (relocate — can leave the
-    current support entirely). Returns (delta, True) on an accepted strict shrink, else (delta, False)."""
-    clean_flat = ctx.clean.view(-1)
-    active = delta != 0
-    k = int(active.sum().item())
-    k_try = max(1, int(math.floor(rho * k)))
-    if k_try >= k:
-        return delta, False
-    _, move_dir, score = _l0_pair(ctx, delta, t)
-    act_idx = active.nonzero(as_tuple=True)[0]
-    cost = _revert_cost(move_dir, score, delta, act_idx, km, q)
-    order = act_idx[torch.argsort(cost)]                       # cheapest-to-remove first
-    cand_subset = delta.clone()
-    cand_subset[order[: k - k_try]] = 0.0                      # keep the k_try most-expensive-to-remove
-    gabs = score.clone()
-    gabs[~movable(clean_flat, move_dir)] = -1.0
-    n_valid = max(1, int((gabs > 0).sum().item()))
-    topk = torch.topk(gabs, min(k_try, n_valid)).indices
-    cand_fresh = torch.zeros_like(delta)                       # relocate: fresh top-k_try support
-    cand_fresh[topk] = move_dir[topk] * km
-    res = _eval_deltas(ctx, [cand_subset, cand_fresh])
-    pick = _l0_pick(ctx, res, max_k=k - 1, require_accept=True)
-    return (pick["delta"], True) if pick is not None else (delta, False)
-
-
-def _l0_group_prune(ctx: Context, delta: torch.Tensor, t: int, q: float) -> torch.Tensor:
-    """C: slack-aware group deletion. Rank active channels by revert cost (ascending), batch-eval a
-    geometric ladder of removal counts (+ the linear-predicted safe prefix) in ONE forward, and take the
-    LARGEST removal that stays accept-safe. Repeat to a local minimum or the budget."""
-    km = float(ctx.k_min)
-    base = float(K.PRUNE_LADDER) if K.PRUNE_LADDER > 1 else 2.0
-    cur = delta
-    while not _out_of_time(ctx):
-        changed = (cur != 0).nonzero(as_tuple=True)[0]
-        if changed.numel() == 0:
-            break
-        val, move_dir, score = _l0_pair(ctx, cur, t)
-        if val >= 0.0:                                        # locked target no longer winning -> stop here
-            break
-        c = _revert_cost(move_dir, score, cur, changed, km, q)
-        sort_idx = torch.argsort(c)
-        order = changed[sort_idx]
-        n = int(order.numel())
-        sizes = set()
-        s = 1
-        while s < n:
-            sizes.add(s)
-            s = max(s + 1, int(s * base))
-        sizes.add(n)
-        cum = torch.cumsum(c[sort_idx], dim=0)                # predicted h_t after reverting each prefix
-        ok = (val + cum < -ctx.kappa)
-        bpred = int(torch.cumprod(ok.to(torch.long), dim=0).sum().item())
-        if bpred >= 1:
-            sizes.add(bpred)
-        sizes = sorted(x for x in sizes if 1 <= x <= n)
-        cands = [cur.clone() for _ in sizes]
-        for d, sz in zip(cands, sizes):
-            d[order[:sz]] = 0.0
-        res = _eval_deltas(ctx, cands)
-        best_d, best_sz = None, 0
-        for sz, d, r in zip(sizes, cands, res):
-            if _accept(ctx, r) and sz > best_sz:
-                best_sz, best_d = sz, d
-        if best_d is None:
-            break
-        cur = best_d
-    return cur
-
-
-def _l0_exchange(ctx: Context, delta: torch.Tensor, t: int, km: float, q: float) -> torch.Tensor:
-    """D: one-for-many support exchange. Add ONE strong unused channel j (its toward-flip step drops h_t
-    by ~q·km·|g_j|) and revert as many cheap active channels as that extra slack pays for, so |S| strictly
-    drops. The added channel may lie OUTSIDE the current support, so this escapes the subset trap that
-    bounds pure backward pruning. Keeps the accept-safe candidate with the lowest |S|; repeats."""
-    clean_flat = ctx.clean.view(-1)
-    mindrop = max(2, int(K.L0_EXCHANGE_MIN_DROP))
-    cur = delta
-    while not _out_of_time(ctx):
-        val, move_dir, score = _l0_pair(ctx, cur, t)
-        if val >= 0.0:
-            break
-        changed_mask = cur != 0
-        changed = changed_mask.nonzero(as_tuple=True)[0]
-        if changed.numel() == 0:
-            break
-        c = _revert_cost(move_dir, score, cur, changed, km, q)
-        c_order = torch.argsort(c)
-        rem_order = changed[c_order]
-        cum = torch.cumsum(c[c_order], dim=0)
-        gabs = score.clone()                                  # strongest unused, movable channels to add
-        gabs[changed_mask] = -1.0
-        gabs[~movable(clean_flat, move_dir)] = -1.0
-        n_add = min(int(K.L0_EXCHANGE_ADDS), int((gabs > 0).sum().item()))
-        if n_add < 1:
-            break
-        add_idx = torch.topk(gabs, n_add).indices.tolist()
-        slack = -ctx.kappa - val                              # head-room of the locked-target margin (>=0)
-
-        def _nmax(j):                                         # cheapest removals the add's slack can pay for
-            budget = slack + q * km * float(score[j].item())
-            return int((cum <= budget).sum().item())
-
-        cands = []
-        j0 = add_idx[0]                                       # strongest add: a removal-count ladder
-        top = _nmax(j0)
-        if top >= mindrop:
-            sizes, s = set(), mindrop
-            while s < top:
-                sizes.add(s)
-                s = max(s + 1, int(s * 2))
-            sizes.add(top)
-            for sz in sorted(sizes):
-                d = cur.clone()
-                d[rem_order[:sz]] = 0.0
-                d[j0] = move_dir[j0] * km
-                cands.append(d)
-        for j in add_idx[1:]:                                 # other adds: one candidate each (diversity)
-            nrem = _nmax(j)
-            if nrem < mindrop:
-                continue
-            d = cur.clone()
-            d[rem_order[:nrem]] = 0.0
-            d[j] = move_dir[j] * km
-            cands.append(d)
-        if not cands:
-            break
-        res = _eval_deltas(ctx, cands)
-        best_d, best_nz = None, int(changed.numel())
-        for d, r in zip(cands, res):
-            if _accept(ctx, r) and r["nz"] < best_nz:
-                best_nz, best_d = r["nz"], d
-        if best_d is None:
-            break
-        cur = best_d
-    return cur
-
-
-def _l0_loo(ctx: Context, delta: torch.Tensor, t: int) -> torch.Tensor:
-    """E: exact batched leave-one-out cleanup (only when |S| is small enough to be worth exact probes).
-    Eval every single-channel revert, collect the ones that stay accept-safe, then take the LARGEST
-    accept-safe cumulative group of them (most-slack-first ladder) — catches curvature / target switches
-    the first-order ranking misses."""
-    changed = (delta != 0).nonzero(as_tuple=True)[0]
-    n = int(changed.numel())
-    if n == 0 or n > K.L0_LOO_MAX:
-        return delta
-    cands = [delta.clone() for _ in range(n)]
-    idx_list = changed.tolist()
-    for d, i in zip(cands, idx_list):
-        d[i] = 0.0
-    res = _eval_deltas(ctx, cands)                            # exact leave-one-out
-    rem = [(r["margin"], i) for i, r in zip(idx_list, res) if _accept(ctx, r)]
-    if not rem:
-        return delta
-    rem.sort(key=lambda z: z[0])                              # most slack (most negative margin) first
-    order = torch.tensor([i for _, i in rem], device=delta.device)
-    m = len(rem)
-    sizes, s = set(), 1
-    while s < m:
-        sizes.add(s)
-        s *= 2
-    sizes.add(m)
-    sizes = sorted(sizes)
-    cands2 = [delta.clone() for _ in sizes]
-    for d, sz in zip(cands2, sizes):
-        d[order[:sz]] = 0.0
-    res2 = _eval_deltas(ctx, cands2)
-    best_d, best_sz = None, 0
-    for sz, d, r in zip(sizes, cands2, res2):
-        if _accept(ctx, r) and sz > best_sz:
-            best_sz, best_d = sz, d
-    return best_d if best_d is not None else delta
-
-
-def compress_l0(ctx: Context) -> str | None:
-    """Phase 4 / RMSE optimizer: exact-byte L0 continuation (see block comment above).
-
-    Warm-starts from the Bank's best flip and keeps optimizing the SUPPORT — reinforce (A) -> adaptive
-    shrink (B) -> slack-aware group prune (C) -> one-for-many exchange (D) -> exact leave-one-out (E) —
-    under a target re-locked to the current flip each round, banking every sparser envelope-safe candidate,
-    until a full round makes no net progress or the budget runs out. ρ (the shrink budget) tightens after a
-    successful shrink and backs off after a failure (FMN-style adaptive cardinality radius)."""
-    delta = _warm_delta(ctx)
-    if delta is None:
-        return _status(ctx)
-    km, q = float(ctx.k_min), ctx.q
-    rho = K.L0_RHO0
-    while not _out_of_time(ctx):
-        k0 = int((delta != 0).sum().item())
-        x = apply_delta_bytes(ctx.clean_u8, delta, ctx.shape)       # re-lock target at the current flip
-        t = top_wrong_classes(logits_of(ctx.model, x), ctx.target_index, 1)[0]
-        delta = _l0_reinforce(ctx, delta, t, km)                    # A
-        d, ok = _l0_shrink(ctx, delta, t, km, q, rho)               # B
-        if ok:
-            delta = d
-            rho = max(K.L0_RHO_MIN, rho - K.L0_RHO_STEP)            # success -> shrink harder next time
+        # adaptive block + gradient-accuracy monitor (items 5/7)
+        if child_best < parent["margin"] - 1e-6:
+            parent["block"] = min(K.FEASUP_BLOCK_MAX, parent["block"] * 2)
+            parent["fail"] = 0
         else:
-            rho = min(K.L0_RHO_MAX, rho + K.L0_RHO_STEP)            # failure -> back off
-        delta = _l0_group_prune(ctx, delta, t, q)                   # C
-        delta = _l0_exchange(ctx, delta, t, km, q)                  # D
-        delta = _l0_loo(ctx, delta, t)                              # E
-        if int((delta != 0).sum().item()) >= k0:                    # no net |S| progress this round
-            break
-    return _status(ctx)
+            parent["block"] = max(K.FEASUP_BLOCK_MIN, parent["block"] // 2)
+            parent["fail"] += 1
 
+        if child_best < best_margin - 1e-6:
+            best_margin = child_best
+            stagnant = 0
+        else:
+            stagnant += 1
 
-def _run_phase(ctx: Context, fn, end_time: float) -> None:
-    """Run a finder with ctx.time_left temporarily capped at `end_time` (never past the real deadline)."""
-    full = ctx.time_left
-    ctx.time_left = lambda: min(full(), end_time - time.time())
-    try:
-        fn(ctx)
-    finally:
-        ctx.time_left = full
+        # stagnation rotation + rescue (items 13/14) and dynamic target-pool rebuild (item 2)
+        if stagnant >= K.FEASUP_STAGNATION or (K.FEASUP_POOL_REFRESH > 0 and it % K.FEASUP_POOL_REFRESH == 0):
+            xb = apply_delta_bytes(ctx.clean_u8, beam[0]["delta"], ctx.shape)
+            cur_best_wrong = top_wrong_classes(logits_of(ctx.model, xb), ctx.target_index, 1)[0]
+            if cur_best_wrong != init_best_wrong or stagnant >= K.FEASUP_STAGNATION:
+                pool = _build_target_pool(ctx, xb, dev) or pool
+                targets = [e["c"] for e in pool] or targets
+                init_best_wrong = cur_best_wrong
+        if stagnant >= K.FEASUP_STAGNATION:
+            _eval_deltas(ctx, _rescue_children(ctx, beam, dev))
+            if ctx.bank.has_safe:
+                return "safe"
+            pi += 1                                                      # jump to a different parent
+            stagnant = 0
 
-
-def find_hybrid(ctx: Context) -> str | None:
-    """Recommended hybrid (standalone approach): exact-byte APGD-DLR + filtered-gradient DCT-APGD +
-    targeted-DLR repair + post-success byte pruning.
-
-    Phase 1 (~HYBRID_APGD_FRAC of the budget): full APGD-DLR searches the whole q=1 cube.
-    Phase 2 (~HYBRID_DCT_FRAC): low-frequency DCT-APGD searches smooth coordinated directions.
-    Phase 3 (~HYBRID_REPAIR_FRAC): short targeted-DLR repair when a clear runner-up exists.
-    Phase 4 (remainder): exact-byte L0 continuation (compress_l0) shrinks |S| of whatever flip was banked.
-    Any phase that finds an envelope-safe flip short-circuits straight to compression, which runs against
-    the real deadline (the per-phase cap is lifted) — after the first flip, nearly all time goes to L0."""
-    full = ctx.time_left
-    total = max(0.0, full())
-    t0 = time.time()
-    acc = 0.0
-    for fn, frac in ((find_apgd_dlr, K.HYBRID_APGD_FRAC),
-                     (find_dct_apgd, K.HYBRID_DCT_FRAC),
-                     (_targeted_repair, K.HYBRID_REPAIR_FRAC)):
-        if ctx.bank.has_safe or _out_of_time(ctx):
-            break
-        acc += frac
-        _run_phase(ctx, fn, t0 + total * acc)
-
-    if ctx.bank.has_flip:                                     # Phase 4: L0 compression to the real deadline
-        compress_l0(ctx)
+    if not ctx.bank.has_flip:
+        logger.info(f"[feasible_upgraded] no flip; best_margin={best_margin:.4f} "
+                    f"({'likely q=1 infeasible' if best_margin > 2.0 else 'near-miss'})")
     return _status(ctx)
 
 
@@ -727,8 +632,8 @@ def perturb(
     start_time: float | None = None,
     steps: int | None = None,  # legacy, unused
 ) -> torch.Tensor:
-    """Find a sparse ±1/255 flip with one of the three q=1 approaches. Returns the sparsest
-    envelope-safe candidate (or, when PERTURB_ALLOW_UNSAFE_FLIP=1, any flip), else the clean image."""
+    """Find ANY envelope-safe ±k_min/255 flip (Problem 1 / feasibility) and return it; else the clean
+    image. With PERTURB_ALLOW_UNSAFE_FLIP=1, returns any margin<0 flip (the literal spec)."""
     t_start = start_time if start_time is not None else time.time()
     clean = clean.to(device).clamp(0.0, 1.0)
 
@@ -767,10 +672,10 @@ def perturb(
         bank=Bank(), m0=m0, g0=g0.view(-1),
     )
 
-    # --- ORCHESTRATOR SWITCH: uncomment exactly ONE of the three approaches. ---
-    # find_apgd_dlr(ctx)     # 1. exact-byte APGD-DLR over the full ternary cube
-    # find_dct_apgd(ctx)     # 2. low-frequency filtered-gradient DCT APGD
-    find_hybrid(ctx)         # 3. recommended hybrid: APGD-DLR -> DCT-APGD -> targeted repair -> RMSE prune
+    if K.SOLVER == "upgraded":
+        find_feasible_upgraded(ctx)
+    else:
+        find_feasible(ctx)
 
     chosen = ctx.bank.result(ctx.allow_unsafe)
     if chosen is None:
