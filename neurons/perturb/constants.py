@@ -72,7 +72,16 @@ Q = 1.0 / 255.0                                            # one byte in [0,1] s
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)  # validator L∞ cap
 MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
 MIN_PSNR_DB = _env_float("PERTURB_MIN_PSNR_DB", 38.0)
-RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 4.5)   # deadline headroom
+RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 4.5)   # deadline headroom (base)
+# Reserve scales with the measured per-forward cost so larger images / models leave enough post-search
+# headroom for serialization + verification (added on top of RESERVE_SECONDS). t_step is one fwd+bwd.
+RESERVE_FWD_MULT = _env_float("PERTURB_RESERVE_FWD_MULT", 6.0)
+# Deadline gating. The budget guard accounts for BOTH a backward pass (t_step) and a real eval chunk
+# (t_eval, measured live): out_of_budget <=> time_left <= 2·t_step + OOT_EVAL_MARGIN·t_eval. And batch_eval
+# stops launching new chunks once time_left <= EVAL_TIME_MARGIN·t_eval, so a big candidate list can never
+# run past the deadline mid-evaluation.
+OOT_EVAL_MARGIN = _env_float("PERTURB_OOT_EVAL_MARGIN", 1.5)
+EVAL_TIME_MARGIN = _env_float("PERTURB_EVAL_TIME_MARGIN", 1.25)
 # ±1/255 edits on a grid-aligned clean image survive PNG exactly, so the round-trip is identity.
 SKIP_ROUNDTRIP = _env_bool("PERTURB_SKIP_ROUNDTRIP", True)
 
@@ -143,3 +152,43 @@ FEASUP_RESCUE_FRACS = _env_floats("PERTURB_FEASUP_RESCUE_FRACS", (0.05, 0.20))  
 FEASUP_POOL_REFRESH = _env_int("PERTURB_FEASUP_POOL_REFRESH", 8)  # rebuild target pool every N iters
 FEASUP_SPARSE_STARTS = _env_floats("PERTURB_FEASUP_SPARSE_STARTS", (0.01, 0.05, 0.20))
 FEASUP_DENSE_STARTS = _env_int("PERTURB_FEASUP_DENSE_STARTS", 2)
+
+# --- Approach 2: Ternary Anytime Sparse Optimizer (L0 minimization, post-flip) -----------
+# Runs AFTER a feasibility flip exists (from the PERTURB_SOLVER engine) and minimizes |S|_0 while the
+# Bank keeps the smallest verified flip as the incumbent. Master switch + per-phase toggles; the same
+# PERTURB_SOLVER engine (feasible/upgraded) is reused as the repair / independent-basin engine.
+APPROACH2 = _env_bool("PERTURB_APPROACH2", False)            # master switch for the sparse optimizer
+A2_REINFORCE = _env_bool("PERTURB_A2_REINFORCE", True)       # Phase E.1: same-cost margin reinforcement
+A2_PRUNE = _env_bool("PERTURB_A2_PRUNE", True)              # Phase B: hierarchical group deletion
+A2_APGD = _env_bool("PERTURB_A2_APGD", True)               # Phase C: fixed-K ternary APGD (coarse->fine)
+A2_EXCHANGE = _env_bool("PERTURB_A2_EXCHANGE", True)        # Phase E.2: compressing exchanges (2->1, ...)
+A2_REPAIR = _env_bool("PERTURB_A2_REPAIR", True)           # Phase D: repair near-flips + independent rerun
+A2_LOO = _env_bool("PERTURB_A2_LOO", True)                 # exact leave-one-out cleanup (small |S|)
+A2_SIGMA0 = _env_bool("PERTURB_A2_SIGMA0", False)          # Section 8: ternary sigma-zero (noisy; off)
+A2_RESCUE = _env_bool("PERTURB_A2_RESCUE", True)           # Section 9: randomized rescue
+
+# Phase C / coarse-to-fine support schedule
+A2_K_COARSE = _env_float("PERTURB_A2_K_COARSE", 0.75)       # first lower budget K = ceil(coarse·U)
+A2_FINE_STEPS = _env_ints("PERTURB_A2_FINE_STEPS", (1, 2, 4, 8))  # fine reductions U-step
+A2_LOSSES = _env_strs("PERTURB_A2_LOSSES", ("hard", "dlr", "soft"))  # fixed-K loss portfolio
+A2_APGD_ITERS = _env_int("PERTURB_A2_APGD_ITERS", 12)      # iters per fixed-K APGD call
+A2_APGD_ALPHA0 = _env_float("PERTURB_A2_APGD_ALPHA0", 2.0)  # initial latent step (activates top saliency)
+A2_APGD_MIN_ALPHA = _env_float("PERTURB_A2_APGD_MIN_ALPHA", 0.25)
+A2_APGD_MOMENTUM = _env_float("PERTURB_A2_APGD_MOMENTUM", 0.75)
+A2_APGD_PATIENCE = _env_int("PERTURB_A2_APGD_PATIENCE", 2)
+A2_TAU = _env_float("PERTURB_A2_TAU", 1.0)                 # soft-margin temperature (portfolio)
+A2_TOPM = _env_int("PERTURB_A2_TOPM", 5)                   # top wrong classes for the soft loss
+
+# Phase B / prune ladder + Phase E exchange
+A2_PRUNE_LADDER = _env_int("PERTURB_A2_PRUNE_LADDER", 2)    # geometric base for removal-count ladders
+A2_EXCHANGE_ADDS = _env_int("PERTURB_A2_EXCHANGE_ADDS", 32)  # top-N unused channels probed as additions
+A2_EXCHANGE_MIN_DROP = _env_int("PERTURB_A2_EXCHANGE_MIN_DROP", 2)  # removals needed per add to net-shrink
+A2_SWAP_FRACS = _env_floats("PERTURB_A2_SWAP_FRACS", (0.05, 0.10, 0.20))  # reinforce weak<->strong swaps
+A2_LOO_MAX = _env_int("PERTURB_A2_LOO_MAX", 2048)         # max |S| for exact leave-one-out
+
+# Phase D repair / sigma-zero / rescue
+A2_INDEP_RERUN = _env_bool("PERTURB_A2_INDEP_RERUN", False)  # re-run the Approach 1 engine for new basins
+A2_REPAIR_ADDS = _env_int("PERTURB_A2_REPAIR_ADDS", 8)     # max coords a repair may add to a near-flip
+A2_SIGMA0_ITERS = _env_int("PERTURB_A2_SIGMA0_ITERS", 8)
+A2_SIGMA0_LAMBDA0 = _env_float("PERTURB_A2_SIGMA0_LAMBDA0", 0.3)
+A2_RESCUE_FRACS = _env_floats("PERTURB_A2_RESCUE_FRACS", (0.02, 0.05, 0.10))

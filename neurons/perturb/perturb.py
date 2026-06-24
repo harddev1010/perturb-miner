@@ -48,6 +48,7 @@ from .utils import (
     loss_grad,
     margin_and_grad,
     movable,
+    out_of_budget,
     top_wrong_classes,
 )
 
@@ -75,7 +76,7 @@ def _status(ctx: Context) -> str | None:
 
 
 def _out_of_time(ctx: Context) -> bool:
-    return ctx.time_left() <= 2.0 * ctx.t_step
+    return out_of_budget(ctx)
 
 
 def _consider(ctx: Context, cands: list[torch.Tensor]) -> list[dict]:
@@ -644,25 +645,28 @@ def perturb(
     k_min = max(1, int(math.ceil(floor * 255.0 - 1e-6)))  # fixed unit step (typically 1)
     q = k_min * K.Q
 
-    if reserve_seconds is None:
-        reserve_seconds = K.RESERVE_SECONDS
-    deadline = t_start + max(0.05, float(timeout_seconds) - float(reserve_seconds))
-
-    def time_left() -> float:
-        return deadline - time.time()
-
     # Byte-space: snap clean to its uint8 grid; every edit is an integer BYTE step on this, so
     # candidates are exactly on the k/255 grid and the PNG round-trip is identity.
     clean_u8 = torch.round(clean.view(-1) * 255.0)
     envelope = K.TF32_ENVELOPE and device.type == "cuda"
     kappa = K.KAPPA_RESID if envelope else K.MARGIN_BUFFER
 
-    # One gradient evaluation: clean margin m0 + boundary gradient g0, and a t_step to gate loops.
+    # One gradient evaluation up front: clean margin m0 + boundary gradient g0, and a t_step gate.
     g_t0 = time.time()
     m0, g0 = margin_and_grad(model, clean, target_index)
     if device.type == "cuda":
         torch.cuda.synchronize()
     t_step = max(1e-4, time.time() - g_t0)
+
+    # Scale the reserve with the per-forward cost so larger images/models leave enough post-search
+    # headroom for serialization + verification (#4); the search deadline shrinks accordingly.
+    if reserve_seconds is None:
+        reserve_seconds = K.RESERVE_SECONDS
+    reserve_seconds = float(reserve_seconds) + K.RESERVE_FWD_MULT * t_step
+    deadline = t_start + max(0.05, float(timeout_seconds) - reserve_seconds)
+
+    def time_left() -> float:
+        return deadline - time.time()
 
     ctx = Context(
         model=model, device=device, clean=clean, clean_u8=clean_u8, shape=clean.shape,
@@ -672,10 +676,14 @@ def perturb(
         bank=Bank(), m0=m0, g0=g0.view(-1),
     )
 
-    if K.SOLVER == "upgraded":
-        find_feasible_upgraded(ctx)
-    else:
-        find_feasible(ctx)
+    # Approach 1 (feasibility): the selected engine finds the first flip and serves as the repair engine.
+    engine = find_feasible_upgraded if K.SOLVER == "upgraded" else find_feasible
+    engine(ctx)
+
+    # Approach 2 (L0 minimization): if enabled, minimize |S| while the Bank keeps the verified incumbent.
+    if K.APPROACH2 and ctx.bank.has_flip:
+        from . import approach2
+        approach2.compress(ctx, repair_fn=engine)
 
     chosen = ctx.bank.result(ctx.allow_unsafe)
     if chosen is None:

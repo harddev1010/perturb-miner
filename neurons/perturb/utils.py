@@ -8,6 +8,7 @@ best-candidate Bank, and the Context bundle handed to every algorithm.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -251,6 +252,22 @@ class Context:
     bank: "Bank"
     m0: float = 0.0              # clean CW margin
     g0: torch.Tensor | None = None  # clean hard-margin gradient (flat)
+    t_eval: float = 0.0          # live EMA of one full-batch eval chunk cost (set by batch_eval)
+
+
+def out_of_budget(ctx: "Context") -> bool:
+    """Deadline gate accounting for BOTH a backward pass (t_step) and a real eval chunk (t_eval). t_eval
+    starts at 0 (== the legacy 2·t_step gate) and grows once batch_eval has measured a chunk, so loops stop
+    while there is still time to finish the work they are about to start."""
+    return ctx.time_left() <= 2.0 * ctx.t_step + K.OOT_EVAL_MARGIN * ctx.t_eval
+
+
+def eval_budget(ctx: "Context") -> int:
+    """Rough number of candidates still evaluable before the budget guard trips — used to cap the size of
+    heavy candidate lists (e.g. exact leave-one-out) so they are not built and then discarded."""
+    per = (ctx.t_eval / max(1, K.BATCH_SIZE)) if ctx.t_eval > 0.0 else ctx.t_step
+    avail = ctx.time_left() - (2.0 * ctx.t_step + K.OOT_EVAL_MARGIN * ctx.t_eval)
+    return max(1, int(avail / max(per, 1e-6)))
 
 
 def _better(a: dict, b: dict) -> bool:
@@ -305,6 +322,11 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
     margin (envelope worst-case when enabled), flipped, safe, quality.
     Envelope: for flipped candidates, a second batched TF32-on forward yields max(off,on).
     OOM-safe: halves the batch and retries on CUDA OOM.
+
+    Deadline-aware: tracks an EMA of per-chunk wall time in ctx.t_eval and STOPS launching new chunks once
+    time_left <= EVAL_TIME_MARGIN·t_eval, returning the results graded so far (always >=1 chunk). This is
+    what keeps a large candidate list from running many forward batches past the deadline. Callers iterate
+    or zip over the returned list, so a short (partial) result is safe everywhere.
     """
     if not cand_list:
         return []
@@ -313,7 +335,11 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
     i = 0
     half_q = 0.5 * ctx.q
     while i < len(cand_list):
+        # Once a chunk cost is known, don't start a chunk we cannot finish before the deadline.
+        if results and ctx.t_eval > 0.0 and ctx.time_left() <= K.EVAL_TIME_MARGIN * ctx.t_eval:
+            break
         chunk = cand_list[i:i + bs]
+        t0 = time.monotonic()
         try:
             seen_list = [c if ctx.skip_roundtrip else png_roundtrip(c, ctx.device) for c in chunk]
             batch = torch.stack(seen_list, dim=0).to(ctx.device)
@@ -349,4 +375,8 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
             if bs == 1:
                 raise
             bs = max(1, bs // 2)
+            continue  # retry this chunk at a smaller batch; don't fold OOM time into the cost EMA
+        # EMA of the cost of a FULL bs-sized chunk (normalize a short tail chunk up to bs).
+        chunk_cost = (time.monotonic() - t0) * (bs / max(1, len(chunk)))
+        ctx.t_eval = chunk_cost if ctx.t_eval <= 0.0 else 0.6 * ctx.t_eval + 0.4 * chunk_cost
     return results

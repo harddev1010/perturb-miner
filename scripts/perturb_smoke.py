@@ -140,6 +140,27 @@ def main():
     nzu, linfu, gridu, stepu, flipu = run("upgraded", clean, 7, 0.012, PERTURB_SOLVER="upgraded")
     assert flipu and gridu and stepu == 1 and 0.003 - 1e-9 <= linfu <= 0.03 + 1e-9
 
+    print("[4c] Approach 2 (compress) shrinks |S| of a dense flip")
+    A2 = importlib.import_module("neurons.perturb.approach2")
+    torch.manual_seed(100)
+    ctx = build_ctx(clean, 13, 0.012)
+    _, move_dir, _ = U.loss_grad(ctx.model, ctx.clean, ctx.target_index, "ce")   # dense gradient-sign flip
+    A2._eval(ctx, [move_dir * float(ctx.k_min)])
+    r0 = ctx.bank.result(ctx.allow_unsafe)
+    assert r0 is not None, "dense seed did not produce a safe flip"
+    base = r0["nz"]
+    A2.compress(ctx, repair_fn=None)
+    r1 = ctx.bank.result(ctx.allow_unsafe)
+    ref, on_grid, mstep = nz_grid_step(r1, clean)
+    print(f"  [approach2] |S| {base} -> {ref}  (drop {100.0 * (base - ref) / max(1, base):.1f}%) "
+          f"on_grid={on_grid} max_step={mstep}")
+    assert on_grid and mstep == 1, "approach2 must keep a grid-aligned one-byte flip"
+    assert ref < base, f"approach2 must strictly shrink |S| on the exact-gradient stub ({ref} !< {base})"
+
+    print("[4d] perturb() end-to-end with PERTURB_APPROACH2=1 (feasible + compress)")
+    nzc, linfc, gridc, stepc, flipc = run("a2", clean, 7, 0.012, PERTURB_APPROACH2="1")
+    assert flipc and gridc and stepc == 1 and 0.003 - 1e-9 <= linfc <= 0.03 + 1e-9
+
     print("[5] unsafe-flip gate — kappa beyond the achievable margin swing makes nothing safe")
     nzg, _, _, _, flipg = run("gate-off", clean, 7, 0.005,
                               PERTURB_MINER_MARGIN_BUFFER="50.0", PERTURB_ALLOW_UNSAFE_FLIP="0")
