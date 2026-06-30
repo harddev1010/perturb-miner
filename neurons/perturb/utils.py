@@ -256,6 +256,8 @@ class Context:
     g0: torch.Tensor | None = None  # clean hard-margin gradient (flat)
     t_eval: float = 0.0          # live EMA of one full-batch eval chunk cost (set by batch_eval)
     dynamic_kappa: bool = False  # tighten the per-candidate accept cushion by the TF32 spread (envelope)
+    optim_seconds: float = 0.0   # post-flip optimization budget (s); 0 => no post-flip clock
+    first_flip_time: float | None = None  # wall-clock when the first flip was banked (arms the optim deadline)
 
 
 def out_of_budget(ctx: "Context") -> bool:
