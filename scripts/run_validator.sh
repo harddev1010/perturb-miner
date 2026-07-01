@@ -19,7 +19,9 @@ fi
 
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
+  set -a
   source "$ENV_FILE"
+  set +a
 fi
 
 WALLET_NAME="${WALLET_NAME:-}"

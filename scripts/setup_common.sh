@@ -41,7 +41,9 @@ if [[ "$ROLE" == "validator" ]]; then
   VALIDATOR_ENV_FILE="$ROOT_DIR/scripts/validator.env"
   if [[ -f "$VALIDATOR_ENV_FILE" ]]; then
     # shellcheck disable=SC1090
+    set -a
     source "$VALIDATOR_ENV_FILE"
+    set +a
   fi
   if [[ -n "${HF_TOKEN:-}" ]]; then
     export HF_TOKEN

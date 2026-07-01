@@ -17,7 +17,7 @@ setup(
         "datasets>=2.19.0",
         "fastapi>=0.111.0",
         "uvicorn>=0.30.0",
-        "wandb",
+        "boto3",
     ],
 )
 
