@@ -100,6 +100,87 @@ def _maybe_arm_optim_deadline(ctx: Context) -> None:
 
 
 # ==========================================================================================
+# Adaptive hyperparameter controller — start at the env values, escalate on stall, relax on progress.
+# Hot-path knobs are read through _p(ctx, NAME), which returns the live (tuned) value when a tuner is
+# attached and enabled, else the static K.NAME default.
+# ==========================================================================================
+_TUNABLE = ("ETA_MASK", "TEMPERATURE", "BLOCK_FRAC", "BLOCK_MIN",
+            "PROPOSAL_COUNT", "SWAP_INTERVAL", "RESTART_FRACTION")
+
+
+def _p(ctx: Context, name: str):
+    """Live value of a tunable knob (tuner override if present/enabled), else the static K default."""
+    t = getattr(ctx, "tuner", None)
+    if t is not None and t.enabled and name in t.params:
+        return t.params[name]
+    return getattr(K, name)
+
+
+class AdaptiveTuner:
+    """Watches the best margin over a sliding window and rescales the exploration knobs.
+
+    level L maps every knob to base · TUNE_FACTOR**L (with per-knob caps; SWAP_INTERVAL divides so it
+    gets MORE frequent). On a stalled window (best margin barely moved) level += 1; on a strongly
+    improving window level -= 1. Escalation makes the steps bigger and de-saturates Phase B (higher
+    temperature), exactly the levers needed when block-swap plateaus on a hard image."""
+
+    def __init__(self) -> None:
+        self.enabled = K.ADAPTIVE_TUNE
+        self.base = {k: getattr(K, k) for k in _TUNABLE}
+        self.params = dict(self.base)
+        self.level = 0
+        self.iters = 0
+        self.best = float("inf")
+        self.window_start_best = float("inf")
+
+    def _apply(self) -> None:
+        f = K.TUNE_FACTOR ** self.level
+        self.params["ETA_MASK"] = self.base["ETA_MASK"] * f
+        self.params["TEMPERATURE"] = min(self.base["TEMPERATURE"] * f, K.TUNE_TEMPERATURE_CAP)
+        self.params["BLOCK_FRAC"] = min(self.base["BLOCK_FRAC"] * f, K.TUNE_BLOCK_FRAC_CAP)
+        self.params["BLOCK_MIN"] = int(round(self.base["BLOCK_MIN"] * f))
+        self.params["PROPOSAL_COUNT"] = min(int(round(self.base["PROPOSAL_COUNT"] * f)), K.TUNE_PROPOSAL_CAP)
+        self.params["SWAP_INTERVAL"] = max(1, int(round(self.base["SWAP_INTERVAL"] / f)))
+        self.params["RESTART_FRACTION"] = min(self.base["RESTART_FRACTION"] * f, K.TUNE_RESTART_FRAC_CAP)
+
+    def _log(self, why: str) -> None:
+        p = self.params
+        logger.info(f"[tune] {why} level={self.level} eta={p['ETA_MASK']:.2f} temp={p['TEMPERATURE']:.2f} "
+                    f"block_frac={p['BLOCK_FRAC']:.3f} block_min={p['BLOCK_MIN']} "
+                    f"proposals={p['PROPOSAL_COUNT']} swap_int={p['SWAP_INTERVAL']} "
+                    f"restart_frac={p['RESTART_FRACTION']:.3f}")
+
+    def observe(self, best_margin: float) -> None:
+        """Call once per optim iteration with the current global-best margin."""
+        if not self.enabled:
+            return
+        self.iters += 1
+        self.best = min(self.best, best_margin)
+        if self.window_start_best == float("inf"):
+            self.window_start_best = self.best
+            return
+        if self.iters % max(1, K.TUNE_INTERVAL) != 0:
+            return
+        improvement = self.window_start_best - self.best
+        rel = improvement / max(abs(self.window_start_best), 1e-6)
+        if improvement < K.TUNE_MIN_IMPROVE and rel < K.TUNE_MIN_REL:
+            decision = "escalate" if self.level < K.TUNE_MAX_LEVEL else "stall@max"
+            if self.level < K.TUNE_MAX_LEVEL:
+                self.level += 1
+                self._apply()
+        elif rel > K.TUNE_GOOD_REL and self.level > 0:
+            self.level -= 1
+            self._apply()
+            decision = "relax"
+        else:
+            decision = "hold"
+        # Per-window heartbeat: always log so the controller's decision is visible even when it holds.
+        self._log(f"window @iter={self.iters} best={self.best:.4f} Δ={improvement:.4f} "
+                  f"rel={rel:.3f} -> {decision}")
+        self.window_start_best = self.best
+
+
+# ==========================================================================================
 # State — the optimization bundle described in the framework's "Common data structures".
 # ==========================================================================================
 @dataclass
@@ -533,11 +614,12 @@ def DynamicMaskOptimizationStep(ctx: Context, state: State, K_cur: int) -> State
     harmful = state.mask & (retention < 0)
     proposed_sign[harmful] = new_sign[harmful]
 
-    # B5. Dense mask-logit update (straight-through sigmoid).
+    # B5. Dense mask-logit update (straight-through sigmoid). eta/temperature are live (adaptive).
+    temperature = max(_p(ctx, "TEMPERATURE"), 1e-6)
     mask_gradient = ctx.q * proposed_sign * gradient
-    soft_mask = torch.sigmoid(state.a / max(K.TEMPERATURE, 1e-6))
-    derivative = soft_mask * (1 - soft_mask) / max(K.TEMPERATURE, 1e-6)
-    state.a = state.a - K.ETA_MASK * mask_gradient * derivative
+    soft_mask = torch.sigmoid(state.a / temperature)
+    derivative = soft_mask * (1 - soft_mask) / temperature
+    state.a = state.a - _p(ctx, "ETA_MASK") * mask_gradient * derivative
 
     # B6. Build the new hard support; new coords use their current preferred signs.
     proposed_mask = _topk_mask(state.a, K_cur)
@@ -634,7 +716,7 @@ def ExactBlockSwap(ctx: Context, state: State, block: int) -> tuple[State, bool]
     proposals.append((remove_set, _top_restricted(state.path_max, swap_in, block)))  # C3 historical-max
 
     # C4 randomized top-band proposals.
-    while len(proposals) < K.PROPOSAL_COUNT and swap_in.numel() > 0 and swap_out.numel() > 0:
+    while len(proposals) < _p(ctx, "PROPOSAL_COUNT") and swap_in.numel() > 0 and swap_out.numel() > 0:
         rin = swap_in[torch.randperm(swap_in.numel(), device=swap_in.device)[:min(block, swap_in.numel())]]
         rout = swap_out[torch.randperm(swap_out.numel(), device=swap_out.device)[:min(block, swap_out.numel())]]
         proposals.append((rout, rin))
@@ -690,7 +772,7 @@ def ShouldRestart(margin_history: list[float], turnover_history: list[float]) ->
 
 def PartialRestart(ctx: Context, state: State, K_cur: int) -> State:
     """Replace the weakest restart_fraction of the support with reservoir candidates (best of several)."""
-    restart_count = max(1, round(K.RESTART_FRACTION * K_cur))
+    restart_count = max(1, round(_p(ctx, "RESTART_FRACTION") * K_cur))
     selected = state.mask.nonzero(as_tuple=True)[0]
     retention = torch.full_like(state.a, float("inf"))
     if state.gradient is not None and selected.numel() > 0:
@@ -751,12 +833,15 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
         turnover_history.append(state.turnover)
         if state.margin < best_state.margin:
             best_state = copy.deepcopy(state)
+        # Feed the adaptive controller the global-best margin (escalate on stall, relax on progress).
+        if ctx.tuner is not None:
+            ctx.tuner.observe(best_state.margin)
         if best_state.margin < 0:
             logger.info(f"[optimK] flip at K={K_cur} iter={iteration} margin={best_state.margin:.4f}")
             return best_state, True
 
-        if iteration % K.SWAP_INTERVAL == 0 and not _oob(ctx):
-            block = _scheduled_block_size(iteration, K_cur, max_iterations)
+        if iteration % max(1, int(_p(ctx, "SWAP_INTERVAL"))) == 0 and not _oob(ctx):
+            block = _scheduled_block_size(ctx, iteration, K_cur, max_iterations)
             state, _ = ExactBlockSwap(ctx, state, block)
             if state.margin < best_state.margin:
                 best_state = copy.deepcopy(state)
@@ -775,16 +860,17 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
     return best_state, best_state.margin < 0
 
 
-def _scheduled_block_size(iteration: int, K_cur: int, max_iterations: int) -> int:
+def _scheduled_block_size(ctx: Context, iteration: int, K_cur: int, max_iterations: int) -> int:
     """Coords swapped per round. Flat BLOCK_FRAC·K (floored at BLOCK_MIN) by default, so the step does
     NOT shrink while we are still trying to flip. BLOCK_ANNEAL restores the old iteration taper, which
-    only makes sense for sparsifying after a flip already exists."""
+    only makes sense for sparsifying after a flip already exists. BLOCK_FRAC/BLOCK_MIN are live (adaptive)."""
+    block_frac = _p(ctx, "BLOCK_FRAC")
     if K.BLOCK_ANNEAL:
         frac = iteration / max(1, max_iterations)
-        f = K.BLOCK_FRAC if frac <= 0.3 else (K.BLOCK_FRAC * 0.4 if frac <= 0.7 else K.BLOCK_FRAC * 0.1)
+        f = block_frac if frac <= 0.3 else (block_frac * 0.4 if frac <= 0.7 else block_frac * 0.1)
     else:
-        f = K.BLOCK_FRAC
-    block = max(K.BLOCK_MIN, round(f * K_cur))
+        f = block_frac
+    block = max(_p(ctx, "BLOCK_MIN"), round(f * K_cur))
     return max(1, min(block, K_cur))
 
 
@@ -941,6 +1027,7 @@ def perturb(
         allow_unsafe=K.ALLOW_UNSAFE_FLIP, deadline=deadline, t_step=t_step, time_left=time_left,
         bank=Bank(), m0=m0, g0=g0.view(-1), dynamic_kappa=use_dynamic,
         optim_seconds=(K.OPTIM_SECONDS if K.RUN_OPTIM else 0.0),
+        tuner=AdaptiveTuner(),
     )
 
     logger.info(f"[perturb] start: m0={m0:.4f} k_min={k_min} q={q:.6f} kappa={kappa:.4f} "

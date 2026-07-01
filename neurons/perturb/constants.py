@@ -212,3 +212,21 @@ ITERATIONS_PER_K = _env_int("PERTURB_FW_ITERATIONS_PER_K", 60)
 # OPTIM_SECONDS is armed; all optimization after the flip (further refinement + Phase E
 # sparsification) must finish within that window.
 OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 12.0)
+
+# --- Adaptive hyperparameter controller ---------------------------------------------------
+# Starts every tunable knob at its env value, then watches the BEST margin over a sliding window.
+# On a stall (best margin barely moved) it escalates exploration one level (bigger blocks, higher
+# eta/temperature, more proposals, more frequent swaps, larger restarts); on strong progress it
+# relaxes a level back toward the env baseline. level L scales a knob by TUNE_FACTOR**L (capped).
+# Higher TEMPERATURE at high levels also de-saturates the BIG_INIT logits, unfreezing Phase B.
+ADAPTIVE_TUNE = _env_bool("PERTURB_ADAPTIVE_TUNE", True)   # enable the controller (active during optim)
+TUNE_INTERVAL = _env_int("PERTURB_TUNE_INTERVAL", 40)     # optim iterations per evaluation window
+TUNE_MIN_IMPROVE = _env_float("PERTURB_TUNE_MIN_IMPROVE", 0.02)  # abs best-margin drop/window => progress
+TUNE_MIN_REL = _env_float("PERTURB_TUNE_MIN_REL", 0.01)   # relative drop/window => progress
+TUNE_GOOD_REL = _env_float("PERTURB_TUNE_GOOD_REL", 0.05)  # relax a level when relative drop exceeds this
+TUNE_FACTOR = _env_float("PERTURB_TUNE_FACTOR", 1.5)      # per-level multiplier
+TUNE_MAX_LEVEL = _env_int("PERTURB_TUNE_MAX_LEVEL", 6)    # escalation ceiling
+TUNE_BLOCK_FRAC_CAP = _env_float("PERTURB_TUNE_BLOCK_FRAC_CAP", 0.25)  # block-fraction ceiling
+TUNE_PROPOSAL_CAP = _env_int("PERTURB_TUNE_PROPOSAL_CAP", 128)  # proposal-count ceiling
+TUNE_RESTART_FRAC_CAP = _env_float("PERTURB_TUNE_RESTART_FRAC_CAP", 0.5)  # restart-fraction ceiling
+TUNE_TEMPERATURE_CAP = _env_float("PERTURB_TUNE_TEMPERATURE_CAP", 16.0)  # temperature ceiling
