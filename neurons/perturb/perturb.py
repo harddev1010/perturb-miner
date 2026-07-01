@@ -262,6 +262,41 @@ def _grad_at(ctx: Context, x_chw: torch.Tensor) -> tuple[float, torch.Tensor]:
     return m, g.view(-1)
 
 
+def _batched_grads(ctx: Context, images: list[torch.Tensor],
+                   specs: list[tuple[str, int | None]]) -> tuple[list[float], torch.Tensor]:
+    """T1.2: gradients for many independent (image, loss) sources in ONE forward+backward.
+
+    images[i] is an (C,H,W) input; specs[i] is ("hard", None) for the CW margin or ("pair", c) for the
+    pairwise margin z_y - z_c. The losses are row-separable, so backward of their sum yields each row's
+    own input gradient. Returns (values, grads[B, N]). Replaces ~9 sequential backwards in Phase A."""
+    batch = torch.stack([im.detach() for im in images], dim=0).to(ctx.device).requires_grad_(True)
+    logits = logits_for_images(model=ctx.model, image_bchw=batch)  # [B, num_classes]
+    y = ctx.target_index
+    losses, values = [], []
+    for i, (kind, c) in enumerate(specs):
+        row = logits[i]
+        if kind == "pair":
+            v = row[y] - row[c]
+        else:  # hard CW margin
+            others = row.clone()
+            others[y] = float("-inf")
+            v = row[y] - others.max()
+        losses.append(v)
+        values.append(float(v.item()))
+    grads = torch.autograd.grad(torch.stack(losses).sum(), batch)[0].detach().view(len(images), -1)
+    return values, grads
+
+
+def _percentile_rank(score: torch.Tensor) -> torch.Tensor:
+    """T1.3: map a score vector to per-coordinate percentile rank in [0,1] (higher score => higher rank).
+    Scale-free, so beams on different numeric scales (hard/soft/DLR/pairwise) fuse without one dominating."""
+    n = score.numel()
+    if n <= 1:
+        return torch.zeros_like(score)
+    ranks = score.argsort().argsort().to(score.dtype)
+    return ranks / (n - 1)
+
+
 def _make_delta(ctx: Context, mask: torch.Tensor, sign: torch.Tensor) -> torch.Tensor:
     """delta = q * mask * sign as an integer byte delta (±k_min on the active support)."""
     return (mask.to(ctx.clean_u8.dtype) * sign) * float(ctx.k_min)
@@ -277,6 +312,11 @@ def _feature_relevance(ctx: Context, x_chw: torch.Tensor) -> torch.Tensor | None
     then bilinearly upsampled to (H_in, W_in) and tiled across the C input channels so it indexes the
     same flat (c·H·W + h·W + w) layout as ctx.clean_u8. Returns None if no conv layer is hookable.
     """
+    # T3.1: the clean-image relevance map is invariant — compute it once and reuse across Phase-A
+    # (re-)seeds and restarts. Swap-in pools pass x_adv (not clean), so they still recompute.
+    is_clean = x_chw is ctx.clean
+    if is_clean and ctx.clean_relevance is not None:
+        return ctx.clean_relevance
     model = ctx.model
     layer = getattr(model, "features", None)
     if layer is None:
@@ -310,7 +350,10 @@ def _feature_relevance(ctx: Context, x_chw: torch.Tensor) -> torch.Tensor | None
     up = F.interpolate(rel[None, None], size=(h_in, w_in), mode="bilinear", align_corners=False)[0, 0]
     up = up / (up.max() + 1e-12)
     # Tile the (H*W) spatial map across the C channels to match the (c·H·W + ...) flat layout.
-    return up.reshape(-1).repeat(int(ctx.shape[0])).to(ctx.clean_u8.dtype)
+    relevance = up.reshape(-1).repeat(int(ctx.shape[0])).to(ctx.clean_u8.dtype)
+    if is_clean:
+        ctx.clean_relevance = relevance
+    return relevance
 
 
 def _feature_score(ctx: Context, x_chw: torch.Tensor, clean_score: torch.Tensor) -> torch.Tensor | None:
@@ -466,17 +509,13 @@ def _top_indices(score: torch.Tensor, count: int) -> torch.Tensor:
     return torch.topk(score, count).indices
 
 
-def _random_start_grad(ctx: Context) -> torch.Tensor:
-    """A1/A3 helper: gradient at a random sparse ±k_min start (a fresh, off-clean basin)."""
+def _rand_mask(ctx: Context, cnt: int) -> torch.Tensor:
+    """Boolean mask over `cnt` random coordinates (for a fresh off-clean random-start basin)."""
     n = ctx.clean_u8.numel()
-    cnt = max(1, int(round(K.RANDOM_START_FRAC * n)))
-    idx = torch.randperm(n, device=ctx.clean_u8.device)[:cnt]
-    rnd_mask = torch.zeros(n, dtype=torch.bool, device=ctx.clean_u8.device)
-    rnd_mask[idx] = True
-    rnd_sign = _feasible_sign_from_value(ctx, torch.randn(n, device=ctx.clean_u8.device))
-    x_rand = apply_delta_bytes(ctx.clean_u8, _make_delta(ctx, rnd_mask, rnd_sign), ctx.shape)
-    _, g = _grad_at(ctx, x_rand)
-    return g
+    idx = torch.randperm(n, device=ctx.clean_u8.device)[:max(1, min(cnt, n))]
+    m = torch.zeros(n, dtype=torch.bool, device=ctx.clean_u8.device)
+    m[idx] = True
+    return m
 
 
 def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[State, list[dict]]:
@@ -484,45 +523,75 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
     candidates, initialize the continuous logits/signs, and (so a flip can be found without the
     optimizer) verify each source's support ladder into the Bank. Returns (state, seed_results)."""
     n = ctx.clean_u8.numel()
-    candidate_lists: list[torch.Tensor] = []
-    aggregate_gradient = torch.zeros(n, device=ctx.clean_u8.device)
     seed_deltas: list[torch.Tensor] = []
+    beams: list[torch.Tensor] = []        # per-source score vectors, fused by percentile rank (T1.3)
+    candidate_lists: list[torch.Tensor] = []
+    tgt = targets[:K.TARGET_COUNT]
 
-    # A1. Standard untargeted clean gradient.
-    clean_margin, clean_gradient = _grad_at(ctx, ctx.clean)
+    # ---- A1/A2/A3 gradients: one batched forward+backward for clean + targets + random starts (T1.2) ----
+    rand_images = [
+        apply_delta_bytes(
+            ctx.clean_u8,
+            _make_delta(
+                ctx,
+                _rand_mask(ctx, max(1, int(round(K.RANDOM_START_FRAC * n)))),
+                _feasible_sign_from_value(ctx, torch.randn(n, device=ctx.clean_u8.device)),
+            ),
+            ctx.shape,
+        )
+        for _ in range(K.RANDOM_START_COUNT)
+    ]
+    if K.BATCHED_GRADS:
+        images = [ctx.clean] + [ctx.clean] * len(tgt) + rand_images
+        specs = [("hard", None)] + [("pair", c) for c in tgt] + [("hard", None)] * len(rand_images)
+        values, grads = _batched_grads(ctx, images, specs)
+        clean_margin, clean_gradient = values[0], grads[0]
+        tgt_grads = [grads[1 + j] for j in range(len(tgt))]
+        tgt_values = [values[1 + j] for j in range(len(tgt))]
+        rand_grads = [grads[1 + len(tgt) + r] for r in range(len(rand_images))]
+    else:
+        clean_margin, clean_gradient = _grad_at(ctx, ctx.clean)
+        tgt_grads, tgt_values = [], []
+        for c in tgt:
+            v, latent = _field(ctx, ctx.clean, f"pair:{c}", targets)
+            tgt_grads.append(-latent); tgt_values.append(v)
+        rand_grads = [_grad_at(ctx, xr)[1] for xr in rand_images]
+
+    aggregate_gradient = clean_gradient.clone()
+
+    # A1. Untargeted clean beam.
     clean_score, clean_sign = _candidate_scores(ctx, clean_gradient)
+    beams.append(clean_score)
     candidate_lists.append(_top_indices(clean_score, round(0.5 * K_init)))
-    aggregate_gradient += clean_gradient
     seed_deltas += _support_ladder(ctx, clean_sign * clean_score, clean_margin)
     logger.info(f"[phaseA] A1 clean gradient: margin={clean_margin:.4f} "
                 f"legal={(clean_score > 0).sum().item()} top={round(0.5 * K_init)}")
 
-    # A2. Target-specific clean gradients.
+    # A2. Target-specific beams (pairwise margins kept separate for generation; T2.2).
     per_target = max(1, round(K_init / (4 * max(1, K.TARGET_COUNT))))
-    for c in targets[:K.TARGET_COUNT]:
-        value, latent = _field(ctx, ctx.clean, f"pair:{c}", targets)
-        # latent = move_dir·|g| = -sign(g)·|g| = -g, so the raw gradient is -latent.
-        tgrad = -latent
-        tscore, _ = _candidate_scores(ctx, tgrad)
+    for c, tgrad, tval in zip(tgt, tgt_grads, tgt_values):
+        tscore, tsign = _candidate_scores(ctx, tgrad)
+        beams.append(tscore)
         candidate_lists.append(_top_indices(tscore, per_target))
         aggregate_gradient += tgrad
-        seed_deltas += _support_ladder(ctx, latent, value)
-        logger.info(f"[phaseA] A2 target={c}: value={value:.4f} kc={_kc_of(ctx, latent, value)} top={per_target}")
+        seed_deltas += _support_ladder(ctx, tsign * tscore, tval)
+        logger.info(f"[phaseA] A2 target={c}: value={tval:.4f} kc={_kc_of(ctx, tsign * tscore, tval)} top={per_target}")
 
-    # A3. Random-start gradient reservoirs.
+    # A3. Random-start beams.
     per_random = max(1, round(K_init / (4 * max(1, K.RANDOM_START_COUNT))))
-    for r in range(K.RANDOM_START_COUNT):
-        rgrad = _random_start_grad(ctx)
+    for r, rgrad in enumerate(rand_grads):
         rscore, rsign = _candidate_scores(ctx, rgrad)
+        beams.append(rscore)
         candidate_lists.append(_top_indices(rscore, per_random))
         seed_deltas += _support_ladder(ctx, rsign * rscore, clean_margin)
         logger.info(f"[phaseA] A3 random-start {r + 1}/{K.RANDOM_START_COUNT}: top={per_random}")
 
-    # A4. Feature-guided candidate reservoir (Q1).
+    # A4. Feature-guided beam (Q1); clean map cached (T3.1).
     if K.FEATURE_GUIDED:
         fscore = _feature_score(ctx, ctx.clean, clean_score)
         if fscore is not None:
             fquota = max(1, round(K.FEATURE_QUOTA_FRAC * K_init))
+            beams.append(fscore)
             candidate_lists.append(_top_indices(fscore, fquota))
             seed_deltas += _support_ladder(ctx, clean_sign * fscore, clean_margin)
             logger.info(f"[phaseA] A4 feature-guided ({'gate' if K.FEATURE_GATE else 'pure'}): "
@@ -532,18 +601,37 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
     else:
         logger.info("[phaseA] A4 feature-guided: disabled")
 
-    # A4'/merge. Union of candidate lists -> highest-ranked K distinct coords; fill from clean_score.
+    # ---- Normalized-rank beam fusion (T1.3): fuse beams by percentile rank, not by clean_score ----
+    if K.RANK_FUSION and beams:
+        fused_score = torch.stack([_percentile_rank(b) for b in beams], dim=0).sum(dim=0)
+    else:
+        fused_score = clean_score
+    agg_sign = _best_direction(ctx, aggregate_gradient)  # toward-flip signs for the grow ladder
+
+    # ---- Grow-until-first-flip ladder (T1.1): nested geometric supports from the FUSED ranking, graded
+    # in the same batched pass; the Bank keeps the sparsest flipping rung so we land sparse directly. ----
+    if K.GROW_LADDER:
+        fused_order = torch.argsort(fused_score, descending=True)
+        rung_ks = sorted({max(1, min(int(round(f * n)), n)) for f in K.GROW_RUNGS})
+        for kr in rung_ks:
+            idx = fused_order[:kr]
+            m = torch.zeros(n, dtype=torch.bool, device=ctx.clean_u8.device)
+            m[idx] = True
+            seed_deltas.append(_make_delta(ctx, m, agg_sign))
+            for _ in range(K.GROW_VARIANTS):
+                seed_deltas.append(_project_sampled(ctx, agg_sign * fused_score, kr))
+        logger.info(f"[phaseA] grow ladder: rungs={rung_ks} (fused-ranked, batched)")
+
+    # A4'/merge. Union of per-beam quotas -> K distinct coords, trimmed/filled by the FUSED rank (T1.3).
     union = torch.cat([c for c in candidate_lists if c.numel() > 0]) if candidate_lists else \
         torch.empty(0, dtype=torch.long, device=ctx.clean_u8.device)
     union = torch.unique(union)
     if union.numel() >= K_init:
-        # rank the union by clean_score and keep the top K
-        order = torch.argsort(clean_score[union], descending=True)
+        order = torch.argsort(fused_score[union], descending=True)
         initial_support = union[order][:K_init]
     else:
-        fill = _top_indices(clean_score, n)
+        fill = _top_indices(fused_score, n)
         merged = torch.cat([union, fill])
-        # preserve order: dedup keeping first occurrence (union coords first, then clean_score fill)
         seen = torch.zeros(n, dtype=torch.bool, device=ctx.clean_u8.device)
         keep: list[int] = []
         for i in merged.tolist():
@@ -554,7 +642,7 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
                 break
         initial_support = torch.tensor(keep, dtype=torch.long, device=ctx.clean_u8.device)
     logger.info(f"[phaseA] merged support: union={union.numel()} -> initial_support={initial_support.numel()} "
-                f"(K_init={K_init})")
+                f"(K_init={K_init}) fusion={'on' if K.RANK_FUSION else 'off'}")
 
     # A5. Initialize mask logits: small noise + a large boost on the seeded support.
     a = K.MASK_NOISE * torch.randn(n, device=ctx.clean_u8.device)
@@ -568,10 +656,18 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
     path_ema = clean_score.clone()
     path_max = clean_score.clone()
 
-    margin, x_adv, _ = _evaluate_state(ctx, mask, sign)
-
-    # Verify every seed candidate so a flip can be banked during Phase A alone (optimizer off).
+    # Verify ALL seed candidates in ONE batched pass: the grow-ladder rungs and per-source ladders
+    # together with the K_init init-state. The Bank keeps the SPARSEST flip (its _better orders by
+    # |S|), and with RETURN_FIRST_FLIP the whole batch is graded before the sentinel unwinds — so we
+    # return the sparsest flipping rung, never the dense init-state just because it was graded first.
+    init_delta = _make_delta(ctx, mask, sign)
+    seed_deltas.append(init_delta)
     seed_results = _eval(ctx, seed_deltas)
+    init_res = seed_results[-1] if len(seed_results) == len(seed_deltas) else None
+    if init_res is not None:
+        margin, x_adv = init_res["margin"], init_res["cand"]
+    else:
+        margin, x_adv, _ = _evaluate_state(ctx, mask, sign)
     flips = sum(1 for r in seed_results if r.get("quality"))
     best_seed = min((r["margin"] for r in seed_results), default=float("inf"))
     logger.info(f"[phaseA] seeded+verified {len(seed_deltas)} candidates: quality_flips={flips} "

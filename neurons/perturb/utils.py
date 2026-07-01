@@ -259,6 +259,7 @@ class Context:
     optim_seconds: float = 0.0   # post-flip optimization budget (s); 0 => no post-flip clock
     first_flip_time: float | None = None  # wall-clock when the first flip was banked (arms the optim deadline)
     tuner: object | None = None  # adaptive hyperparameter controller (perturb.AdaptiveTuner)
+    clean_relevance: torch.Tensor | None = None  # cached clean-image feature-relevance map (invariant)
 
 
 def out_of_budget(ctx: "Context") -> bool:
