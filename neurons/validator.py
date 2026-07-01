@@ -27,7 +27,7 @@ from perturbnet.emissions import ranked_emission_shares
 from perturbnet.image_io import changed_pixel_count, decode_image_b64, quantize_image_uint8_grid
 from perturbnet.leaderboard_payload import build_report, update_score_histories
 from perturbnet.leaderboard_reporter import LeaderboardReporter
-from perturbnet.metagraph_utils import count_miners, miner_incentive
+from perturbnet.metagraph_utils import miner_incentive, miner_uids as metagraph_miner_uids
 from perturbnet.model import (
     label_for_index,
     load_efficientnet_v2_l,
@@ -814,14 +814,14 @@ class PerturbValidator:
         challenge: ChallengeSpec,
         results_by_uid: Sequence[tuple[int, EvaluationResult]],
         image_url_by_uid: dict[int, str],
-        responded_miner_count: int,
+        available_miner_count: int,
     ) -> None:
         self.leaderboard_reporter.submit(
             build_report(
                 task_id=challenge.task_id,
                 validator_hotkey=str(getattr(self.wallet.hotkey, "ss58_address", "")),
-                total_miners=count_miners(self.metagraph),
-                available_miners=int(responded_miner_count),
+                total_miners=len(self._leaderboard_miner_uids()),
+                available_miners=int(available_miner_count),
                 hotkeys=self.metagraph.hotkeys,
                 coldkeys=getattr(self.metagraph, "coldkeys", []),
                 incentives_by_uid={uid: miner_incentive(self.metagraph, uid) for uid, _ in results_by_uid},
@@ -831,6 +831,28 @@ class PerturbValidator:
                 image_url_by_uid=image_url_by_uid,
             )
         )
+
+    def _leaderboard_results_for_all_miners(
+        self,
+        results_by_uid: Sequence[tuple[int, EvaluationResult]],
+    ) -> list[tuple[int, EvaluationResult]]:
+        selected_results = {uid: result for uid, result in results_by_uid}
+        report_rows: list[tuple[int, EvaluationResult]] = []
+        for uid in self._leaderboard_miner_uids():
+            result = selected_results.get(uid)
+            if result is None:
+                result = EvaluationResult(
+                    score=0.0,
+                    reason="leaderboard_unavailable",
+                    model_prediction="unavailable",
+                )
+            report_rows.append((uid, result))
+        return report_rows
+
+    def _leaderboard_miner_uids(self) -> list[int]:
+        own_hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "") or "")
+        own_uid = self.metagraph.hotkeys.index(own_hotkey) if own_hotkey in self.metagraph.hotkeys else None
+        return [uid for uid in metagraph_miner_uids(self.metagraph) if own_uid is None or uid != own_uid]
 
     def _fallback_burn_rate(self) -> float:
         return min(max(float(getattr(self.config.perturb, "default_burn_rate", 0.0)), 0.0), 1.0)
@@ -1121,12 +1143,23 @@ class PerturbValidator:
                 all_zero_scores = bool(rewards) and all(score <= 0.0 for score in rewards)
 
                 self._log_step_start("loop_update_histories")
-                self._update_leaderboard_histories(miner_uids, rewards)
+                leaderboard_results_by_uid = self._leaderboard_results_for_all_miners(results_by_uid)
+                leaderboard_uids = [uid for uid, _ in leaderboard_results_by_uid]
+                leaderboard_rewards = [float(result.score) for _, result in leaderboard_results_by_uid]
+                self._update_leaderboard_histories(leaderboard_uids, leaderboard_rewards)
                 self._submit_leaderboard_report(
                     challenge=challenge,
-                    results_by_uid=results_by_uid,
+                    results_by_uid=leaderboard_results_by_uid,
                     image_url_by_uid=image_url_by_uid,
-                    responded_miner_count=responded_miner_count,
+                    available_miner_count=len(available_uids),
+                )
+                self._log_summary(
+                    "leaderboard_report_queued",
+                    task_id=challenge.task_id,
+                    miners=len(leaderboard_results_by_uid),
+                    valid=sum(1 for _, result in leaderboard_results_by_uid if result.reason == "success"),
+                    r2_uploaded=len(image_url_by_uid),
+                    available=len(available_uids),
                 )
                 if all_zero_scores:
                     logger.warning(

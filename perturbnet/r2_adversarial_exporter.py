@@ -173,8 +173,14 @@ class R2AdversarialDatasetExporter:
         return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()[:24]
 
     def object_url(self, key: str) -> str:
-        # R2 buckets are private by default; this URI is a stable object
-        # reference for backend jobs with R2 credentials, not a public URL.
+        if self.client is not None and self.bucket:
+            return self.client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": self.bucket, "Key": key},
+                ExpiresIn=min(int(C.R2_PRESIGNED_URL_EXPIRES_SECONDS), 604800),
+            )
+        # Fallback for tests or disabled clients; browser UIs should receive
+        # presigned HTTPS URLs when R2 export is configured.
         return f"r2://{self.bucket}/{key}"
 
     def image_key_for(
@@ -214,40 +220,57 @@ class R2AdversarialDatasetExporter:
             seen_image_hashes.add(image_hash)
             selected.append((len(selected) + 1, candidate, image_hash))
         image_url_by_storage_key: dict[str, str] = {}
+        failed_uploads = 0
         for rank, candidate, image_hash in selected:
-            self.submit(
-                image_id=image_id,
-                task_id=task_id,
-                block=block,
-                rank=rank,
-                miner_storage_key=candidate.miner_storage_key,
-                model_name=model_name,
-                true_label=true_label,
-                adversarial_label=candidate.adversarial_label,
-                score=candidate.score,
-                norm=candidate.norm,
-                rmse=candidate.rmse,
-                epsilon=candidate.epsilon,
-                ssim=candidate.ssim,
-                psnr_db=candidate.psnr_db,
-                response_time_ms=candidate.response_time_ms,
-                perturbed_image_b64=candidate.perturbed_image_b64,
-                image_sha256=image_hash,
-            )
-            image_url_by_storage_key[candidate.miner_storage_key] = self.object_url(
-                self.image_key_for(
+            try:
+                self.submit(
                     image_id=image_id,
                     task_id=task_id,
+                    block=block,
                     rank=rank,
                     miner_storage_key=candidate.miner_storage_key,
+                    model_name=model_name,
+                    true_label=true_label,
+                    adversarial_label=candidate.adversarial_label,
+                    score=candidate.score,
+                    norm=candidate.norm,
+                    rmse=candidate.rmse,
+                    epsilon=candidate.epsilon,
+                    ssim=candidate.ssim,
+                    psnr_db=candidate.psnr_db,
+                    response_time_ms=candidate.response_time_ms,
+                    perturbed_image_b64=candidate.perturbed_image_b64,
                     image_sha256=image_hash,
+                    sync=True,
                 )
-            )
+                image_url_by_storage_key[candidate.miner_storage_key] = self.object_url(
+                    self.image_key_for(
+                        image_id=image_id,
+                        task_id=task_id,
+                        rank=rank,
+                        miner_storage_key=candidate.miner_storage_key,
+                        image_sha256=image_hash,
+                    )
+                )
+            except Exception as exc:
+                failed_uploads += 1
+                logger.warning(
+                    f"R2 adversarial dataset export failed before leaderboard URL "
+                    f"task_id={task_id} image_id={image_id}: {exc}"
+                )
         if selected:
-            logger.info(
-                f"Queued {len(selected)} unique adversarial examples for R2 export "
-                f"task_id={task_id} image_id={image_id} storage_mode={self.storage_mode}"
-            )
+            uploaded_count = len(image_url_by_storage_key)
+            if failed_uploads:
+                logger.warning(
+                    f"R2 export completed with failures task_id={task_id} image_id={image_id} "
+                    f"uploaded={uploaded_count} failed={failed_uploads} attempted={len(selected)} "
+                    f"storage_mode={self.storage_mode}"
+                )
+            else:
+                logger.info(
+                    f"R2 export succeeded task_id={task_id} image_id={image_id} "
+                    f"uploaded={uploaded_count} storage_mode={self.storage_mode}"
+                )
         return image_url_by_storage_key
 
     def submit(
@@ -270,6 +293,7 @@ class R2AdversarialDatasetExporter:
         response_time_ms: int,
         perturbed_image_b64: str,
         image_sha256: str | None = None,
+        sync: bool = False,
     ) -> None:
         if not self.enabled:
             return
@@ -305,6 +329,9 @@ class R2AdversarialDatasetExporter:
             storage_mode=self.storage_mode,
             miner_storage_key=miner_storage_key if self.storage_mode == "latest" else None,
         )
+        if sync:
+            self._upload(record=record, perturbed_image_b64=perturbed_image_b64)
+            return
         try:
             self.queue.put_nowait((record, perturbed_image_b64))
         except queue.Full:
@@ -341,6 +368,7 @@ class R2AdversarialDatasetExporter:
             Key=record.image_object_key,
             Body=image_bytes,
             ContentType="image/png",
+            CacheControl="no-store, max-age=0",
         )
 
         created = datetime.fromisoformat(record.created_at)

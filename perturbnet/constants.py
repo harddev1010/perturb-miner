@@ -69,15 +69,17 @@ ANALYZE_BUCKET_MARGIN_WEIGHT = _env_float("ANALYZE_BUCKET_MARGIN_WEIGHT", 0.03)
 ANALYZE_BUCKET_NOVELTY_WEIGHT = _env_float("ANALYZE_BUCKET_NOVELTY_WEIGHT", 0.01)
 ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS = _env_int("ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS", 8)
 STORAGE_MODE = os.getenv("PERTURB_STORAGE_MODE", "latest").strip().lower() or "latest"
-BURN_RATE_ENDPOINT = "https://perturbai.io/api/v1/burn-rate"
+BURN_RATE_ENDPOINT = "https://api.perturbai.io/api/v1/burn-rate"
 DEFAULT_BURN_RATE = 0.0
 BURN_RATE_FETCH_TIMEOUT_SECONDS = 5.0
 BURN_UID = 0
-LEADERBOARD_REPORTING_ENABLED = _env_bool("LEADERBOARD_REPORTING_ENABLED", True)
-LEADERBOARD_API_URL = os.getenv("LEADERBOARD_API_URL", "https://api.perturbai.io/api/v1/report").strip()
+LEADERBOARD_REPORTING_ENABLED = True
+LEADERBOARD_API_URL = "https://api.perturbai.io/api/v1/report"
 LEADERBOARD_REPORT_TIMEOUT_SECONDS = 10.0
+LEADERBOARD_NO_IMAGE_URL = "https://placeimg.dev/128x128/F3F4F6?text=None&textColor=6B7280"
 R2_EXPORT_ENABLED = True
 R2_PREFIX = "adversarial-dataset"
+R2_PRESIGNED_URL_EXPIRES_SECONDS = 604800
 
 VALIDATOR_CONFIG = {
     "imagenet100_repo_id": IMAGENET100_REPO_ID,
@@ -106,8 +108,10 @@ VALIDATOR_CONFIG = {
     "leaderboard_reporting_enabled": LEADERBOARD_REPORTING_ENABLED,
     "leaderboard_api_url": LEADERBOARD_API_URL,
     "leaderboard_report_timeout_seconds": LEADERBOARD_REPORT_TIMEOUT_SECONDS,
+    "leaderboard_no_image_url": LEADERBOARD_NO_IMAGE_URL,
     "r2_export_enabled": R2_EXPORT_ENABLED,
     "r2_prefix": R2_PREFIX,
+    "r2_presigned_url_expires_seconds": R2_PRESIGNED_URL_EXPIRES_SECONDS,
 }
 
 # Validator scoring defaults.

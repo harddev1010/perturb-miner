@@ -98,6 +98,10 @@ class LeaderboardReporter:
                 return
             try:
                 self._post_with_retry(report=report)
+                logger.info(
+                    f"Leaderboard report succeeded task_id={report.task_id} "
+                    f"miners={len(report.miners)} valid={report.network.success_count}"
+                )
             except Exception as exc:
                 logger.warning(f"Leaderboard report failed task_id={report.task_id}: {exc}")
             finally:

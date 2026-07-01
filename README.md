@@ -139,8 +139,6 @@ Edit required fields in `scripts/validator.env`:
 Optional:
 
 - `HF_TOKEN` (speeds up the one-time ImageNet-100 download)
-- `LEADERBOARD_REPORTING_ENABLED` (`true` default)
-- `LEADERBOARD_API_URL`
 - `PERTURB_STORAGE_MODE` (`latest` default, or `all`)
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` for quieter logs)
 
@@ -230,13 +228,9 @@ Miner response field:
 
 ### Leaderboard reporting
 
-After each scoring round, validators submit a signed leaderboard report to `LEADERBOARD_API_URL`. Reports are queued in a background thread; leaderboard API failures, non-2xx responses, or timeouts are logged and skipped without affecting validator scoring.
+After each scoring round, validators submit a signed leaderboard report to the API configured in `perturbnet/constants.py`. Reports are queued in a background thread; leaderboard API failures, non-2xx responses, or timeouts are logged and skipped without affecting validator scoring.
 
-Network metrics include `total_miners`, `available_miners`, `avg_score`, `avg_rmse`, `avg_norm`, and `success_count`. `total_miners` excludes validator neurons, identified by validator permit plus stake above `100000`. `available_miners` is the count of selected miners that responded to the current task with HTTP 200 and a response image.
-
-Each miner row includes `uid`, `hotkey`, `coldkey`, `incentive`, `avg_score`, `last_score`, `rmse`, `norm`, `result`, and `image_url`. Miner `avg_score` uses the same rolling window as `PERTURB_HISTORY_SIZE`; `incentive` is read from the current metagraph incentive value for that UID.
-
-Authentication signs the exact request body bytes with the validator hotkey. The reporter serializes the payload once, signs those bytes, and posts those same bytes with `data=body_bytes` plus `X-Validator-Hotkey`, `X-Signature`, and `Content-Type: application/json`. It does not use `requests.post(json=...)`.
+Reports include network metrics and full miner details for every registered non-validator UID. Successful responses include presigned R2 image URLs for UI display; miners without an exported image use the configured placeholder image. Reports are authenticated by signing the exact JSON request bytes with the validator hotkey.
 
 
 ## Scoring and Weighting

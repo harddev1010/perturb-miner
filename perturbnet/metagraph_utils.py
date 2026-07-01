@@ -38,9 +38,12 @@ def is_validator_neuron(metagraph: Any, uid: int) -> bool:
 
 
 def count_miners(metagraph: Any) -> int:
+    return len(miner_uids(metagraph))
+
+
+def miner_uids(metagraph: Any) -> list[int]:
     total_neurons = int(getattr(metagraph, "n", 0))
-    validators = sum(1 for uid in range(total_neurons) if is_validator_neuron(metagraph, uid))
-    return max(0, total_neurons - validators)
+    return [uid for uid in range(total_neurons) if not is_validator_neuron(metagraph, uid)]
 
 
 def miner_incentive(metagraph: Any, uid: int) -> float:

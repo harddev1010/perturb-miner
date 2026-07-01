@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+from perturbnet import constants as C
 from perturbnet.leaderboard_reporter import LeaderboardMinerResult, LeaderboardNetworkMetrics, LeaderboardReport
 
 
@@ -20,10 +21,14 @@ def avg_score(histories: list[list[float]], uid: int, window: int) -> float:
 
 def result_status(result: Any) -> str:
     if result.reason == "success":
-        return "valid"
+        return "Valid"
+    if result.reason == "duplicate_response_fastest_wins":
+        return "Duplicate"
     if result.reason == "response_missing_or_status_error":
-        return "timeout"
-    return "rejected"
+        return "Inactive"
+    if result.reason == "leaderboard_unavailable":
+        return "Unavailable"
+    return "Invalid"
 
 
 def network_metrics(
@@ -32,9 +37,9 @@ def network_metrics(
     available_miners: int,
     results_by_uid: Sequence[tuple[int, Any]],
 ) -> LeaderboardNetworkMetrics:
-    count = len(results_by_uid)
-    success_count = sum(1 for _, result in results_by_uid if result_status(result) == "valid")
-    if count == 0:
+    successful_results = [result for _, result in results_by_uid if result_status(result) == "Valid"]
+    success_count = len(successful_results)
+    if success_count == 0:
         return LeaderboardNetworkMetrics(
             total_miners=int(total_miners),
             available_miners=int(available_miners),
@@ -46,9 +51,9 @@ def network_metrics(
     return LeaderboardNetworkMetrics(
         total_miners=int(total_miners),
         available_miners=int(available_miners),
-        avg_score=float(sum(result.score for _, result in results_by_uid) / count),
-        avg_rmse=float(sum(result.rmse for _, result in results_by_uid) / count),
-        avg_norm=float(sum(result.norm for _, result in results_by_uid) / count),
+        avg_score=float(sum(result.score for result in successful_results) / success_count),
+        avg_rmse=float(sum(result.rmse for result in successful_results) / success_count),
+        avg_norm=float(sum(result.norm for result in successful_results) / success_count),
         success_count=int(success_count),
     )
 
@@ -80,7 +85,7 @@ def build_report(
                 rmse=float(result.rmse),
                 norm=float(result.norm),
                 result=result_status(result),
-                image_url=image_url_by_uid.get(uid, ""),
+                image_url=image_url_by_uid.get(uid) or C.LEADERBOARD_NO_IMAGE_URL,
             )
         )
     return LeaderboardReport(
