@@ -23,3 +23,13 @@ def encode_image_b64(image_chw: torch.Tensor) -> str:
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+
+def quantize_image_uint8_grid(image_chw: torch.Tensor) -> torch.Tensor:
+    return (image_chw.detach().clamp(0.0, 1.0) * 255.0).round().div(255.0)
+
+
+def changed_pixel_count(x_clean: torch.Tensor, x_adv: torch.Tensor) -> int:
+    if x_clean.shape != x_adv.shape or x_clean.ndim != 3:
+        return 0
+    return int((x_clean != x_adv).any(dim=0).sum().item())
+

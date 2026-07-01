@@ -17,17 +17,27 @@ from typing import Any, Sequence
 
 import bittensor as bt
 import numpy as np
+import requests
 import torch
 import torch.nn.functional as F
-try:
-    import wandb  # type: ignore[reportMissingImports]
-except Exception:  # pragma: no cover - optional dependency
-    wandb = None
 
 from perturbnet import constants as C
-from perturbnet.image_io import decode_image_b64
-from perturbnet.model import load_efficientnet_v2_l, normalize_prediction_label, predict_label
+from perturbnet.duplicate_responses import apply_fastest_wins
+from perturbnet.emissions import ranked_emission_shares
+from perturbnet.image_io import changed_pixel_count, decode_image_b64, quantize_image_uint8_grid
+from perturbnet.leaderboard_payload import build_report, update_score_histories
+from perturbnet.leaderboard_reporter import LeaderboardReporter
+from perturbnet.metagraph_utils import miner_incentive, miner_uids as metagraph_miner_uids
+from perturbnet.model import (
+    label_for_index,
+    load_efficientnet_v2_l,
+    logits_for_images,
+    normalize_prediction_label,
+    predict_label,
+    resolve_target_index,
+)
 from perturbnet.protocol import AttackChallenge
+from perturbnet.r2_adversarial_exporter import AdversarialExportCandidate, R2AdversarialDatasetExporter
 
 logger = pylogging.getLogger(__name__)
 
@@ -35,6 +45,7 @@ logger = pylogging.getLogger(__name__)
 @dataclass
 class ChallengeSpec:
     task_id: str
+    image_id: str
     model_name: str
     clean_image_b64: str
     true_label: str
@@ -139,32 +150,6 @@ def _compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
     return 10.0 * math.log10(1.0 / mse)
 
 
-class _WandbConsoleHandler(pylogging.Handler):
-    def __init__(self, owner: "PerturbValidator") -> None:
-        super().__init__()
-        self.owner = owner
-
-    def emit(self, record: pylogging.LogRecord) -> None:
-        run = self.owner.wandb_run
-        if run is None:
-            return
-        if record.name.startswith("wandb"):
-            return
-        try:
-            run.log(
-                {
-                    "validator/console_level": record.levelname,
-                    "validator/console_logger": record.name,
-                    "validator/console_message": self.format(record),
-                    "validator/console_ts": float(record.created),
-                },
-                step=int(self.owner.step),
-            )
-        except Exception:
-            # Never let console-forwarding failures affect validator runtime.
-            pass
-
-
 class PerturbValidator:
     def __init__(self, config: bt.config) -> None:
         self.config = config
@@ -181,10 +166,21 @@ class PerturbValidator:
         self.step = 0
         self.last_weight_block = 0
         self.state_path = os.path.join(self.config.logging.logging_dir, C.VALIDATOR_STATE_FILENAME)
-        self.wandb_run: Any | None = None
-        self._wandb_console_handler: pylogging.Handler | None = None
         hotkey = getattr(self.wallet.hotkey, "ss58_address", "unknown")
         self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
+        self.adversarial_exporter = R2AdversarialDatasetExporter(
+            run_id=self.run_id,
+            netuid=int(self.config.netuid),
+            validator_hotkey=str(hotkey),
+            storage_mode=str(getattr(self.config.perturb, "storage_mode", C.STORAGE_MODE)),
+        )
+        self.leaderboard_reporter = LeaderboardReporter(
+            enabled=bool(getattr(self.config.perturb, "leaderboard_reporting_enabled", True)),
+            api_url=str(getattr(self.config.perturb, "leaderboard_api_url", C.LEADERBOARD_API_URL)),
+            timeout_seconds=float(getattr(self.config.perturb, "leaderboard_report_timeout_seconds", 10.0)),
+            wallet=self.wallet,
+            validator_hotkey=str(hotkey),
+        )
         self.reason_counts_total: Counter[str] = Counter()
         self.miner_emission_share = 1
         self.imagenet100_order_seed = 0
@@ -198,10 +194,12 @@ class PerturbValidator:
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
+        # Separate leaderboard buffer persisted under its own key; its window
+        # intentionally follows HISTORY_SIZE so operators have one history knob.
+        self.leaderboard_score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
         self.uid_hotkeys: list[str] = list(self.metagraph.hotkeys[: int(self.metagraph.n)])
 
         self._load_state()
-        self._init_wandb()
 
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
@@ -230,6 +228,12 @@ class PerturbValidator:
                 self.score_histories.extend([[] for _ in range(new_n - len(self.score_histories))])
             else:
                 self.score_histories = self.score_histories[:new_n]
+            if new_n > len(self.leaderboard_score_histories):
+                self.leaderboard_score_histories.extend(
+                    [[] for _ in range(new_n - len(self.leaderboard_score_histories))]
+                )
+            else:
+                self.leaderboard_score_histories = self.leaderboard_score_histories[:new_n]
             if new_n > len(self.uid_hotkeys):
                 self.uid_hotkeys.extend([""] * (new_n - len(self.uid_hotkeys)))
             else:
@@ -239,6 +243,7 @@ class PerturbValidator:
     def _reset_uid_stats(self, uid: int, reason: str) -> None:
         self.processed_counts[uid] = 0
         self.score_histories[uid] = []
+        self.leaderboard_score_histories[uid] = []
         logger.info(f"Reset uid={uid} stats due to {reason}.")
 
     def _reconcile_uid_identities(self) -> None:
@@ -280,6 +285,14 @@ class PerturbValidator:
             if isinstance(raw, list):
                 self.score_histories[idx] = [float(x) for x in raw[-self.config.perturb.history_size :]]
 
+        leaderboard_window = int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE))
+        saved_leaderboard_histories = state.get("leaderboard_score_histories", [])
+        copied_lh = min(len(saved_leaderboard_histories), len(self.leaderboard_score_histories))
+        for idx in range(copied_lh):
+            raw = saved_leaderboard_histories[idx]
+            if isinstance(raw, list):
+                self.leaderboard_score_histories[idx] = [float(x) for x in raw[-leaderboard_window:]]
+
         saved_hotkeys = state.get("uid_hotkeys", [])
         if isinstance(saved_hotkeys, list):
             copied_keys = min(len(saved_hotkeys), len(self.uid_hotkeys))
@@ -302,6 +315,10 @@ class PerturbValidator:
             "last_weight_block": int(self.last_weight_block),
             "processed_counts": self.processed_counts.tolist(),
             "score_histories": [history[-self.config.perturb.history_size :] for history in self.score_histories],
+            "leaderboard_score_histories": [
+                history[-int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)) :]
+                for history in self.leaderboard_score_histories
+            ],
             "uid_hotkeys": self.uid_hotkeys,
             "imagenet100_order_seed": int(self.imagenet100_order_seed),
             "imagenet100_order_cursor": int(self.imagenet100_order_cursor),
@@ -316,90 +333,6 @@ class PerturbValidator:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp_path, self.state_path)
-
-    def _init_wandb(self) -> None:
-        if not bool(getattr(self.config.perturb, "wandb_enabled", False)):
-            return
-        if wandb is None:
-            logger.warning("PERTURB_WANDB_ENABLED is true, but `wandb` is not installed.")
-            return
-        try:
-            init_kwargs: dict[str, Any] = {
-                "project": str(getattr(self.config.perturb, "wandb_project", "perturb-validator")),
-                "config": {
-                    "netuid": int(self.config.netuid),
-                    "network": str(getattr(self.config.subtensor, "network", "unknown")),
-                    "k_miners": int(self.config.perturb.k_miners),
-                    "history_size": int(self.config.perturb.history_size),
-                    "min_processed_count": int(self.config.perturb.min_processed_count),
-                },
-            }
-            entity = str(getattr(self.config.perturb, "wandb_entity", "")).strip()
-            run_name = str(getattr(self.config.perturb, "wandb_run_name", "")).strip()
-            mode = str(getattr(self.config.perturb, "wandb_mode", "online")).strip() or "online"
-            if not run_name:
-                uid_suffix = self._resolve_validator_uid_for_run_name()
-                run_name = f"{time.strftime('%Y%m%d-%H%M%S')}-uid{uid_suffix}"
-            if entity:
-                init_kwargs["entity"] = entity
-            init_kwargs["name"] = run_name
-            init_kwargs["mode"] = mode
-            self.wandb_run = wandb.init(**init_kwargs)
-            self._attach_wandb_console_handler()
-            logger.info("W&B logging initialized for validator.")
-        except Exception as exc:
-            logger.warning(f"Failed to initialize W&B logging: {exc}")
-            self.wandb_run = None
-
-    def _resolve_validator_uid_for_run_name(self) -> str:
-        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "") or "")
-        try:
-            if hotkey and hotkey in self.metagraph.hotkeys:
-                return str(self.metagraph.hotkeys.index(hotkey))
-        except Exception:
-            pass
-        return "unknown"
-
-    def _attach_wandb_console_handler(self) -> None:
-        if not bool(getattr(self.config.perturb, "wandb_log_console", True)):
-            return
-        if self._wandb_console_handler is not None:
-            return
-        handler = _WandbConsoleHandler(self)
-        handler.setLevel(pylogging.NOTSET)
-        handler.setFormatter(
-            pylogging.Formatter(
-                "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
-            )
-        )
-        pylogging.getLogger().addHandler(handler)
-        self._wandb_console_handler = handler
-
-    def _detach_wandb_console_handler(self) -> None:
-        if self._wandb_console_handler is None:
-            return
-        root_logger = pylogging.getLogger()
-        root_logger.removeHandler(self._wandb_console_handler)
-        self._wandb_console_handler = None
-
-    def _wandb_log(self, payload: dict[str, Any]) -> None:
-        if self.wandb_run is None:
-            return
-        try:
-            self.wandb_run.log(payload, step=int(self.step))
-        except Exception as exc:
-            logger.warning(f"W&B log failed: {exc}")
-
-    def _finish_wandb(self) -> None:
-        self._detach_wandb_console_handler()
-        if self.wandb_run is None:
-            return
-        try:
-            self.wandb_run.finish()
-        except Exception as exc:
-            logger.warning(f"W&B finish failed: {exc}")
-        finally:
-            self.wandb_run = None
 
     def _seed_from_block(self, block: int) -> int:
         digest = hashlib.sha256(f"{C.SUBNET_NAMESPACE}:{self.config.netuid}:{block}".encode("utf-8")).hexdigest()
@@ -554,6 +487,7 @@ class PerturbValidator:
             self._save_state()
             return ChallengeSpec(
                 task_id=task_id,
+                image_id=image_id,
                 model_name=model_name,
                 clean_image_b64=image_b64,
                 # Use exact EfficientNet class label for miner targeting and response verification.
@@ -631,8 +565,8 @@ class PerturbValidator:
         return sorted(min_uid_by_group.values())
 
     def _valuable_miner_uids(self, candidate_uids: Sequence[int]) -> list[int]:
-        min_processed = int(self.config.perturb.min_processed_count)
-        return [uid for uid in candidate_uids if int(self.processed_counts[uid]) >= min_processed]
+        history_size = int(self.config.perturb.history_size)
+        return [uid for uid in candidate_uids if len(self.score_histories[uid]) >= history_size]
 
     def _select_random_miners(self, candidate_uids: Sequence[int], seed: int) -> list[int]:
         if not candidate_uids:
@@ -705,10 +639,11 @@ class PerturbValidator:
         challenge: ChallengeSpec,
         perturbed_image_b64: str,
         response_time_ms: int,
+        novelty_pixel_count: int | None = None,
     ) -> EvaluationResult:
         try:
-            x_clean = decode_image_b64(challenge.clean_image_b64).to(self.device)
-            x_adv = decode_image_b64(perturbed_image_b64).to(self.device)
+            x_clean = quantize_image_uint8_grid(decode_image_b64(challenge.clean_image_b64).to(self.device))
+            x_adv = quantize_image_uint8_grid(decode_image_b64(perturbed_image_b64).to(self.device))
         except Exception as exc:
             return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}", response_time_ms=response_time_ms)
 
@@ -718,8 +653,14 @@ class PerturbValidator:
             return EvaluationResult(score=0.0, reason="value_out_of_range", response_time_ms=response_time_ms)
 
         prediction = ""
+        prediction_index: int | None = None
+        true_index = resolve_target_index(challenge.true_label)
+        logits: torch.Tensor | None = None
         try:
-            prediction = predict_label(self.model, x_adv)
+            with torch.no_grad():
+                logits = logits_for_images(self.model, x_adv.unsqueeze(0))
+            prediction_index = int(logits.argmax(dim=1).item())
+            prediction = label_for_index(prediction_index)
         except Exception as exc:
             return EvaluationResult(
                 score=0.0,
@@ -757,7 +698,12 @@ class PerturbValidator:
 
         normalized_prediction = normalize_prediction_label(prediction)
         # Successful perturbation means the response label changes from original model output.
-        if normalized_prediction == challenge.true_label:
+        label_matches_original = (
+            prediction_index == true_index
+            if prediction_index is not None and true_index is not None
+            else normalized_prediction == normalize_prediction_label(challenge.true_label)
+        )
+        if label_matches_original:
             return EvaluationResult(
                 score=0.0,
                 reason="label_match_with_original",
@@ -816,7 +762,27 @@ class PerturbValidator:
         time_ratio = response_time_ms / (challenge.timeout_seconds * 1000.0)
         speed_score = 1.0 - min(time_ratio, 1.0)
 
-        score = C.PERTURBATION_WEIGHT * perturbation_score + C.SPEED_WEIGHT * speed_score
+        margin_score = 0.0
+        if logits is not None and true_index is not None and 0 <= true_index < logits.shape[1]:
+            row = logits[0]
+            true_logit = float(row[true_index].item())
+            masked = row.clone()
+            masked[true_index] = -float("inf")
+            best_non_true_logit = float(masked.max().item())
+            margin = best_non_true_logit - true_logit
+            margin_score = min(max(margin / 10.0, 0.0), 1.0)
+
+        if novelty_pixel_count is None:
+            novelty_pixel_count = changed_pixel_count(x_clean=x_clean, x_adv=x_adv)
+        novelty_target = max(1, int(getattr(self.config.perturb, "analyze_bucket_novelty_target_pixels", 8)))
+        novelty_score = min(max(float(novelty_pixel_count) / float(novelty_target), 0.0), 1.0)
+
+        score = (
+            C.PERTURBATION_WEIGHT * perturbation_score
+            + C.SPEED_WEIGHT * speed_score
+            + float(getattr(self.config.perturb, "analyze_bucket_margin_weight", 0.03)) * margin_score
+            + float(getattr(self.config.perturb, "analyze_bucket_novelty_weight", 0.01)) * novelty_score
+        )
         return EvaluationResult(
             score=float(score),
             reason="success",
@@ -834,17 +800,99 @@ class PerturbValidator:
             self.processed_counts[uid] += 1
             self.score_histories[uid].append(float(reward))
 
+    def _update_leaderboard_histories(self, uids: Sequence[int], rewards: Sequence[float]) -> None:
+        update_score_histories(
+            self.leaderboard_score_histories,
+            uids,
+            rewards,
+            int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),
+        )
+
+    def _submit_leaderboard_report(
+        self,
+        *,
+        challenge: ChallengeSpec,
+        results_by_uid: Sequence[tuple[int, EvaluationResult]],
+        image_url_by_uid: dict[int, str],
+        available_miner_count: int,
+    ) -> None:
+        self.leaderboard_reporter.submit(
+            build_report(
+                task_id=challenge.task_id,
+                validator_hotkey=str(getattr(self.wallet.hotkey, "ss58_address", "")),
+                total_miners=len(self._leaderboard_miner_uids()),
+                available_miners=int(available_miner_count),
+                hotkeys=self.metagraph.hotkeys,
+                coldkeys=getattr(self.metagraph, "coldkeys", []),
+                incentives_by_uid={uid: miner_incentive(self.metagraph, uid) for uid, _ in results_by_uid},
+                score_histories=self.leaderboard_score_histories,
+                avg_window=int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),
+                results_by_uid=results_by_uid,
+                image_url_by_uid=image_url_by_uid,
+            )
+        )
+
+    def _leaderboard_results_for_all_miners(
+        self,
+        results_by_uid: Sequence[tuple[int, EvaluationResult]],
+    ) -> list[tuple[int, EvaluationResult]]:
+        selected_results = {uid: result for uid, result in results_by_uid}
+        report_rows: list[tuple[int, EvaluationResult]] = []
+        for uid in self._leaderboard_miner_uids():
+            result = selected_results.get(uid)
+            if result is None:
+                result = EvaluationResult(
+                    score=0.0,
+                    reason="leaderboard_unavailable",
+                    model_prediction="unavailable",
+                )
+            report_rows.append((uid, result))
+        return report_rows
+
+    def _leaderboard_miner_uids(self) -> list[int]:
+        own_hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "") or "")
+        own_uid = self.metagraph.hotkeys.index(own_hotkey) if own_hotkey in self.metagraph.hotkeys else None
+        return [uid for uid in metagraph_miner_uids(self.metagraph) if own_uid is None or uid != own_uid]
+
+    def _fallback_burn_rate(self) -> float:
+        return min(max(float(getattr(self.config.perturb, "default_burn_rate", 0.0)), 0.0), 1.0)
+
+    def _fetch_burn_rate(self) -> float:
+        endpoint = str(getattr(self.config.perturb, "burn_rate_endpoint", C.BURN_RATE_ENDPOINT)).strip()
+        timeout = float(getattr(self.config.perturb, "burn_rate_fetch_timeout_seconds", 5.0))
+        fallback = self._fallback_burn_rate()
+        if not endpoint:
+            logger.warning(f"Burn rate endpoint is empty; using fallback burn={fallback:.4f}")
+            return fallback
+        try:
+            response = requests.get(endpoint, timeout=timeout)
+            response.raise_for_status()
+            payload = response.json()
+            raw_burn = payload.get("burnRate") if isinstance(payload, dict) else None
+            burn = float(raw_burn)
+            if not math.isfinite(burn) or burn < 0.0 or burn > 1.0:
+                raise ValueError(f"burnRate must be in [0,1], got {raw_burn!r}")
+            return min(max(burn, 0.0), 1.0)
+        except Exception as exc:
+            # Burn is policy-controlled by the API, but weight setting must never
+            # fail or use garbage data because the endpoint is slow/unavailable.
+            logger.warning(f"Failed to fetch burn rate from {endpoint}; using fallback burn={fallback:.4f}: {exc}")
+            return fallback
+
     def _set_weights(self) -> None:
         self._log_step_start(
             "set_weights",
-            min_processed=self.config.perturb.min_processed_count,
             history_size=self.config.perturb.history_size,
         )
         eligible: list[tuple[int, float]] = []
         history_size = int(self.config.perturb.history_size)
-        min_processed = int(self.config.perturb.min_processed_count)
+        burn_uid = int(getattr(self.config.perturb, "burn_uid", 0))
+        if burn_uid < 0 or burn_uid >= int(self.metagraph.n):
+            logger.warning(f"Configured burn_uid={burn_uid} is outside metagraph; falling back to UID 0.")
+            burn_uid = 0
+        burn_rate = self._fetch_burn_rate()
         for uid in range(int(self.metagraph.n)):
-            if int(self.processed_counts[uid]) < min_processed:
+            if uid == burn_uid:
                 continue
             history = self.score_histories[uid]
             if len(history) < history_size:
@@ -854,29 +902,21 @@ class PerturbValidator:
             eligible.append((uid, avg_score))
 
         if not eligible:
-            logger.warning(f"No eligible miners with processed_count >= {min_processed}.")
+            logger.warning(f"No eligible miners with full history_size={history_size}.")
             return
 
         eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
         n_eligible = len(eligible)
         emission_raw = np.zeros(int(self.metagraph.n), dtype=np.float32)
 
-        rank_to_uid: dict[int, int] = {}
-        for rank0, (uid, avg_score) in enumerate(eligible):
-            rank = rank0 + 1
-            rank_to_uid[rank] = uid
-
-        # Fixed top-5 emission schedule; ranks 6+ intentionally receive zero.
-        top5_shares = (0.70, 0.25, 0.03, 0.015, 0.005)
-        for rank, share in enumerate(top5_shares, start=1):
-            if rank <= n_eligible:
-                emission_raw[rank_to_uid[rank]] = float(share)
-
         # Only miners with positive average score may receive non-zero emissions.
-        positive_uids = [uid for uid, avg_score in eligible if avg_score > 0.0]
+        positive_eligible = [(uid, avg_score) for uid, avg_score in eligible if avg_score > 0.0]
+        positive_uids = [uid for uid, _ in positive_eligible]
         if not positive_uids:
-            logger.warning("No miners with positive average score; setting all weights to zero.")
+            logger.warning("No miners with positive average score; routing 100% to burn UID.")
             zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
+            if len(zero_weights) > burn_uid:
+                zero_weights[burn_uid] = 1.0
             uids = list(range(len(zero_weights)))
             ok, msg = self.subtensor.set_weights(
                 wallet=self.wallet,
@@ -891,49 +931,39 @@ class PerturbValidator:
             else:
                 logger.error(f"set_weights failed (all zero): {msg}")
             return
-        active_emission_total = float(sum(float(emission_raw[uid]) for uid in positive_uids))
-        if active_emission_total <= 0.0:
-            logger.warning("No positive-score miners in weighted rank buckets; setting all weights to zero.")
-            zero_weights = np.zeros(int(self.metagraph.n), dtype=np.float32)
-            uids = list(range(len(zero_weights)))
-            ok, msg = self.subtensor.set_weights(
-                wallet=self.wallet,
-                netuid=self.config.netuid,
-                uids=uids,
-                weights=[float(v) for v in zero_weights.tolist()],
-                wait_for_inclusion=False,
-                wait_for_finalization=False,
-            )
-            if ok:
-                logger.info("set_weights success (all zero)")
-            else:
-                logger.error(f"set_weights failed (all zero): {msg}")
-            return
+
+        # Ranks 3+ split the final 15% by descending rank weight, not evenly.
+        for uid, share in ranked_emission_shares(positive_uids).items():
+            emission_raw[uid] = float(share)
 
         normalized = np.zeros(int(self.metagraph.n), dtype=np.float32)
         for uid in positive_uids:
-            normalized[uid] = float(emission_raw[uid]) / active_emission_total
+            normalized[uid] = float(emission_raw[uid])
         for rank0, (uid, avg_score) in enumerate(eligible[:10]):
             rank = rank0 + 1
             logger.debug(
                 f"rank={rank} uid={uid} avg_score={avg_score:.6f} emission_raw={emission_raw[uid]:.6f} emission={normalized[uid]:.6f}"
             )
         top_weight_items: list[str] = []
-        for rank, (uid, avg_score) in enumerate(eligible[:5], start=1):
+        for rank, (uid, avg_score) in enumerate(positive_eligible[:5], start=1):
             top_weight_items.append(f"r{rank}:uid{uid}:avg={avg_score:.4f}:w={normalized[uid]:.4f}")
         self._log_summary(
             "weights_summary",
+            burn=f"{burn_rate:.4f}",
+            burn_uid=burn_uid,
             eligible=n_eligible,
-            distributed=min(5, n_eligible),
-            top5="|".join(top_weight_items) if top_weight_items else "none",
+            distributed=len(positive_eligible),
+            top="|".join(top_weight_items) if top_weight_items else "none",
         )
 
-        # Scale miner emissions by configured share; route remainder to uid 0.
+        # Burn is fetched live each cycle and assigned to UID 0 (existing subnet
+        # convention for the burn/null destination). Miner weights are scaled by
+        # the remaining share so the final vector remains normalized.
         miner_share = float(min(max(self.miner_emission_share, 0.0), 1.0))
-        scaled = normalized * miner_share
-        remainder = 1.0 - miner_share
-        if len(scaled) > 0:
-            scaled[0] = remainder
+        miner_distribution_share = miner_share * (1.0 - burn_rate)
+        scaled = normalized * miner_distribution_share
+        if len(scaled) > burn_uid:
+            scaled[burn_uid] = float(burn_rate + (1.0 - miner_share))
 
         uids = list(range(len(scaled)))
         weights = [float(v) for v in scaled.tolist()]
@@ -962,7 +992,6 @@ class PerturbValidator:
             timeout=self.config.perturb.timeout_seconds,
             k_miners=self.config.perturb.k_miners,
             history_size=self.config.perturb.history_size,
-            min_processed=self.config.perturb.min_processed_count,
             min_linf=self.config.perturb.min_linf_delta,
             max_linf=self.config.perturb.max_linf_delta,
             min_ssim=self.config.perturb.min_ssim,
@@ -1021,8 +1050,14 @@ class PerturbValidator:
                 rewards: list[float] = []
                 results_by_uid: list[tuple[int, EvaluationResult]] = []
                 response_log_lines: list[str] = []
+                response_b64_by_uid: dict[int, str] = {}
+                response_hash_by_uid: dict[int, str] = {}
+                status_code_by_uid: dict[int, int] = {}
+                storage_key_by_uid: dict[int, str] = {}
+                responded_miner_count = 0
                 for uid, response in zip(miner_uids, responses):
                     status_code = getattr(response.dendrite, "status_code", 0) if response.dendrite else 0
+                    status_code_by_uid[uid] = int(status_code)
                     process_time = getattr(response.dendrite, "process_time", None) if response.dendrite else None
                     response_time_ms = int((process_time or challenge.timeout_seconds) * 1000)
 
@@ -1034,17 +1069,57 @@ class PerturbValidator:
                             response_time_ms=response_time_ms,
                         )
                     else:
+                        responded_miner_count += 1
+                        # Duplicate detection is exact-match on submitted response bytes
+                        # (base64-decoded content), not perceptual similarity.
+                        try:
+                            response_hash_by_uid[uid] = hashlib.sha256(
+                                base64.b64decode(response.perturbed_image_b64)
+                            ).hexdigest()
+                            response_b64_by_uid[uid] = response.perturbed_image_b64
+                        except Exception:
+                            pass
                         result = self.verify_and_score(
                             challenge=challenge,
                             perturbed_image_b64=response.perturbed_image_b64,
                             response_time_ms=response_time_ms,
                         )
+                    results_by_uid.append((uid, result))
+
+                apply_fastest_wins(results_by_uid=results_by_uid, response_hash_by_uid=response_hash_by_uid)
+
+                export_candidates: list[AdversarialExportCandidate] = []
+                for uid, result in results_by_uid:
                     score = float(result.score)
                     rewards.append(score)
-                    results_by_uid.append((uid, result))
+                    response_hash = response_hash_by_uid.get(uid)
+                    response_b64 = response_b64_by_uid.get(uid)
+                    if result.reason == "success" and response_hash and response_b64:
+                        miner_hotkey = ""
+                        if uid < len(self.metagraph.hotkeys):
+                            miner_hotkey = str(self.metagraph.hotkeys[uid])
+                        miner_storage_key = self.adversarial_exporter.miner_storage_key(
+                            miner_uid=int(uid),
+                            miner_hotkey=miner_hotkey,
+                        )
+                        storage_key_by_uid[uid] = miner_storage_key
+                        export_candidates.append(
+                            AdversarialExportCandidate(
+                                miner_storage_key=miner_storage_key,
+                                adversarial_label=result.model_prediction,
+                                score=float(result.score),
+                                norm=float(result.norm),
+                                rmse=float(result.rmse),
+                                epsilon=float(result.epsilon),
+                                ssim=float(result.ssim),
+                                psnr_db=float(result.psnr_db),
+                                response_time_ms=int(result.response_time_ms),
+                                perturbed_image_b64=response_b64,
+                            )
+                        )
                     self.reason_counts_total[result.reason] += 1
                     response_log_lines.append(
-                        f"uid={uid} status={status_code} score={score:.6f} "
+                        f"uid={uid} status={status_code_by_uid.get(uid, 0)} score={score:.6f} "
                         f"response_time_ms={result.response_time_ms} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} "
@@ -1052,9 +1127,40 @@ class PerturbValidator:
                         f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f}"
                     )
 
+                image_url_by_storage_key = self.adversarial_exporter.submit_top_unique(
+                    image_id=challenge.image_id,
+                    task_id=challenge.task_id,
+                    block=int(block),
+                    model_name=challenge.model_name,
+                    true_label=challenge.true_label,
+                    candidates=export_candidates,
+                )
+                image_url_by_uid = {
+                    uid: image_url_by_storage_key[storage_key]
+                    for uid, storage_key in storage_key_by_uid.items()
+                    if storage_key in image_url_by_storage_key
+                }
                 all_zero_scores = bool(rewards) and all(score <= 0.0 for score in rewards)
 
                 self._log_step_start("loop_update_histories")
+                leaderboard_results_by_uid = self._leaderboard_results_for_all_miners(results_by_uid)
+                leaderboard_uids = [uid for uid, _ in leaderboard_results_by_uid]
+                leaderboard_rewards = [float(result.score) for _, result in leaderboard_results_by_uid]
+                self._update_leaderboard_histories(leaderboard_uids, leaderboard_rewards)
+                self._submit_leaderboard_report(
+                    challenge=challenge,
+                    results_by_uid=leaderboard_results_by_uid,
+                    image_url_by_uid=image_url_by_uid,
+                    available_miner_count=len(available_uids),
+                )
+                self._log_summary(
+                    "leaderboard_report_queued",
+                    task_id=challenge.task_id,
+                    miners=len(leaderboard_results_by_uid),
+                    valid=sum(1 for _, result in leaderboard_results_by_uid if result.reason == "success"),
+                    r2_uploaded=len(image_url_by_uid),
+                    available=len(available_uids),
+                )
                 if all_zero_scores:
                     logger.warning(
                         "Skipping history update because all selected miner scores are zero "
@@ -1101,6 +1207,7 @@ class PerturbValidator:
                     self.last_weight_block = block
 
                 self.step += 1
+                time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
                 logger.info("Validator stopped by user.")
                 break
@@ -1109,7 +1216,8 @@ class PerturbValidator:
                 time.sleep(5)
         if not self._query_loop.is_closed():
             self._query_loop.close()
-        self._finish_wandb()
+        self.adversarial_exporter.close()
+        self.leaderboard_reporter.close()
 
 
 def build_config() -> bt.config:

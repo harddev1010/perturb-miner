@@ -131,21 +131,16 @@ Edit required fields in `scripts/validator.env`:
 
 - `WALLET_NAME`
 - `WALLET_HOTKEY`
-- `NETUID`
-- `NETWORK`
+- `PERTURB_R2_BUCKET`
+- `PERTURB_R2_ENDPOINT_URL`
+- `PERTURB_R2_ACCESS_KEY_ID`
+- `PERTURB_R2_SECRET_ACCESS_KEY`
 
-Important validator-specific fields:
+Optional:
 
-- `HF_TOKEN` (optional in `scripts/validator.env`, speeds up the one-time ImageNet-100 download)
-- `PERTURB_K_MINERS`
-- `PERTURB_HISTORY_SIZE`
-- `PERTURB_MIN_PROCESSED_COUNT`
-- `PERTURB_MIN_LINF_DELTA`
-- `PERTURB_MAX_LINF_DELTA`
-- `PERTURB_WANDB_ENABLED` (`true` to enable validator metrics logging to Weights & Biases)
-- `PERTURB_WANDB_PROJECT`, `PERTURB_WANDB_ENTITY`, `PERTURB_WANDB_RUN_NAME`, `PERTURB_WANDB_MODE`
-- `PERTURB_WANDB_LOG_CONSOLE` (`true` to forward validator console logs to W&B as well)
-- `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
+- `HF_TOKEN` (speeds up the one-time ImageNet-100 download)
+- `PERTURB_STORAGE_MODE` (`latest` default, or `all`)
+- `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` for quieter logs)
 
 ### 3) Start validator
 
@@ -164,6 +159,7 @@ Expected log behavior:
 
 - Challenge generation does not depend on external image APIs or LLM verification.
 - ImageNet-100 selection walks the entire train split (~126k images) once in random order before reshuffling for the next epoch; the order, cursor, and epoch persist across restarts so no image repeats within an epoch.
+- R2 export is enabled by default. The validator checks R2 configuration before the challenge loop and stops with a warning if bucket, endpoint, or credentials are missing.
 
 ## Installation and Setup (Miner Side)
 
@@ -230,6 +226,13 @@ Miner response field:
 
 - `perturbed_image_b64`
 
+### Leaderboard reporting
+
+After each scoring round, validators submit a signed leaderboard report to the API configured in `perturbnet/constants.py`. Reports are queued in a background thread; leaderboard API failures, non-2xx responses, or timeouts are logged and skipped without affecting validator scoring.
+
+Reports include network metrics and full miner details for every registered non-validator UID. Successful responses include presigned R2 image URLs for UI display; miners without an exported image use the configured placeholder image. Reports are authenticated by signing the exact JSON request bytes with the validator hotkey.
+
+
 ## Scoring and Weighting
 
 Per-response score (if verification passes):
@@ -245,14 +248,20 @@ Per-response score (if verification passes):
 - `rmse_score = (1 - rmse_ratio)^2`
 - `perturbation_score = weighted_avg(linf_score, rmse_score)` using `PERTURB_LINF_COMPONENT_WEIGHT` and `PERTURB_RMSE_COMPONENT_WEIGHT`
 - `speed_score = 1 - min(response_time / timeout, 1)`
-- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score`
+- `margin = best_non_true_logit - true_class_logit`
+- `margin_score = clamp(margin / 10, 0, 1)` using `ANALYZE_BUCKET_MARGIN_WEIGHT` (default `0.03`)
+- `novelty_score = clamp(changed_pixel_count / ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS, 0, 1)` using `ANALYZE_BUCKET_NOVELTY_WEIGHT` (default `0.01`)
+- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score + margin_weight * margin_score + novelty_weight * novelty_score`
 
 Any verification or constraint failure gets `0.0`.
 
+Labels are normalized with `strip -> lowercase -> replace "_" with " "`. When possible, the validator resolves the true label to an EfficientNet class index and compares class indices instead of only strings, including comma-separated ImageNet label aliases. Miner responses are quantized onto the same uint8 PNG grid used by base64 image submissions before norms are measured, so nonzero `Linf` values are effectively multiples of `1/255`.
+
 Weight setting:
 
-- Only miners with `processed_count >= PERTURB_MIN_PROCESSED_COUNT` (default `50`) and a full score history are weight-eligible
-- Emission schedule: top-5 only with fixed shares `70%, 25%, 3%, 1.5%, 0.5%` (ranks 6+ receive 0)
+- Only miners with a full `PERTURB_HISTORY_SIZE` score history are weight-eligible
+- Emission schedule: rank 1 receives `70%`, rank 2 receives `15%`, and the remaining `15%` is split by descending rank weight among all other positive-score eligible miners
+- At each weight-setting cycle, the validator fetches `burnRate` from the burn endpoint configured in `perturbnet/constants.py` and assigns that share to the configured burn UID. Miner weights are scaled by `1 - burnRate`, keeping the submitted vector normalized. If the API is unavailable or invalid, the default burn rate from `constants.py` is used instead.
 
 ## Integration Smoke Test
 
