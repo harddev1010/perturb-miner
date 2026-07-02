@@ -75,6 +75,7 @@ BURN_RATE_FETCH_TIMEOUT_SECONDS = 5.0
 BURN_UID = 0
 LEADERBOARD_REPORTING_ENABLED = True
 LEADERBOARD_API_URL = "https://api.perturbai.io/api/v1/report"
+LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL = "https://api.perturbai.io/api/v1/last-weight-update"
 LEADERBOARD_REPORT_TIMEOUT_SECONDS = 10.0
 LEADERBOARD_NO_IMAGE_URL = "https://placeimg.dev/128x128/F3F4F6?text=None&textColor=6B7280"
 R2_EXPORT_ENABLED = True
@@ -107,6 +108,7 @@ VALIDATOR_CONFIG = {
     "burn_uid": BURN_UID,
     "leaderboard_reporting_enabled": LEADERBOARD_REPORTING_ENABLED,
     "leaderboard_api_url": LEADERBOARD_API_URL,
+    "leaderboard_last_weight_update_api_url": LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,
     "leaderboard_report_timeout_seconds": LEADERBOARD_REPORT_TIMEOUT_SECONDS,
     "leaderboard_no_image_url": LEADERBOARD_NO_IMAGE_URL,
     "r2_export_enabled": R2_EXPORT_ENABLED,

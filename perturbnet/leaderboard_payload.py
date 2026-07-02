@@ -19,6 +19,12 @@ def avg_score(histories: list[list[float]], uid: int, window: int) -> float:
     return float(sum(history) / len(history))
 
 
+def score_graph(histories: list[list[float]], uid: int, window: int) -> list[float]:
+    if uid >= len(histories):
+        return []
+    return [float(score) for score in histories[uid][-int(window):]]
+
+
 def result_status(result: Any) -> str:
     if result.reason == "success":
         return "Valid"
@@ -82,6 +88,7 @@ def build_report(
                 incentive=float(incentives_by_uid.get(uid, 0.0)),
                 avg_score=avg_score(score_histories, uid, avg_window),
                 last_score=float(result.score),
+                graph=score_graph(score_histories, uid, avg_window),
                 rmse=float(result.rmse),
                 norm=float(result.norm),
                 result=result_status(result),
