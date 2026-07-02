@@ -235,7 +235,12 @@ OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 15.0)
 #     dynamically balances margin vs RMSE per image (hard images where deep margin costs too much RMSE
 #     keep the bare flip). Much cheaper than a geometric descent that re-deepens every 10% step.
 #   strict: geometric first-flip descent (shallow rungs, cheap) then ONE deepen pass at the settled K.
+#   analytic: MODEL-based (fewest expensive probes). Fit margin(K) from a few probes, then MAXIMIZE the
+#     analytic score S(K) (perturbation is closed-form q√(K/N); margin bonus from the interpolated margin;
+#     novelty saturated) over a fine K grid for FREE, and verify the predicted optimum + neighborhood at
+#     full budget. Fewer probes than the binary search -> more optimization depth on the winner.
 POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "coupled").strip().lower() or "coupled"
+ANALYTIC_PROBE_FRACS = _env_floats("PERTURB_ANALYTIC_PROBE_FRACS", (0.5, 0.25))  # K/K_anchor probes that fit margin(K)
 MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
 KSAT_REL_TOL = _env_float("PERTURB_KSAT_REL_TOL", 0.05)   # coupled: stop binary search when (hi-lo) <= max(KSAT_ABS_TOL, this·hi)
 KSAT_ABS_TOL = _env_int("PERTURB_KSAT_ABS_TOL", 8)        # absolute tol floor so small K doesn't over-probe single coords
@@ -256,6 +261,19 @@ COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.95, 0.85, 
 COUPLED_REFINE_FULL = _env_int("PERTURB_COUPLED_REFINE_FULL", 2)  # screened candidates given the full budget
 COUPLED_RETRY_FRAC = _env_float("PERTURB_COUPLED_RETRY_FRAC", 0.6)
 COUPLED_PARENTS = _env_int("PERTURB_COUPLED_PARENTS", 3)
+
+# --- INNER support-quality refinement (all strategies, after the K-search) -----------------------
+# The K-search picks a good cardinality; it does NOT guarantee the best coordinates/signs AT that K
+# (WarmStartSmallerK ranks by first-order retention; the deepen swaps accept by margin). This pass takes
+# the current best flip and, gradient-prefiltered to ONE batched forward per round, tries: EXACT deletion
+# of redundant coords (individual + aggregate removals) and score-accepted one-for-one SWAPS (weakest-out
+# / strongest-feasible-in). Every candidate folds through the score-ranked Bank, so acceptance is by FULL
+# score automatically and it can only RAISE the returned score (or, out of budget, do nothing).
+REFINE_SUPPORT = _env_bool("PERTURB_REFINE_SUPPORT", True)
+REFINE_ROUNDS = _env_int("PERTURB_REFINE_ROUNDS", 3)                    # deletion+swap rounds (re-linearized)
+REFINE_DELETION_POOL = _env_int("PERTURB_REFINE_DELETION_POOL", 128)   # weakest active coords tested for deletion
+REFINE_SWAP_POOL = _env_int("PERTURB_REFINE_SWAP_POOL", 128)           # strongest inactive coords for swap-in
+REFINE_SWAP_PROPOSALS = _env_int("PERTURB_REFINE_SWAP_PROPOSALS", 128)  # one-for-one swap proposals per round
 # strict only: accept a smaller-K rung while its total score is within SCORE_TOL of the best (a positive
 # tolerance lets the descent push through score noise / a shallow dip before declaring the peak).
 SCORE_TOL = _env_float("PERTURB_SCORE_TOL", 0.0003)

@@ -1156,6 +1156,69 @@ def ReduceCardinality(ctx: Context, flip_state: State, K_start: int, minimum_K: 
 
 
 # ==========================================================================================
+# INNER support-quality refinement (all strategies). Fixes the coords/signs at the chosen K.
+# ==========================================================================================
+def SupportRefine(ctx: Context) -> None:
+    """Refine the coordinate SET at the chosen K on the current best flip. The outer K-search decides
+    HOW MANY coords; this decides WHICH — where the engine was weakest (first-order retention + margin-
+    only swaps). Two moves per round, gradient-prefiltered into ONE batched forward:
+
+      * EXACT deletion — batch-test removing the weakest active coords (individually AND a few aggregate
+        removals), catching redundancy the first-order retention misranks (nonlinear response).
+      * Score swaps — batch weakest-out / strongest-feasible-in one-for-one replacements.
+
+    Every candidate folds through the score-ranked Bank, so acceptance is by FULL validator score for
+    free — it can only raise the returned score (or, out of budget, do nothing). Re-linearizes at the new
+    best each round and stops when a round yields no score gain."""
+    if not K.REFINE_SUPPORT:
+        return
+    best = ctx.bank.best_safe
+    if best is None or best.get("delta") is None:
+        return
+    d = best["delta"]
+    x_adv = best["cand"]
+    prev = float(best["score"])
+    for _ in range(max(1, int(K.REFINE_ROUNDS))):
+        if _oob(ctx):
+            break
+        mask = d != 0
+        sign = d.sign()
+        active = mask.nonzero(as_tuple=True)[0]
+        if active.numel() == 0:
+            break
+        _m, g = _grad_at(ctx, x_adv)
+        retention = -g[active] * ctx.q * sign[active]                 # small/negative => removable
+        weak = active[torch.argsort(retention)][: max(1, int(K.REFINE_DELETION_POOL))]
+        cands: list[torch.Tensor] = []
+        # (B) exact deletion: individual removals + a few aggregate removals of the weakest coords.
+        for i in weak.tolist():
+            c = d.clone(); c[i] = 0.0; cands.append(c)
+        for frac in (0.5, 0.25, 0.1):
+            k = max(1, int(frac * weak.numel()))
+            c = d.clone(); c[weak[:k]] = 0.0; cands.append(c)
+        # (C) score-accepted swaps: weakest active out, strongest feasible-descent inactive in.
+        in_sign = _best_direction(ctx, g)
+        in_gain = (-g * ctx.q * in_sign).clamp(min=0.0)
+        in_gain[mask] = float("-inf")                                 # inactive coords only
+        n_in = min(int(K.REFINE_SWAP_POOL), int((~mask).sum().item()))
+        if n_in > 0:
+            strong_in = torch.topk(in_gain, n_in).indices
+            n_pairs = min(int(weak.numel()), int(strong_in.numel()), int(K.REFINE_SWAP_PROPOSALS))
+            for t in range(n_pairs):
+                i = int(weak[t]); j = int(strong_in[t])
+                c = d.clone(); c[i] = 0.0; c[j] = float(in_sign[j]) * float(ctx.k_min); cands.append(c)
+        _eval(ctx, cands)                                             # batched; Bank accepts by full score
+        cur = ctx.bank.best_safe
+        if cur is None or float(cur["score"]) <= prev + 1e-6:
+            break                                                    # no score gain this round -> stop
+        prev = float(cur["score"]); d = cur["delta"]; x_adv = cur["cand"]
+    fin = ctx.bank.best_safe
+    if fin is not None:
+        logger.info(f"[refine] support-refine best=({fin['nz']}ch pixels={fin['pixels']} "
+                    f"margin={fin['margin']:.4f} score={fin['score']:.4f})")
+
+
+# ==========================================================================================
 # Post-flip strategies (env PERTURB_POSTFLIP_STRATEGY). Both leave the best (K, margin) in the Bank.
 # ==========================================================================================
 def PostFlipStrict(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
@@ -1307,6 +1370,91 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
         logger.info("[coupled] no safe flip banked")
 
 
+def _interp_margin(K_new: int, samples: list[tuple[int, float]]) -> float:
+    """Estimate margin at K_new from (K, margin) probe samples (margin is more negative at larger K).
+    Piecewise-linear within the sampled range; LINEAR-EXTRAPOLATED below the smallest sample using the
+    two lowest points, because margin degrades toward 0 (the flip dies) as K shrinks — clamping there
+    would falsely predict a surviving deep flip at tiny K. Clamped above the largest (we don't probe
+    above the anchor, and margin only deepens there)."""
+    pts = sorted(samples)
+    if len(pts) == 1:
+        return pts[0][1]
+    if K_new <= pts[0][0]:
+        (k0, m0), (k1, m1) = pts[0], pts[1]
+        return m0 + ((m1 - m0) / max(1, (k1 - k0))) * (K_new - k0)   # extrapolate the low-K trend
+    if K_new >= pts[-1][0]:
+        return pts[-1][1]
+    for (k0, m0), (k1, m1) in zip(pts, pts[1:]):
+        if k0 <= K_new <= k1:
+            t = (K_new - k0) / max(1, (k1 - k0))
+            return m0 + t * (m1 - m0)
+    return pts[-1][1]
+
+
+def PostFlipAnalytic(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
+    """Model-based score maximizer (Family 2). perturbation(K)=f(q√(K/N)) is closed-form, so given a
+    cheap model of margin(K) the WHOLE score S(K) is a known 1-D function. We fit margin(K) from an
+    anchor + a couple of spread probes, maximize the predicted S(K) over a fine grid for FREE (no model
+    evals), and verify the predicted optimum + a small neighborhood at full budget — the Bank keeps the
+    actual best. Fewer expensive probes than the binary search, so more depth lands on the winner. If the
+    margin model mispredicts, the neighborhood verification + the Bank still recover a good candidate."""
+    target = -K.MARGIN_DEEPEN_TARGET
+    b_iters = max(1, int(K.ITERATIONS_PER_K * K.COUPLED_BOUNDARY_ITER_FRAC))
+    r_iters = max(1, int(K.ITERATIONS_PER_K))
+    K_floor = _novelty_floor_k(K_start, K_min)
+    n = max(1, ctx.clean_u8.numel())
+
+    # 1. Anchor + spread probes -> (K, margin) samples that define the margin(K) model.
+    anchor, _ = OptimizeFixedK(ctx, flip_state, _k_of(flip_state), r_iters, deepen_target=target)
+    K_a = _k_of(anchor)
+    parents: list = []
+    _remember_parent(ctx, parents, anchor, K.COUPLED_PARENTS)
+    samples: list[tuple[int, float]] = [(K_a, anchor.margin)]
+    for frac in K.ANALYTIC_PROBE_FRACS:
+        if _oob(ctx):
+            break
+        kk = min(K_a, max(K_floor, int(round(frac * K_a))))
+        cand = _probe_k(ctx, _best_parent(parents, kk), kk, b_iters, target)
+        _remember_parent(ctx, parents, cand, K.COUPLED_PARENTS)
+        samples.append((kk, cand.margin))
+        logger.info(f"[analytic] sample K={kk} margin={cand.margin:.4f}")
+
+    # 2. Maximize predicted S(K) over a geometric grid (analytic — no model evals).
+    lo_k, hi_k = K_floor, K_a
+    if hi_k > lo_k:
+        grid = sorted({min(hi_k, max(lo_k, int(round(lo_k * (hi_k / lo_k) ** (i / 63.0))))) for i in range(64)})
+    else:
+        grid = [lo_k]
+
+    def pred(kk: int) -> float:
+        m = _interp_margin(kk, samples)
+        if m >= 0.0:
+            return 0.0                                   # predicted not-flipped -> no score (don't chase tiny K)
+        rmse = ctx.q * math.sqrt(kk / n)
+        return validator_score(ctx.q, rmse, m, 10 ** 9, ctx.cap)
+
+    K_star = max(grid, key=pred)
+    logger.info(f"[analytic] predicted K*={K_star} pred_score={pred(K_star):.4f} samples={len(samples)}")
+
+    # 3. Verify K* + a small neighborhood at full budget (Bank keeps the actual best; skip by UB).
+    verify_ks = sorted({min(hi_k, max(lo_k, int(round(f * K_star)))) for f in (1.0, 0.85, 1.15)})
+    for kk in verify_ks:
+        if _oob(ctx):
+            break
+        if _score_upper_bound(ctx, kk) <= _bank_best_score(ctx) + K.SCORE_TOL:
+            continue
+        cand = _probe_k(ctx, _best_parent(parents, kk), kk, r_iters, target)
+        _remember_parent(ctx, parents, cand, K.COUPLED_PARENTS)
+        logger.info(f"[analytic] verify K={kk} margin={cand.margin:.4f} score={_state_score(ctx, cand):.4f}")
+
+    best = ctx.bank.best_safe
+    if best is not None:
+        logger.info(f"[analytic] K*~{K_star} best=({best['nz']}ch pixels={best['pixels']} "
+                    f"margin={best['margin']:.4f} score={best['score']:.4f})")
+    else:
+        logger.info("[analytic] no safe flip banked")
+
+
 # ==========================================================================================
 # Orchestrator — DynamicSparseFixedQAttack.
 # ==========================================================================================
@@ -1342,8 +1490,12 @@ def search(ctx: Context) -> None:
             if success:
                 if K.POSTFLIP_STRATEGY == "strict":
                     PostFlipStrict(ctx, successful_state, K_init, K_min)
+                elif K.POSTFLIP_STRATEGY == "analytic":
+                    PostFlipAnalytic(ctx, successful_state, K_init, K_min)
                 else:
                     PostFlipCoupled(ctx, successful_state, K_init, K_min)
+                # INNER refinement on the chosen K (all strategies): exact deletion + score swaps.
+                SupportRefine(ctx)
         else:
             logger.info("[search] optimizer disabled (PERTURB_RUN_OPTIM=0): returning Phase-A incumbent")
     except _FirstFlipFound:
