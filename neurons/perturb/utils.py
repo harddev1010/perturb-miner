@@ -51,16 +51,37 @@ def compute_psnr_db(x_clean: torch.Tensor, x_adv: torch.Tensor) -> float:
     return 10.0 * math.log10(1.0 / mse)
 
 
-def estimate_validator_score(norm: float, rmse: float, synapse_epsilon: float) -> float:
-    """Mirror the validator's perturbation score (SPEED_WEIGHT=0 so speed is irrelevant)."""
-    effective_max = min(float(synapse_epsilon), _C.MAX_LINF_DELTA)
+def perturbation_score(linf: float, rmse: float, effective_max: float) -> float:
+    """The validator's L∞+RMSE perturbation component (the base ~0.95 term), given the effective L∞
+    cap = min(epsilon, MAX_LINF_DELTA). Split out so validator_score() and the log estimator share it."""
     denom = max(1e-12, effective_max - _C.MIN_LINF_DELTA)
-    linf_ratio = min(max((norm - _C.MIN_LINF_DELTA) / denom, 0.0), 1.0)
+    linf_ratio = min(max((linf - _C.MIN_LINF_DELTA) / denom, 0.0), 1.0)
     linf_score = (1.0 - linf_ratio) ** 2
     rmse_ratio = min(max(rmse / max(1e-12, effective_max), 0.0), 1.0)
     rmse_score = (1.0 - rmse_ratio) ** 2
     total_w = max(1e-12, _C.LINF_COMPONENT_WEIGHT + _C.RMSE_COMPONENT_WEIGHT)
     return (_C.LINF_COMPONENT_WEIGHT * linf_score + _C.RMSE_COMPONENT_WEIGHT * rmse_score) / total_w
+
+
+def estimate_validator_score(norm: float, rmse: float, synapse_epsilon: float) -> float:
+    """Perturbation-only proxy for the miner log line (has no margin/novelty at that call site).
+    The engine ranks candidates by the FULL objective via validator_score() instead."""
+    return perturbation_score(norm, rmse, min(float(synapse_epsilon), _C.MAX_LINF_DELTA))
+
+
+def validator_score(linf: float, rmse: float, margin: float, pixels: int, effective_max: float) -> float:
+    """Full validator total score for a flipped, quality-passing candidate, mirroring
+    validator.verify_and_score: perturbation (L∞+RMSE) + margin bonus + novelty bonus, with
+    PERTURBATION_WEIGHT/SPEED_WEIGHT (speed=0) and the analyze-bucket weights.
+
+    `margin` is the engine's CW margin (logit_true - max_other); the validator's margin is its
+    negation, so a MORE negative CW margin => larger margin bonus (saturates at CW margin <= -10).
+    `pixels` is the changed SPATIAL-pixel count (validator counts pixels, not channels)."""
+    pert = perturbation_score(linf, rmse, effective_max)
+    margin_bonus = _C.ANALYZE_BUCKET_MARGIN_WEIGHT * min(max(-margin / 10.0, 0.0), 1.0)
+    novelty_target = max(1, int(_C.ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS))
+    novelty_bonus = _C.ANALYZE_BUCKET_NOVELTY_WEIGHT * min(max(float(pixels) / float(novelty_target), 0.0), 1.0)
+    return _C.PERTURBATION_WEIGHT * pert + margin_bonus + novelty_bonus
 
 
 # ==========================================================================================
@@ -270,8 +291,13 @@ def out_of_budget(ctx: "Context") -> bool:
 
 
 def _better(a: dict, b: dict) -> bool:
-    """Is candidate a strictly sparser/closer than b? Order by (|S|, linf, rmse)."""
-    return (a["nz"], a["linf"], a["rmse"]) < (b["nz"], b["linf"], b["rmse"])
+    """Is candidate a strictly better than b under the FULL validator objective? Ranks by total
+    validator score (perturbation + margin + novelty), ties broken toward fewer changed channels.
+
+    Replaces the old cardinality-first (|S|, linf, rmse) order, which optimized a stale objective
+    (minimum-L0 bare flip) and discarded the margin (0.03) and novelty (0.01) terms the current
+    validator rewards — i.e. it pruned away the very margin the optimizer had just built."""
+    return (a["score"], -a["nz"]) > (b["score"], -b["nz"])
 
 
 class Bank:
@@ -374,9 +400,11 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
                 kap = None
             for j, seen in enumerate(seen_list):
                 diff = seen - ctx.clean
+                changed = diff.abs() > half_q            # [C,H,W] changed-coordinate mask
                 linf = float(diff.abs().max().item())
                 rmse = float(torch.sqrt(torch.mean(diff * diff)).item())
-                nz = int((diff.abs() > half_q).sum().item())
+                nz = int(changed.sum().item())           # changed channels (|S|_0)
+                pixels = int(changed.any(dim=0).sum().item())  # changed SPATIAL pixels (validator novelty)
                 margin = float(margins[j].item())
                 flipped = margin < 0.0
                 kappa_j = float(kap[j].item()) if kap is not None else ctx.kappa
@@ -386,10 +414,13 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
                     ssim = compute_ssim(ctx.clean, seen)
                     psnr = compute_psnr_db(ctx.clean, seen)
                     quality = ssim >= K.MIN_SSIM and psnr >= K.MIN_PSNR_DB
+                # Full validator objective (only meaningful for quality flips; 0 otherwise since the
+                # Bank folds in quality candidates only). ctx.cap == min(epsilon, MAX_LINF_DELTA).
+                score = validator_score(linf, rmse, margin, pixels, ctx.cap) if quality else 0.0
                 results.append({
-                    "cand": chunk[j], "nz": nz, "linf": linf, "rmse": rmse,
+                    "cand": chunk[j], "nz": nz, "pixels": pixels, "linf": linf, "rmse": rmse,
                     "margin": margin, "flipped": flipped,
-                    "safe": flipped and margin <= -kappa_j, "quality": quality,
+                    "safe": flipped and margin <= -kappa_j, "quality": quality, "score": score,
                 })
             i += bs
         except torch.cuda.OutOfMemoryError:  # type: ignore[attr-defined]

@@ -73,7 +73,7 @@ Q = 1.0 / 255.0                                            # one byte in [0,1] s
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)  # validator L∞ cap
 MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
 MIN_PSNR_DB = _env_float("PERTURB_MIN_PSNR_DB", 38.0)
-RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 4.5)   # deadline headroom (base)
+RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 4)   # deadline headroom (base)
 # Reserve scales with the measured per-forward cost so larger images / models leave enough post-search
 # headroom for serialization + verification (added on top of RESERVE_SECONDS). t_step is one fwd+bwd.
 RESERVE_FWD_MULT = _env_float("PERTURB_RESERVE_FWD_MULT", 6.0)
@@ -223,7 +223,37 @@ ITERATIONS_PER_K = _env_int("PERTURB_FW_ITERATIONS_PER_K", 60)
 # (it closes on max-iters / convergence). The instant the first flip appears, a budget of
 # OPTIM_SECONDS is armed; all optimization after the flip (further refinement + Phase E
 # sparsification) must finish within that window.
-OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 8.0)
+OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 12.0)
+
+# --- Post-flip objective (score-gated, not just L0) ---------------------------------------------
+# The validator scores total = perturbation(L∞,RMSE) + 0.03·clip(-margin/10,0,1) + 0.01·clip(px/8,0,1).
+# Since SPEED_WEIGHT=0, once everyone clusters at ~0.95 on perturbation the ranking turns on RMSE
+# (= cardinality) AND on the 0.03 margin term. Both strategies below do a SCORE-GATED cardinality
+# descent: geometrically probe smaller K and accept it only while the TOTAL score does not fall (a
+# smaller K at equal score is strictly better). Reduction stops at the score PEAK — the K where the
+# margin lost by removing one more coord costs more than the perturbation it buys — not at the
+# minimum flipping K. This is the "margin-vs-RMSE rate" made explicit. env PERTURB_POSTFLIP_STRATEGY:
+#   coupled (default): re-DEEPEN the margin at every probed K before scoring it, so the descent sees the
+#     deep-margin-at-moderate-K points and settles where score is truly maximal. Best score, more evals.
+#   strict: each rung stops at the first flip (shallow, cheaper), THEN one deepen pass at the final K.
+POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "coupled").strip().lower() or "coupled"
+MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
+# Accept a smaller-K candidate while its total score is within SCORE_TOL of the current best (a positive
+# tolerance lets the descent push through score noise / a shallow local dip before declaring the peak).
+SCORE_TOL = _env_float("PERTURB_SCORE_TOL", 0.0003)
+# Novelty floor: the validator's novelty bonus saturates at NOVELTY_TARGET_PIXELS changed spatial
+# pixels; pruning below it trades ~0 perturbation gain for lost novelty. Floor cardinality reduction at
+# ~3x that in channels (worst-case 3 channels/pixel) so neither strategy churns in the sub-floor regime.
+# Correctness is still guaranteed by the score-ranked Bank; this only saves wasted evals.
+NOVELTY_TARGET_PIXELS = _env_int("ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS", 8)
+
+# --- q=2 fallback (last resort when no single-byte flip exists) ----------------------------------
+# If the whole q=1 (L∞=1/255) search bank is empty, retry ONCE at q=2 (L∞=2/255). Doubling the per-
+# coordinate reach makes flipping far easier, so a small support usually flips on the first grow-ladder
+# rung. Capped at q=2 (never q>=3): q=2 tops out at ~0.77 total score, but that dwarfs the 0 of a clean
+# return (which also drags the validator's 300-sample average). Phase A only, time-boxed — a fast net.
+FALLBACK_Q2 = _env_bool("PERTURB_FALLBACK_Q2", True)
+FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 3)    # reserved quick budget for the q=2 retry
 
 # --- Adaptive hyperparameter controller ---------------------------------------------------
 # Starts every tunable knob at its env value, then watches the BEST margin over a sliding window.
