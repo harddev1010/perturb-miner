@@ -20,12 +20,13 @@ import typing
 import bittensor as bt
 import torch
 
+from perturbnet.constants import MAX_LINF_DELTA
 from perturbnet.image_io import decode_image_b64, encode_image_b64
 from perturbnet.model import load_efficientnet_v2_l, logits_for_images, resolve_target_index
 from perturbnet.protocol import AttackChallenge
 
 from neurons.perturb import perturb
-from neurons.perturb.utils import estimate_validator_score, png_roundtrip
+from neurons.perturb.utils import cw_margin, estimate_validator_score, png_roundtrip, validator_score
 
 logger = pylogging.getLogger(__name__)
 
@@ -328,16 +329,22 @@ class PerturbMiner:
             else:
                 synapse.perturbed_image_b64 = adv_b64
             h, w = clean.shape[1], clean.shape[2]
-            est_score = 0.0 if norm < min_delta else estimate_validator_score(norm, rmse, epsilon)
-            # logger.info(
-            #     f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
-            #     f"norm={norm:.6f} k~={norm * 255.0:.2f} rmse={rmse:.6f} dim={h}x{w} "
-            #     f"est_score={est_score:.4f} min_delta={min_delta:.6f} epsilon={epsilon:.4f} "
-            #     f"timeout={timeout_seconds:.1f}s elapsed={time.time() - t_received:.3f}s"
-            # )
+            # Log BOTH: pert_score = L∞+RMSE component only; score = the FULL validator objective
+            # (adds 0.03·margin + 0.01·novelty). The full score is what the validator actually assigns —
+            # it is normally HIGHER than pert_score, so don't read pert_score as "the score".
+            if norm < min_delta:
+                pert_score = full_score = 0.0
+            else:
+                pert_score = estimate_validator_score(norm, rmse, epsilon)
+                with torch.no_grad():
+                    adv_logits = logits_for_images(model=self.model, image_bchw=seen.unsqueeze(0))[0]
+                cw = cw_margin(adv_logits, target_index)  # true - best_other; validator margin = -cw
+                changed_pixels = int((diff.abs() > (0.5 / 255.0)).any(dim=0).sum().item())
+                full_score = validator_score(norm, rmse, cw, changed_pixels, min(epsilon, MAX_LINF_DELTA))
             logger.info(
                 f"Finished task={getattr(synapse, 'task_id', 'unknown')} dim={h}x{w} "
-                f"rmse={rmse:.6f} est_score={est_score:.4f} elapsed={time.time() - t_received:.3f}s"
+                f"rmse={rmse:.6f} pert_score={pert_score:.4f} score={full_score:.4f} "
+                f"elapsed={time.time() - t_received:.3f}s"
             )
             logger.info("-" * 77)
         except Exception as err:

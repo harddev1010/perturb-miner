@@ -95,7 +95,10 @@ def _maybe_arm_optim_deadline(ctx: Context) -> None:
         return
     if ctx.bank.has_flip:
         ctx.first_flip_time = time.time()
-        ctx.deadline = min(ctx.deadline, ctx.first_flip_time + ctx.optim_seconds)
+        # Reclaim the q2 reserve: a q=1 flip exists, so the fallback won't run — arm against the FULL
+        # hard_deadline (not the fb-reduced ctx.deadline), so post-flip optimization uses the whole budget.
+        limit = ctx.hard_deadline if ctx.hard_deadline > 0.0 else ctx.deadline
+        ctx.deadline = min(limit, ctx.first_flip_time + ctx.optim_seconds)
         logger.info(f"[optim] first flip banked -> arming {ctx.optim_seconds:.1f}s optim budget "
                     f"(deadline in {ctx.deadline - time.time():.1f}s)")
 
@@ -536,35 +539,48 @@ def _pad_novelty(ctx: Context, chosen: dict) -> dict:
 
 
 def _q2_fallback(ctx: Context, hard_deadline: float) -> dict | None:
-    """Last resort when the q=1 (L∞=1/255) search banked nothing: retry ONCE at q=2 (L∞=2/255). Doubling
-    the per-coordinate reach makes flipping far easier, so a small gradient-directed support usually flips
-    on the first grow-ladder rung. Phase A only, time-boxed to FALLBACK_Q2_SECONDS — a fast safety net,
-    not a deep search. Capped at q=2 (never q>=3): ~0.77 max total, but far better than a clean return (0).
-    Reuses the clean gradient (∇margin is step-size-independent); a fresh Bank/Context carries k_min=2."""
+    """Strong last resort when the q=1 search banked nothing. Here "q=2" is a MAXIMUM L∞ budget of 2/255
+    (k_min=2) — a SPARSE ±2/255 support, not every pixel at 2/255. Two stages inside the reserve:
+
+      1) GUARANTEED backstop: one DENSE feasible descent candidate (every coord stepped -sign(g0)·2/255).
+         At double reach this flips almost any image in a SINGLE eval, so we always bank *something*
+         (score ~0.6-0.7) rather than returning clean (0) — even on a 1s tail.
+      2) If budget remains: the FULL search at q=2 (Phase A + optimizer + score-gated reduction) to find
+         a SPARSE, higher-score q=2 flip. The score-ranked Bank keeps the best of the two.
+
+    Reuses the clean gradient (∇margin is step-size independent). Hard-capped at q=2 (never q>=3): a q=2
+    flip tops out ~0.77 total, but that dwarfs the 0 (and 300-window drag) of a clean return."""
     fb_deadline = min(hard_deadline, time.time() + K.FALLBACK_Q2_SECONDS)
     if fb_deadline - time.time() <= 2.0 * ctx.t_step:
         logger.info("[q2-fallback] no time left for q=2 retry")
         return None
-    n = ctx.clean_u8.numel()
-    K_init = max(1, int(round(K.K_INIT_FRAC * n)))
     ctx2 = replace(
         ctx, k_min=2, q=2 * K.Q, bank=Bank(), first_flip_time=None,
         deadline=fb_deadline, time_left=lambda: fb_deadline - time.time(),
     )
-    logger.info(f"[q2-fallback] retry at q=2 K_init={K_init} budget={fb_deadline - time.time():.2f}s")
+    logger.info(f"[q2-fallback] retry at q=2 budget={fb_deadline - time.time():.2f}s")
     try:
-        targets = top_wrong_classes(logits_of(ctx2.model, ctx2.clean), ctx2.target_index, K.TOPM)
-        InitializeAttack(ctx2, targets, K_init)
+        # Stage 1 — dense feasible descent backstop (one eval, near-guaranteed flip at double reach).
+        if ctx2.g0 is not None:
+            sign = _best_direction(ctx2, ctx2.g0)
+            dense = _make_delta(ctx2, torch.ones_like(ctx2.clean_u8, dtype=torch.bool), sign)
+            _eval(ctx2, [dense])
+            inc = ctx2.bank.result(ctx2.allow_unsafe)
+            if inc is not None:
+                logger.info(f"[q2-fallback] dense backstop nz={inc['nz']} margin={inc['margin']:.4f} "
+                            f"score={inc['score']:.4f}")
+        # Stage 2 — full q=2 search for a sparse, higher-score flip (Bank keeps the best).
+        if not _oob(ctx2):
+            search(ctx2)
     except _FirstFlipFound:
         pass
     except Exception as err:  # a fallback must never take the whole call down
         logger.warning(f"[q2-fallback] failed: {err}")
-        return None
     chosen = ctx2.bank.result(ctx2.allow_unsafe)
     if chosen is not None:
         chosen = _pad_novelty(ctx2, chosen)
-        logger.info(f"[q2-fallback] flip channels={chosen['nz']} margin={chosen['margin']:.4f} "
-                    f"score={chosen['score']:.4f}")
+        logger.info(f"[q2-fallback] flip channels={chosen['nz']} pixels={chosen['pixels']} "
+                    f"margin={chosen['margin']:.4f} score={chosen['score']:.4f}")
     else:
         logger.info("[q2-fallback] no q=2 flip either -> clean")
     return chosen
@@ -1074,9 +1090,11 @@ def WarmStartSmallerK(ctx: Context, successful_state: State, K_new: int) -> Stat
 
 
 def _novelty_floor_k(K_start: int, K_min: int) -> int:
-    """Smallest K the reducers may reach: max(K_min, min(K_start, 3·NOVELTY_TARGET_PIXELS)). Keeps the
-    changed-pixel count at/above the validator's novelty saturation without ever exceeding K_start."""
-    return max(int(K_min), min(int(K_start), 3 * max(1, int(K.NOVELTY_TARGET_PIXELS))))
+    """Smallest K the reducers may reach: max(K_min, min(K_start, NOVELTY_TARGET_PIXELS)). Channels are
+    scored with their real changed-PIXEL count (batch_eval), and _pad_novelty lifts any sub-target flip
+    back to >=8 pixels at the end — so the search may explore down to the pixel target (8 channels on 8
+    distinct pixels already saturate novelty) instead of the old conservative 3x-channel floor (#4)."""
+    return max(int(K_min), min(int(K_start), max(1, int(K.NOVELTY_TARGET_PIXELS))))
 
 
 def _state_score(ctx: Context, state: State) -> float:
@@ -1151,15 +1169,142 @@ def PostFlipStrict(ctx: Context, flip_state: State, K_start: int, K_min: int) ->
         logger.info(f"[strict] deepened at K={final_K} margin={deepened.margin:.4f}")
 
 
+def _k_of(state: State) -> int:
+    return max(1, int(state.mask.sum().item()))
+
+
+def _saturates(state: State, target: float) -> bool:
+    """A flip whose margin reached the saturation target (full margin bonus)."""
+    return state.margin < 0.0 and state.margin <= target
+
+
+def _probe_k(ctx: Context, src: State, K_new: int, iters: int, target: float) -> State:
+    """Warm-start `src` down to K_new (keep its top-retention coords) and re-optimize/deepen there. Every
+    candidate it evaluates is folded into the score-ranked Bank; returns the optimized state."""
+    warm = WarmStartSmallerK(ctx, src, K_new)
+    cand, _ = OptimizeFixedK(ctx, warm, K_new, iters, deepen_target=target)
+    return cand
+
+
+def _remember_parent(ctx: Context, parents: list, state: State, cap: int) -> None:
+    """Keep up to `cap` highest-score states as alternate warm-start parents (a tiny beam that breaks the
+    single-lineage path dependence of a pure nested reduction)."""
+    parents.append((_state_score(ctx, state), state))
+    parents.sort(key=lambda t: t[0], reverse=True)
+    del parents[cap:]
+
+
+def _best_parent(parents: list, min_k: int) -> State:
+    """Best-score parent whose support is large enough (K >= min_k) to warm-start DOWN to min_k; falls
+    back to the largest-K parent if none qualifies."""
+    eligible = [(s, st) for s, st in parents if _k_of(st) >= min_k]
+    if eligible:
+        return max(eligible, key=lambda t: t[0])[1]
+    return max(parents, key=lambda t: _k_of(t[1]))[1]
+
+
+def _bank_best_score(ctx: Context) -> float:
+    return float(ctx.bank.best_safe["score"]) if ctx.bank.best_safe is not None else -1.0
+
+
+def _score_upper_bound(ctx: Context, K_new: int) -> float:
+    """Analytic MAX score achievable at cardinality K_new: perturbation at the fixed L∞=q and
+    RMSE=q·√(K/N), plus the FULL margin and novelty bonuses. Cheap (no model eval) — if this ceiling
+    can't beat the current Bank best, an expensive probe/retry at K_new is pointless and is skipped."""
+    rmse = ctx.q * math.sqrt(max(0, int(K_new)) / max(1, ctx.clean_u8.numel()))
+    return validator_score(ctx.q, rmse, -10.0, 10 ** 9, ctx.cap)  # margin -10 => full bonus; huge px => full novelty
+
+
 def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
-    """Deepen the margin at every probed K during the score-gated descent, so it settles at the K where
-    margin and RMSE are jointly optimal, then spend any leftover budget deepening further at that K."""
-    final_state, final_K = ReduceCardinality(ctx, flip_state, K_start, K_min, deepen_per_level=True)
-    logger.info(f"[coupled] score-peak K={final_K} margin={final_state.margin:.4f}")
-    if not _oob(ctx) and final_state.margin > -K.MARGIN_DEEPEN_TARGET:
-        deepened, _ = OptimizeFixedK(ctx, final_state, final_K, K.MAX_ITERATIONS,
-                                     deepen_target=-K.MARGIN_DEEPEN_TARGET)
-        logger.info(f"[coupled] final deepen K={final_K} margin={deepened.margin:.4f}")
+    """Three-phase score maximizer. The validator rewards a SCORE peak, not the saturation threshold, so
+    binary search is demoted to a fast boundary LOCATOR and a real score sweep decides the winner.
+
+      1) Anchor: deepen the first flip at its own K to a known SATURATING upper bound (validate the
+         bracket — if it can't saturate, there is no K_sat, so skip straight to the score sweep).
+      2) Locate K_sat: bracket-validated binary search with adaptive (current-bracket) tolerance, cheap
+         classification probes, and a single retry from a diverse parent on an ambiguous near-miss (a
+         fixed-K run can be a false negative, so `lo=mid` is not applied blindly).
+      3) Refine: sample the real score curve at K/K_sat in COUPLED_REFINE_MULTS with the full per-K
+         budget, warm-started from a small best-score parent beam.
+
+    Every probe is score-ranked into the Bank (which also holds Phase A's low-K bare flips); the returned
+    answer is the highest-score SAFE candidate, not the last binary-search state. No fixed margin-vs-RMSE
+    priority — the Bank's full score arbitrates per image."""
+    target = -K.MARGIN_DEEPEN_TARGET
+    b_iters = max(1, int(K.ITERATIONS_PER_K * K.COUPLED_BOUNDARY_ITER_FRAC))  # cheap classify probes
+    r_iters = max(1, int(K.ITERATIONS_PER_K))                                 # intensive refine probes
+    K_floor = _novelty_floor_k(K_start, K_min)
+
+    # --- Phase 1: anchor -> a validated saturating upper bound. -------------------------------------
+    anchor, _ = OptimizeFixedK(ctx, flip_state, _k_of(flip_state), r_iters, deepen_target=target)
+    parents: list = []
+    _remember_parent(ctx, parents, anchor, K.COUPLED_PARENTS)
+    hi = max(K_floor, _k_of(anchor))
+    anchor_ok = _saturates(anchor, target)
+    logger.info(f"[coupled] anchor K={_k_of(anchor)} margin={anchor.margin:.4f} saturates={anchor_ok}")
+
+    # --- Phase 2: bracket-validated binary search for K_sat (only under a real saturating anchor). ---
+    K_sat = hi
+    if anchor_ok:
+        lo, src = K_floor, anchor
+        while not _oob(ctx):
+            tol = max(int(K.KSAT_ABS_TOL), int(K.KSAT_REL_TOL * hi))   # adaptive rel + absolute floor (#2)
+            if hi - lo <= tol:
+                break
+            mid = (lo + hi) // 2
+            cand = _probe_k(ctx, src, mid, b_iters, target)
+            _remember_parent(ctx, parents, cand, K.COUPLED_PARENTS)
+            if _saturates(cand, target):
+                src, hi = cand, mid                        # smaller K still saturates -> go lower
+            elif (cand.margin <= K.COUPLED_RETRY_FRAC * target
+                  and _score_upper_bound(ctx, mid) > _bank_best_score(ctx) + K.SCORE_TOL):
+                # Near-miss whose ceiling can still beat the Bank: may be an optimizer false negative ->
+                # retry once from a diverse parent with the full budget before conceding the bracket (#5).
+                retry = _probe_k(ctx, _best_parent(parents, mid), mid, r_iters, target)
+                _remember_parent(ctx, parents, retry, K.COUPLED_PARENTS)
+                if _saturates(retry, target):
+                    src, hi = retry, mid
+                else:
+                    lo = mid
+            else:
+                lo = mid                                   # confident non-saturation (or can't beat Bank)
+            logger.info(f"[coupled] probe K={mid} margin={cand.margin:.4f} "
+                        f"score={_state_score(ctx, cand):.4f} bracket=[{lo},{hi}]")
+        K_sat = hi
+    else:
+        logger.info("[coupled] anchor did not saturate -> score-sweep around K_start (no K_sat)")
+
+    # --- Phase 3: SCREEN-then-refine (#3, #7) -> cheaply sample the curve around/below K_sat, skipping
+    #     any K whose analytic ceiling can't beat the Bank, then spend the full budget only on the best
+    #     COUPLED_REFINE_FULL screened states. Preserves broad score-curve discovery without starving the
+    #     eventual winner of optimization depth. -------------------------------------------------------
+    hi_cap = _k_of(anchor)
+    probe_ks = sorted({min(hi_cap, max(K_floor, int(round(m * K_sat)))) for m in K.COUPLED_REFINE_MULTS})
+    screened: list[tuple[float, int, State]] = []
+    for kk in probe_ks:
+        if _oob(ctx):
+            break
+        if _score_upper_bound(ctx, kk) <= _bank_best_score(ctx) + K.SCORE_TOL:
+            logger.info(f"[coupled] skip K={kk} (UB {_score_upper_bound(ctx, kk):.4f} <= bank {_bank_best_score(ctx):.4f})")
+            continue
+        cand = _probe_k(ctx, _best_parent(parents, kk), kk, b_iters, target)   # cheap screen
+        _remember_parent(ctx, parents, cand, K.COUPLED_PARENTS)
+        screened.append((_state_score(ctx, cand), kk, cand))
+        logger.info(f"[coupled] screen K={kk} margin={cand.margin:.4f} score={_state_score(ctx, cand):.4f}")
+    screened.sort(key=lambda t: t[0], reverse=True)
+    for _, kk, cand in screened[: max(1, int(K.COUPLED_REFINE_FULL))]:
+        if _oob(ctx):
+            break
+        full, _ = OptimizeFixedK(ctx, cand, kk, K.MAX_ITERATIONS, deepen_target=target)  # full budget on the best
+        _remember_parent(ctx, parents, full, K.COUPLED_PARENTS)
+        logger.info(f"[coupled] refine K={kk} margin={full.margin:.4f} score={_state_score(ctx, full):.4f}")
+
+    best = ctx.bank.best_safe
+    if best is not None:
+        logger.info(f"[coupled] K_sat~{K_sat} best=({best['nz']}ch pixels={best['pixels']} "
+                    f"margin={best['margin']:.4f} score={best['score']:.4f})")
+    else:
+        logger.info("[coupled] no safe flip banked")
 
 
 # ==========================================================================================
@@ -1282,7 +1427,7 @@ def perturb(
         skip_roundtrip=K.SKIP_ROUNDTRIP, tf32_on=K.TF32_ON, envelope=envelope,
         allow_unsafe=K.ALLOW_UNSAFE_FLIP, deadline=deadline, t_step=t_step, time_left=time_left,
         bank=Bank(), m0=m0, g0=g0.view(-1), dynamic_kappa=use_dynamic,
-        optim_seconds=(K.OPTIM_SECONDS if K.RUN_OPTIM else 0.0),
+        optim_seconds=(K.OPTIM_SECONDS if K.RUN_OPTIM else 0.0), hard_deadline=hard_deadline,
         tuner=AdaptiveTuner(),
     )
 

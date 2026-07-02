@@ -269,7 +269,7 @@ class Context:
     tf32_on: bool                # ambient cuDNN-TF32 regime for forward + backward (matches the validator)
     envelope: bool               # worst-case over the cuDNN-TF32 regime and its opposite (CUDA only)
     allow_unsafe: bool
-    deadline: float
+    deadline: float              # live budget deadline (pre-flip = hard_deadline - q2 reserve; armed to optim clock on first flip)
     t_step: float                # one fwd+bwd time, for budget gating
     time_left: Callable[[], float]
     bank: "Bank"
@@ -278,6 +278,7 @@ class Context:
     t_eval: float = 0.0          # live EMA of one full-batch eval chunk cost (set by batch_eval)
     dynamic_kappa: bool = False  # tighten the per-candidate accept cushion by the TF32 spread (envelope)
     optim_seconds: float = 0.0   # post-flip optimization budget (s); 0 => no post-flip clock
+    hard_deadline: float = 0.0   # true limit WITHOUT the q2 reserve; reclaimed the instant a flip is banked
     first_flip_time: float | None = None  # wall-clock when the first flip was banked (arms the optim deadline)
     tuner: object | None = None  # adaptive hyperparameter controller (perturb.AdaptiveTuner)
     clean_relevance: torch.Tensor | None = None  # cached clean-image feature-relevance map (invariant)

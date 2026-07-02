@@ -223,23 +223,41 @@ ITERATIONS_PER_K = _env_int("PERTURB_FW_ITERATIONS_PER_K", 60)
 # (it closes on max-iters / convergence). The instant the first flip appears, a budget of
 # OPTIM_SECONDS is armed; all optimization after the flip (further refinement + Phase E
 # sparsification) must finish within that window.
-OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 12.0)
+OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 15.0)
 
-# --- Post-flip objective (score-gated, not just L0) ---------------------------------------------
+# --- Post-flip objective (maximize the full score, use the whole budget) -------------------------
 # The validator scores total = perturbation(L∞,RMSE) + 0.03·clip(-margin/10,0,1) + 0.01·clip(px/8,0,1).
-# Since SPEED_WEIGHT=0, once everyone clusters at ~0.95 on perturbation the ranking turns on RMSE
-# (= cardinality) AND on the 0.03 margin term. Both strategies below do a SCORE-GATED cardinality
-# descent: geometrically probe smaller K and accept it only while the TOTAL score does not fall (a
-# smaller K at equal score is strictly better). Reduction stops at the score PEAK — the K where the
-# margin lost by removing one more coord costs more than the perturbation it buys — not at the
-# minimum flipping K. This is the "margin-vs-RMSE rate" made explicit. env PERTURB_POSTFLIP_STRATEGY:
-#   coupled (default): re-DEEPEN the margin at every probed K before scoring it, so the descent sees the
-#     deep-margin-at-moderate-K points and settles where score is truly maximal. Best score, more evals.
-#   strict: each rung stops at the first flip (shallow, cheaper), THEN one deepen pass at the final K.
+# perturbation(K) is ANALYTIC (RMSE=q·√(K/N)) and RISES as K falls; the margin bonus saturates at CW
+# margin <= -CEIL. So among K that still saturate the margin, score = perturbation(K)+0.04 is maximized
+# at the SMALLEST such K (=K_sat). env PERTURB_POSTFLIP_STRATEGY:
+#   coupled (default): BINARY-SEARCH K_sat — ~log probes (warm-start + deepen at K), each score-ranked
+#     into the Bank, which also holds Phase A's low-K bare flips. Lands at the peak within budget and
+#     dynamically balances margin vs RMSE per image (hard images where deep margin costs too much RMSE
+#     keep the bare flip). Much cheaper than a geometric descent that re-deepens every 10% step.
+#   strict: geometric first-flip descent (shallow rungs, cheap) then ONE deepen pass at the settled K.
 POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "coupled").strip().lower() or "coupled"
 MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
-# Accept a smaller-K candidate while its total score is within SCORE_TOL of the current best (a positive
-# tolerance lets the descent push through score noise / a shallow local dip before declaring the peak).
+KSAT_REL_TOL = _env_float("PERTURB_KSAT_REL_TOL", 0.05)   # coupled: stop binary search when (hi-lo) <= max(KSAT_ABS_TOL, this·hi)
+KSAT_ABS_TOL = _env_int("PERTURB_KSAT_ABS_TOL", 8)        # absolute tol floor so small K doesn't over-probe single coords
+# Coupled V2 = a fast saturation-boundary LOCATOR followed by a SCORE-peak refinement (the validator
+# rewards a score maximum, not the saturation threshold). Boundary probes run cheap (a fraction of the
+# per-K iters) just to classify saturate/not; refinement probes around K_sat run the full budget. A
+# near-miss (margin reached >= COUPLED_RETRY_FRAC·target) is retried once from a different warm-start
+# parent before conceding the bracket (a single fixed-K run can be a false negative). COUPLED_PARENTS is
+# a tiny beam of best-score states kept as alternate warm-start parents (breaks single-lineage path
+# dependence). COUPLED_REFINE_MULTS are the K/K_sat ratios sampled in the refinement sweep.
+# Phase 3 refinement is SCREEN-then-refine (keeps depth where it matters under the 15s budget): all
+# COUPLED_REFINE_MULTS ratios of K_sat are screened with the cheap boundary budget, then only the best
+# COUPLED_REFINE_FULL are given a full OptimizeFixedK. Ratios are <=1 (below the boundary, where the score
+# peak lives — above-boundary K has worse RMSE and is already covered by the binary-search probes). Every
+# expensive probe/retry is skipped when its analytic score upper bound can't beat the current Bank best.
+COUPLED_BOUNDARY_ITER_FRAC = _env_float("PERTURB_COUPLED_BOUNDARY_ITER_FRAC", 0.4)
+COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.95, 0.85, 0.7, 0.55))
+COUPLED_REFINE_FULL = _env_int("PERTURB_COUPLED_REFINE_FULL", 2)  # screened candidates given the full budget
+COUPLED_RETRY_FRAC = _env_float("PERTURB_COUPLED_RETRY_FRAC", 0.6)
+COUPLED_PARENTS = _env_int("PERTURB_COUPLED_PARENTS", 3)
+# strict only: accept a smaller-K rung while its total score is within SCORE_TOL of the best (a positive
+# tolerance lets the descent push through score noise / a shallow dip before declaring the peak).
 SCORE_TOL = _env_float("PERTURB_SCORE_TOL", 0.0003)
 # Novelty floor: the validator's novelty bonus saturates at NOVELTY_TARGET_PIXELS changed spatial
 # pixels; pruning below it trades ~0 perturbation gain for lost novelty. Floor cardinality reduction at
@@ -253,7 +271,7 @@ NOVELTY_TARGET_PIXELS = _env_int("ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS", 8)
 # rung. Capped at q=2 (never q>=3): q=2 tops out at ~0.77 total score, but that dwarfs the 0 of a clean
 # return (which also drags the validator's 300-sample average). Phase A only, time-boxed — a fast net.
 FALLBACK_Q2 = _env_bool("PERTURB_FALLBACK_Q2", True)
-FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 3)    # reserved quick budget for the q=2 retry
+FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 5)    # reserved q=2 budget; reclaimed the instant a q=1 flip banks
 
 # --- Adaptive hyperparameter controller ---------------------------------------------------
 # Starts every tunable knob at its env value, then watches the BEST margin over a sliding window.
