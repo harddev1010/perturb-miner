@@ -177,6 +177,13 @@ class PerturbValidator:
         self.leaderboard_reporter = LeaderboardReporter(
             enabled=bool(getattr(self.config.perturb, "leaderboard_reporting_enabled", True)),
             api_url=str(getattr(self.config.perturb, "leaderboard_api_url", C.LEADERBOARD_API_URL)),
+            last_weight_update_api_url=str(
+                getattr(
+                    self.config.perturb,
+                    "leaderboard_last_weight_update_api_url",
+                    C.LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,
+                )
+            ),
             timeout_seconds=float(getattr(self.config.perturb, "leaderboard_report_timeout_seconds", 10.0)),
             wallet=self.wallet,
             validator_hotkey=str(hotkey),
@@ -823,7 +830,6 @@ class PerturbValidator:
                 total_miners=len(self._leaderboard_miner_uids()),
                 available_miners=int(available_miner_count),
                 hotkeys=self.metagraph.hotkeys,
-                coldkeys=getattr(self.metagraph, "coldkeys", []),
                 incentives_by_uid={uid: miner_incentive(self.metagraph, uid) for uid, _ in results_by_uid},
                 score_histories=self.leaderboard_score_histories,
                 avg_window=int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),
@@ -879,7 +885,7 @@ class PerturbValidator:
             logger.warning(f"Failed to fetch burn rate from {endpoint}; using fallback burn={fallback:.4f}: {exc}")
             return fallback
 
-    def _set_weights(self) -> None:
+    def _set_weights(self, *, block: int) -> bool:
         self._log_step_start(
             "set_weights",
             history_size=self.config.perturb.history_size,
@@ -903,7 +909,7 @@ class PerturbValidator:
 
         if not eligible:
             logger.warning(f"No eligible miners with full history_size={history_size}.")
-            return
+            return False
 
         eligible.sort(key=lambda x: (x[1], -x[0]), reverse=True)
         n_eligible = len(eligible)
@@ -928,9 +934,10 @@ class PerturbValidator:
             )
             if ok:
                 logger.info("set_weights success (all zero)")
+                self.leaderboard_reporter.submit_last_weight_update(last_weight_update=block)
             else:
                 logger.error(f"set_weights failed (all zero): {msg}")
-            return
+            return bool(ok)
 
         # Ranks 3+ split the final 15% by descending rank weight, not evenly.
         for uid, share in ranked_emission_shares(positive_uids).items():
@@ -977,8 +984,10 @@ class PerturbValidator:
         )
         if ok:
             logger.info("set_weights success")
+            self.leaderboard_reporter.submit_last_weight_update(last_weight_update=block)
         else:
             logger.error(f"set_weights failed: {msg}")
+        return bool(ok)
 
     def run(self) -> None:
         self._log_step_start("validator_boot")
@@ -1203,8 +1212,8 @@ class PerturbValidator:
                 blocks_since_weights = block - self.last_weight_block
                 if blocks_since_weights >= tempo:
                     self._log_step_start("loop_maybe_set_weights", blocks_since_weights=blocks_since_weights, tempo=tempo)
-                    self._set_weights()
-                    self.last_weight_block = block
+                    if self._set_weights(block=block):
+                        self.last_weight_block = block
 
                 self.step += 1
                 time.sleep(self.config.perturb.query_interval_seconds)

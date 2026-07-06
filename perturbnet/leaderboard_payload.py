@@ -19,6 +19,22 @@ def avg_score(histories: list[list[float]], uid: int, window: int) -> float:
     return float(sum(history) / len(history))
 
 
+GRAPH_SCORE_LIMIT = 50
+
+
+def compact_graph_score(score: float) -> int | float:
+    rounded = round(float(score), 4)
+    if rounded == 0.0:
+        return 0
+    return rounded
+
+
+def score_graph(histories: list[list[float]], uid: int) -> list[int | float]:
+    if uid >= len(histories):
+        return []
+    return [compact_graph_score(score) for score in histories[uid][-GRAPH_SCORE_LIMIT:]]
+
+
 def result_status(result: Any) -> str:
     if result.reason == "success":
         return "Valid"
@@ -65,7 +81,6 @@ def build_report(
     total_miners: int,
     available_miners: int,
     hotkeys: Sequence[str],
-    coldkeys: Sequence[str],
     incentives_by_uid: dict[int, float],
     score_histories: list[list[float]],
     avg_window: int,
@@ -78,10 +93,10 @@ def build_report(
             LeaderboardMinerResult(
                 uid=int(uid),
                 hotkey=str(hotkeys[uid]) if uid < len(hotkeys) else "",
-                coldkey=str(coldkeys[uid]) if uid < len(coldkeys) else "",
                 incentive=float(incentives_by_uid.get(uid, 0.0)),
                 avg_score=avg_score(score_histories, uid, avg_window),
                 last_score=float(result.score),
+                graph=score_graph(score_histories, uid),
                 rmse=float(result.rmse),
                 norm=float(result.norm),
                 result=result_status(result),
