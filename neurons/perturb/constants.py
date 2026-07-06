@@ -73,10 +73,10 @@ Q = 1.0 / 255.0                                            # one byte in [0,1] s
 MAX_LINF_DELTA = _env_float("PERTURB_MAX_LINF_DELTA", 0.03)  # validator L∞ cap
 MIN_SSIM = _env_float("PERTURB_MIN_SSIM", 0.98)
 MIN_PSNR_DB = _env_float("PERTURB_MIN_PSNR_DB", 38.0)
-RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 4)   # deadline headroom (base)
+RESERVE_SECONDS = _env_float("PERTURB_MINER_RESERVE_SECONDS", 2)   # deadline headroom (base)
 # Reserve scales with the measured per-forward cost so larger images / models leave enough post-search
 # headroom for serialization + verification (added on top of RESERVE_SECONDS). t_step is one fwd+bwd.
-RESERVE_FWD_MULT = _env_float("PERTURB_RESERVE_FWD_MULT", 6.0)
+RESERVE_FWD_MULT = _env_float("PERTURB_RESERVE_FWD_MULT", 4.0)
 # Deadline gating. The budget guard accounts for BOTH a backward pass (t_step) and a real eval chunk
 # (t_eval, measured live): out_of_budget <=> time_left <= 2·t_step + OOT_EVAL_MARGIN·t_eval. And batch_eval
 # stops launching new chunks once time_left <= EVAL_TIME_MARGIN·t_eval, so a big candidate list can never

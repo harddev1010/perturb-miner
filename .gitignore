@@ -6,5 +6,6 @@ __pycache__/
 *.npz
 logs/
 scripts/miner.env
+scripts/miner.prod.env
 scripts/validator.env
 

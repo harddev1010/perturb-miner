@@ -34,6 +34,11 @@ logger = pylogging.getLogger(__name__)
 # debugging/replay. Override the location with PERTURB_ERROR_CASES_DIR.
 _ERROR_CASES_DIR = os.getenv("PERTURB_ERROR_CASES_DIR", "/workspace/Perturb_error_cases")
 
+# When perturb() DOES find a flip but only at a coarser byte step than the ideal L∞=1/255 (the q=2
+# fallback, or a large min_delta forcing k_min>=2), dump it here. These are processed properly but sit
+# in the lower-scoring q>1 tail — worth studying offline. Override with PERTURB_NONQ1_CASES_DIR.
+_NONQ1_CASES_DIR = os.getenv("PERTURB_NONQ1_CASES_DIR", "/workspace/Perturb_nonq1_cases")
+
 # Every incoming AttackChallenge is also archived here (one JSON per request). Only the newest
 # _ATTACK_CHALLENGES_KEEP files are retained; older ones are rotated into _ATTACK_HISTORY_DIR.
 _ATTACK_CHALLENGES_DIR = os.getenv("PERTURB_ATTACK_CHALLENGES_DIR", "/workspace/Perturb_attack_challenges")
@@ -93,15 +98,20 @@ def _store_attack_challenge(synapse: AttackChallenge) -> None:
         logger.warning(f"[attack-challenge] failed to store challenge task={getattr(synapse, 'task_id', 'unknown')}: {err}")
 
 
-def _dump_error_case(synapse: AttackChallenge, reason: str) -> None:
-    """Persist a no-flip challenge's AttackChallenge input params to {timestamp}_{task_id}.json.
-    Best-effort: failures are logged, never raised, so they can't disturb the response."""
+def _dump_case(synapse: AttackChallenge, reason: str, directory: str,
+               tag: str = "case", extra: typing.Optional[dict] = None) -> None:
+    """Persist a challenge's AttackChallenge input params to {timestamp}_{task_id}.json under `directory`.
+    `extra` merges extra fields (e.g. the measured q / L∞ / score) into the payload. Best-effort:
+    failures are logged, never raised, so they can't disturb the response."""
     try:
-        os.makedirs(_ERROR_CASES_DIR, exist_ok=True)
+        os.makedirs(directory, exist_ok=True)
         task_id = str(getattr(synapse, "task_id", "unknown"))
         safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id) or "unknown"
         timestamp = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(_ERROR_CASES_DIR, f"{timestamp}_{safe_task}.json")
+        path = os.path.join(directory, f"{timestamp}_{safe_task}.json")
+        # Several requests can share a task_id / land in the same second; don't clobber.
+        if os.path.exists(path):
+            path = os.path.join(directory, f"{timestamp}_{safe_task}_{os.urandom(3).hex()}.json")
         payload = {
             "reason": reason,
             "saved_at": timestamp,
@@ -114,11 +124,18 @@ def _dump_error_case(synapse: AttackChallenge, reason: str) -> None:
             "timeout_seconds": getattr(synapse, "timeout_seconds", None),
             "clean_image_b64": getattr(synapse, "clean_image_b64", None),
         }
+        if extra:
+            payload.update(extra)
         with open(path, "w", encoding="utf-8") as f:
             json.dump(payload, f)
-        logger.info(f"[error-case] saved no-flip challenge -> {path} (reason={reason})")
+        logger.info(f"[{tag}] saved challenge -> {path} (reason={reason})")
     except Exception as err:
-        logger.warning(f"[error-case] failed to save challenge task={getattr(synapse, 'task_id', 'unknown')}: {err}")
+        logger.warning(f"[{tag}] failed to save challenge task={getattr(synapse, 'task_id', 'unknown')}: {err}")
+
+
+def _dump_error_case(synapse: AttackChallenge, reason: str) -> None:
+    """Dump a no-flip / exception challenge to _ERROR_CASES_DIR for offline replay."""
+    _dump_case(synapse, reason, _ERROR_CASES_DIR, tag="error-case")
 
 
 def _warmup(model: torch.nn.Module, device: torch.device) -> None:
@@ -286,7 +303,7 @@ class PerturbMiner:
             norm_type=getattr(synapse, "norm_type", "unknown"),
             epsilon=getattr(synapse, "epsilon", "unknown"),
         )
-        # _store_attack_challenge(synapse)
+        _store_attack_challenge(synapse)
         if synapse.norm_type != "Linf":
             logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
             synapse.perturbed_image_b64 = synapse.clean_image_b64
@@ -341,6 +358,16 @@ class PerturbMiner:
                 cw = cw_margin(adv_logits, target_index)  # true - best_other; validator margin = -cw
                 changed_pixels = int((diff.abs() > (0.5 / 255.0)).any(dim=0).sum().item())
                 full_score = validator_score(norm, rmse, cw, changed_pixels, min(epsilon, MAX_LINF_DELTA))
+                # Flip found, but at a coarser byte step than the ideal L∞=1/255 (q=2 fallback, or a
+                # large min_delta forcing k_min>=2). Processed properly yet in the lower-scoring q>1
+                # tail — dump it (enriched with the measured q/L∞/RMSE/score) for offline study.
+                k_used = int(round(norm * 255.0))
+                if k_used > 1:
+                    _dump_case(
+                        synapse, f"q{k_used}_flip", _NONQ1_CASES_DIR, tag="nonq1-case",
+                        extra={"k": k_used, "linf": norm, "rmse": rmse, "score": full_score,
+                               "margin": float(-cw), "changed_pixels": changed_pixels},
+                    )
             logger.info(
                 f"Finished task={getattr(synapse, 'task_id', 'unknown')} dim={h}x{w} "
                 f"rmse={rmse:.6f} pert_score={pert_score:.4f} score={full_score:.4f} "
