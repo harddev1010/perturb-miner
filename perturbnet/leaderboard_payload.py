@@ -25,7 +25,7 @@ GRAPH_SCORE_LIMIT = 100
 def score_graph(histories: list[list[float]], uid: int) -> list[float]:
     if uid >= len(histories):
         return []
-    return [round(float(score), 6) for score in histories[uid][-GRAPH_SCORE_LIMIT:]]
+    return [round(float(score), 4) for score in histories[uid][-GRAPH_SCORE_LIMIT:]]
 
 
 def result_status(result: Any) -> str:
