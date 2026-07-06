@@ -20,7 +20,7 @@ class LeaderboardMinerResult:
     incentive: float
     avg_score: float
     last_score: float
-    graph: list[float]
+    graph: list[int | float]
     rmse: float
     norm: float
     result: str

@@ -19,13 +19,20 @@ def avg_score(histories: list[list[float]], uid: int, window: int) -> float:
     return float(sum(history) / len(history))
 
 
-GRAPH_SCORE_LIMIT = 100
+GRAPH_SCORE_LIMIT = 50
 
 
-def score_graph(histories: list[list[float]], uid: int) -> list[float]:
+def compact_graph_score(score: float) -> int | float:
+    rounded = round(float(score), 4)
+    if rounded == 0.0:
+        return 0
+    return rounded
+
+
+def score_graph(histories: list[list[float]], uid: int) -> list[int | float]:
     if uid >= len(histories):
         return []
-    return [round(float(score), 4) for score in histories[uid][-GRAPH_SCORE_LIMIT:]]
+    return [compact_graph_score(score) for score in histories[uid][-GRAPH_SCORE_LIMIT:]]
 
 
 def result_status(result: Any) -> str:
