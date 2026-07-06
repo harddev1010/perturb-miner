@@ -830,7 +830,6 @@ class PerturbValidator:
                 total_miners=len(self._leaderboard_miner_uids()),
                 available_miners=int(available_miner_count),
                 hotkeys=self.metagraph.hotkeys,
-                coldkeys=getattr(self.metagraph, "coldkeys", []),
                 incentives_by_uid={uid: miner_incentive(self.metagraph, uid) for uid, _ in results_by_uid},
                 score_histories=self.leaderboard_score_histories,
                 avg_window=int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),

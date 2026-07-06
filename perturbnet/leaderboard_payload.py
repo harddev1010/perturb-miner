@@ -19,10 +19,13 @@ def avg_score(histories: list[list[float]], uid: int, window: int) -> float:
     return float(sum(history) / len(history))
 
 
-def score_graph(histories: list[list[float]], uid: int, window: int) -> list[float]:
+GRAPH_SCORE_LIMIT = 100
+
+
+def score_graph(histories: list[list[float]], uid: int) -> list[float]:
     if uid >= len(histories):
         return []
-    return [float(score) for score in histories[uid][-int(window):]]
+    return [round(float(score), 6) for score in histories[uid][-GRAPH_SCORE_LIMIT:]]
 
 
 def result_status(result: Any) -> str:
@@ -71,7 +74,6 @@ def build_report(
     total_miners: int,
     available_miners: int,
     hotkeys: Sequence[str],
-    coldkeys: Sequence[str],
     incentives_by_uid: dict[int, float],
     score_histories: list[list[float]],
     avg_window: int,
@@ -84,11 +86,10 @@ def build_report(
             LeaderboardMinerResult(
                 uid=int(uid),
                 hotkey=str(hotkeys[uid]) if uid < len(hotkeys) else "",
-                coldkey=str(coldkeys[uid]) if uid < len(coldkeys) else "",
                 incentive=float(incentives_by_uid.get(uid, 0.0)),
                 avg_score=avg_score(score_histories, uid, avg_window),
                 last_score=float(result.score),
-                graph=score_graph(score_histories, uid, avg_window),
+                graph=score_graph(score_histories, uid),
                 rmse=float(result.rmse),
                 norm=float(result.norm),
                 result=result_status(result),

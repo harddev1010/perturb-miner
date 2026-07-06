@@ -17,7 +17,6 @@ logger = logging.getLogger(__name__)
 class LeaderboardMinerResult:
     uid: int
     hotkey: str
-    coldkey: str
     incentive: float
     avg_score: float
     last_score: float
@@ -179,7 +178,7 @@ class LeaderboardReporter:
         }
         # Serialize once, sign these exact bytes, and POST the same bytes with
         # data=body. Do not use requests.post(json=...), which re-serializes.
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         signature = self._sign_payload(body)
         response = requests.post(
             self.api_url,
@@ -192,14 +191,14 @@ class LeaderboardReporter:
             timeout=self.timeout_seconds,
         )
         if response.status_code < 200 or response.status_code >= 300:
-            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]}")
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:200]} body_bytes={len(body)}")
 
     def _post_last_weight_update(self, *, update: LeaderboardLastWeightUpdate) -> None:
         payload = {
             "validator_hotkey": update.validator_hotkey,
             "last_weight_update": int(update.last_weight_update),
         }
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         signature = self._sign_payload(body)
         response = requests.post(
             self.last_weight_update_api_url,
