@@ -257,7 +257,7 @@ KSAT_ABS_TOL = _env_int("PERTURB_KSAT_ABS_TOL", 8)        # absolute tol floor s
 # peak lives — above-boundary K has worse RMSE and is already covered by the binary-search probes). Every
 # expensive probe/retry is skipped when its analytic score upper bound can't beat the current Bank best.
 COUPLED_BOUNDARY_ITER_FRAC = _env_float("PERTURB_COUPLED_BOUNDARY_ITER_FRAC", 0.4)
-COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.85, 0.7, 0.55, 0.4, 0.25))
+COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.85, 0.7, 0.55, 0.4))
 COUPLED_REFINE_FULL = _env_int("PERTURB_COUPLED_REFINE_FULL", 2)  # screened candidates given the full budget
 COUPLED_RETRY_FRAC = _env_float("PERTURB_COUPLED_RETRY_FRAC", 0.6)
 COUPLED_PARENTS = _env_int("PERTURB_COUPLED_PARENTS", 3)
