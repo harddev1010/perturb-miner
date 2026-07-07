@@ -1014,11 +1014,18 @@ def _reached(margin: float, deepen_target: float | None) -> bool:
 
 
 def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iterations: int,
-                   deepen_target: float | None = None) -> tuple[State, bool]:
+                   deepen_target: float | None = None, return_state: bool = False):
+    """Fixed-K optimizer (Phases B/C/D). Returns (best_state, success). With return_state=True also returns
+    the LIVE end-of-run state as a third element — used by the chunked QuickAnchor to CONTINUE the optimizer
+    trajectory across chunks (best_state is the deepest snapshot; resuming from it would discard the
+    temporarily-uphill exploration that precedes a delayed nonlinear margin drop)."""
     state = copy.deepcopy(initial_state)
     best_state = copy.deepcopy(initial_state)
     margin_history: list[float] = []
     turnover_history: list[float] = []
+
+    def _out(ok: bool):
+        return (best_state, ok, state) if return_state else (best_state, ok)
 
     for iteration in range(1, max_iterations + 1):
         if _oob(ctx):
@@ -1033,7 +1040,7 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
             ctx.tuner.observe(best_state.margin)
         if _reached(best_state.margin, deepen_target):
             logger.info(f"[optimK] flip at K={K_cur} iter={iteration} margin={best_state.margin:.4f}")
-            return best_state, True
+            return _out(True)
 
         if iteration % max(1, int(_p(ctx, "SWAP_INTERVAL"))) == 0 and not _oob(ctx):
             block = _scheduled_block_size(ctx, iteration, K_cur, max_iterations)
@@ -1041,7 +1048,7 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
             if state.margin < best_state.margin:
                 best_state = copy.deepcopy(state)
             if _reached(best_state.margin, deepen_target):
-                return best_state, True
+                return _out(True)
 
         if ShouldRestart(margin_history, turnover_history):
             state = PartialRestart(ctx, state, K_cur)
@@ -1050,9 +1057,9 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
             if state.margin < best_state.margin:
                 best_state = copy.deepcopy(state)
             if _reached(best_state.margin, deepen_target):
-                return best_state, True
+                return _out(True)
 
-    return best_state, best_state.margin < 0
+    return _out(best_state.margin < 0)
 
 
 def _scheduled_block_size(ctx: Context, iteration: int, K_cur: int, max_iterations: int) -> int:
@@ -1278,12 +1285,65 @@ def _score_upper_bound(ctx: Context, K_new: int) -> float:
     return validator_score(ctx.q, rmse, -10.0, 10 ** 9, ctx.cap)  # margin -10 => full bonus; huge px => full novelty
 
 
+def _quick_anchor(ctx: Context, flip_state: State, target: float) -> tuple[State, bool]:
+    """Budget-aware anchor (coupled Phase 1). Deepen the first flip at its OWN K toward `target`, giving
+    the optimizer a REAL chance to reach CEIL (margin deepening here is non-monotonic and often delayed)
+    while still bailing on genuinely hopeless images so the K/RMSE search isn't starved.
+
+    Design (see constants ANCHOR_*):
+      * warmup     — run at least ANCHOR_MIN_ITERS before ANY slope-based early stop;
+      * trajectory — continue each chunk from the LIVE state (return_state=True), NOT the best-margin
+                     snapshot, so a temporarily-uphill run that precedes a delayed drop is not discarded;
+      * near-CEIL  — once best margin <= -ANCHOR_PUSH_MARGIN, never stall-bail (almost saturated, finish);
+      * stall      — post-warmup, stop after ANCHOR_STALL_CHUNKS chunks whose best-margin gain stayed
+                     < ANCHOR_MIN_MARGIN_GAIN (~a flat 20-iter window); at fixed K the best-margin slope
+                     IS the score slope, so this is the slope + score-ROI gate in one;
+      * caps       — hard ANCHOR_MAX_ITERS, and post-warmup a fraction-of-budget time cap (ANCHOR_MAX_FRAC).
+
+    Returns (best_anchor, saturated). Every probe is folded into the score-ranked Bank; the returned
+    best_anchor is the deepest snapshot (a good warm-start parent) — the K sweep decides the winner."""
+    if _saturates(flip_state, target):                       # already deep — bonus ~maxed, no work
+        return flip_state, True
+    Kc = _k_of(flip_state)
+    chunk = max(1, int(K.ANCHOR_CHUNK_ITERS))
+    min_iters = max(0, int(K.ANCHOR_MIN_ITERS))
+    max_iters = max(min_iters, chunk, int(K.ANCHOR_MAX_ITERS))
+    push = -abs(float(K.ANCHOR_PUSH_MARGIN))                  # best margin <= push => never stall-bail
+    t_cap = time.time() + max(0.0, K.ANCHOR_MAX_FRAC) * max(0.0, ctx.time_left())
+    live = best = flip_state                                  # `live` carries the trajectory; `best` the depth
+    prev_margin = best.margin
+    weak = done = 0
+    while done < max_iters and not _oob(ctx):
+        best_c, _, live = OptimizeFixedK(ctx, live, Kc, chunk, deepen_target=target, return_state=True)
+        done += chunk
+        if best_c.margin < best.margin:
+            best = best_c
+        if _saturates(best, target):
+            logger.info(f"[quick-anchor] saturated iter={done} margin={best.margin:.4f}")
+            return best, True
+        gain = prev_margin - best.margin                     # >= 0: deepening of the BEST margin this chunk
+        prev_margin = best.margin
+        weak = weak + 1 if gain < K.ANCHOR_MIN_MARGIN_GAIN else 0
+        # Early stops apply only AFTER the warmup and only while NOT already near CEIL.
+        if done >= min_iters and best.margin > push:
+            if time.time() >= t_cap:
+                logger.info(f"[quick-anchor] time cap iter={done} margin={best.margin:.4f} -> score/K search")
+                break
+            if weak >= max(1, int(K.ANCHOR_STALL_CHUNKS)):
+                logger.info(f"[quick-anchor] stalled (gain<{K.ANCHOR_MIN_MARGIN_GAIN} x{weak}) iter={done} "
+                            f"margin={best.margin:.4f} -> score/K search")
+                break
+    return best, _saturates(best, target)
+
+
 def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
     """Three-phase score maximizer. The validator rewards a SCORE peak, not the saturation threshold, so
     binary search is demoted to a fast boundary LOCATOR and a real score sweep decides the winner.
 
-      1) Anchor: deepen the first flip at its own K to a known SATURATING upper bound (validate the
-         bracket — if it can't saturate, there is no K_sat, so skip straight to the score sweep).
+      1) Anchor: deepen the first flip at its own K toward a SATURATING upper bound, but BUDGET-AWARE
+         (QuickAnchor) — capped in iters/time and stopped on a weak margin slope, so a hard/unreachable
+         CEIL can't consume the whole window. If it can't saturate, there is no K_sat -> score sweep with
+         a bounded per-K refine.
       2) Locate K_sat: bracket-validated binary search with adaptive (current-bracket) tolerance, cheap
          classification probes, and a single retry from a diverse parent on an ambiguous near-miss (a
          fixed-K run can be a false negative, so `lo=mid` is not applied blindly).
@@ -1298,12 +1358,16 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
     r_iters = max(1, int(K.ITERATIONS_PER_K))                                 # intensive refine probes
     K_floor = _novelty_floor_k(K_start, K_min)
 
-    # --- Phase 1: anchor -> a validated saturating upper bound. -------------------------------------
-    anchor, _ = OptimizeFixedK(ctx, flip_state, _k_of(flip_state), r_iters, deepen_target=target)
+    # --- Phase 1: anchor -> a validated saturating upper bound. Budget-aware: deepen only until the
+    #     marginal return dries up (QuickAnchor), so a hard/unreachable CEIL can't eat the whole window. -
     parents: list = []
+    if K.COUPLED_QUICK_ANCHOR:
+        anchor, anchor_ok = _quick_anchor(ctx, flip_state, target)
+    else:
+        anchor, _ = OptimizeFixedK(ctx, flip_state, _k_of(flip_state), r_iters, deepen_target=target)
+        anchor_ok = _saturates(anchor, target)
     _remember_parent(ctx, parents, anchor, K.COUPLED_PARENTS)
     hi = max(K_floor, _k_of(anchor))
-    anchor_ok = _saturates(anchor, target)
     logger.info(f"[coupled] anchor K={_k_of(anchor)} margin={anchor.margin:.4f} saturates={anchor_ok}")
 
     # --- Phase 2: bracket-validated binary search for K_sat (only under a real saturating anchor). ---
@@ -1338,9 +1402,14 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
         logger.info("[coupled] anchor did not saturate -> score-sweep around K_start (no K_sat)")
 
     # --- Phase 3: SCREEN-then-refine (#3, #7) -> cheaply sample the curve around/below K_sat, skipping
-    #     any K whose analytic ceiling can't beat the Bank, then spend the full budget only on the best
+    #     any K whose analytic ceiling can't beat the Bank, then spend the budget only on the best
     #     COUPLED_REFINE_FULL screened states. Preserves broad score-curve discovery without starving the
-    #     eventual winner of optimization depth. -------------------------------------------------------
+    #     eventual winner of optimization depth. The per-candidate refine budget is decided by how close
+    #     that candidate ALREADY is to CEIL (not by whether the anchor saturated): a candidate at CW margin
+    #     <= -COUPLED_REFINE_DEEP_MARGIN is close enough that finishing to CEIL is worth the full budget
+    #     (and it returns early on reaching it anyway); a shallow one gets a bounded ITERATIONS_PER_K pass
+    #     so it can't grind an unreachable CEIL. This lets a good candidate recover even when the anchor
+    #     itself fell short. The score-ranked Bank keeps the true best K either way. --------------------
     hi_cap = _k_of(anchor)
     probe_ks = sorted({min(hi_cap, max(K_floor, int(round(m * K_sat)))) for m in K.COUPLED_REFINE_MULTS})
     screened: list[tuple[float, int, State]] = []
@@ -1358,9 +1427,11 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
     for _, kk, cand in screened[: max(1, int(K.COUPLED_REFINE_FULL))]:
         if _oob(ctx):
             break
-        full, _ = OptimizeFixedK(ctx, cand, kk, K.MAX_ITERATIONS, deepen_target=target)  # full budget on the best
+        # Full budget only for candidates already near CEIL; bounded otherwise (per-candidate, not blanket).
+        cand_iters = K.MAX_ITERATIONS if cand.margin <= -K.COUPLED_REFINE_DEEP_MARGIN else max(1, int(K.ITERATIONS_PER_K))
+        full, _ = OptimizeFixedK(ctx, cand, kk, cand_iters, deepen_target=target)
         _remember_parent(ctx, parents, full, K.COUPLED_PARENTS)
-        logger.info(f"[coupled] refine K={kk} margin={full.margin:.4f} score={_state_score(ctx, full):.4f}")
+        logger.info(f"[coupled] refine K={kk} margin={full.margin:.4f} score={_state_score(ctx, full):.4f} iters={cand_iters}")
 
     best = ctx.bank.best_safe
     if best is not None:

@@ -157,13 +157,13 @@ IGNORE_TIMEOUT = _env_bool("PERTURB_IGNORE_TIMEOUT", False)  # ignore the deadli
 # RUN_OPTIM is on. Default on. Set to 0 to let the optimizer run (then OPTIM_SECONDS caps the post-flip work).
 RETURN_FIRST_FLIP = _env_bool("PERTURB_RETURN_FIRST_FLIP", False)
 # Phase-A support sizing + seeding breadth.
-K_INIT_FRAC = _env_float("PERTURB_K_INIT_FRAC", 0.6)    # initial support as a fraction of N channels
-K_MIN_FRAC = _env_float("PERTURB_K_MIN_FRAC", 0.0005)     # cardinality-reduction floor (fraction of N)
-TARGET_COUNT = _env_int("PERTURB_FW_TARGET_COUNT", 4)    # target-specific clean gradients in Phase A
+K_INIT_FRAC = _env_float("PERTURB_K_INIT_FRAC", 0.7)    # initial support as a fraction of N channels
+K_MIN_FRAC = _env_float("PERTURB_K_MIN_FRAC", 0.001)     # cardinality-reduction floor (fraction of N)
+TARGET_COUNT = _env_int("PERTURB_FW_TARGET_COUNT", 3)    # target-specific clean gradients in Phase A
 RANDOM_START_COUNT = _env_int("PERTURB_FW_RANDOM_STARTS", 2)  # random-start gradient reservoirs
 RANDOM_START_FRAC = _env_float("PERTURB_FW_RANDOM_FRAC", 0.05)  # density of each random-start mask
 BIG_INIT = _env_float("PERTURB_FW_BIG_INIT", 2.0)        # mask-logit boost for the seeded support
-MASK_NOISE = _env_float("PERTURB_FW_MASK_NOISE", 0.005)   # small random noise on mask logits
+MASK_NOISE = _env_float("PERTURB_FW_MASK_NOISE", 0.002)   # small random noise on mask logits
 # Batched gradients: compute clean + targeted + random-start gradients in ONE forward+backward over a
 # replicated-input batch instead of ~9 sequential backwards (T1.2). Big Phase-A speedup on GPU.
 BATCHED_GRADS = _env_bool("PERTURB_FW_BATCHED_GRADS", True)
@@ -174,7 +174,7 @@ RANK_FUSION = _env_bool("PERTURB_FW_RANK_FUSION", True)
 # them in the same batched pass; the Bank keeps the sparsest flipping rung, so you land sparse directly
 # instead of shrinking from K_init. Falls through to the fixed-K optimizer if no rung flips.
 GROW_LADDER = _env_bool("PERTURB_FW_GROW_LADDER", True)
-GROW_RUNGS = _env_floats("PERTURB_FW_GROW_RUNGS", (0.002, 0.005, 0.01, 0.05, 0.1, 0.3, 0.6))  # fractions of N
+GROW_RUNGS = _env_floats("PERTURB_FW_GROW_RUNGS", (0.005, 0.01, 0.05, 0.1, 0.2, 0.4, 0.7))  # fractions of N
 GROW_VARIANTS = _env_int("PERTURB_FW_GROW_VARIANTS", 1)  # near-tie randomized order variants per rung
 
 # --- Feature guidance (Q1: feature-guided candidate selection) ----------------------------
@@ -190,29 +190,29 @@ FEATURE_PIXEL_QUOTA_FRAC = _env_float("PERTURB_FEATURE_PIXEL_QUOTA_FRAC", 0.5)  
 FEATURE_REFRESH_INTERVAL = _env_int("PERTURB_FEATURE_REFRESH_INTERVAL", 8)  # refresh during Phase B/C
 
 # --- Phase B (dynamic mask + sign optimization) -------------------------------------------
-ETA_MASK = _env_float("PERTURB_FW_ETA_MASK", 3.0)        # mask-logit learning rate
+ETA_MASK = _env_float("PERTURB_FW_ETA_MASK", 4.0)        # mask-logit learning rate
 SIGN_MOMENTUM = _env_float("PERTURB_FW_SIGN_MOMENTUM", 0.9)
 HISTORY_BETA = _env_float("PERTURB_FW_HISTORY_BETA", 0.9)  # path-EMA decay
 TEMPERATURE = _env_float("PERTURB_FW_TEMPERATURE", 1.0)  # straight-through sigmoid temperature
 MAX_ITERATIONS = _env_int("PERTURB_FW_MAX_ITERATIONS", 200)  # Phase B-D iterations per fixed K
 
 # --- Phase C (exact block swap) -----------------------------------------------------------
-SWAP_INTERVAL = _env_int("PERTURB_FW_SWAP_INTERVAL", 5)  # block-swap cadence (iterations)
-PROPOSAL_COUNT = _env_int("PERTURB_FW_PROPOSAL_COUNT", 32)  # exact swap proposals per round
+SWAP_INTERVAL = _env_int("PERTURB_FW_SWAP_INTERVAL", 4)  # block-swap cadence (iterations)
+PROPOSAL_COUNT = _env_int("PERTURB_FW_PROPOSAL_COUNT", 16)  # exact swap proposals per round
 # Block size = how many coords are swapped in/out per round. By default it stays a FLAT fraction of
 # K (BLOCK_FRAC), floored at BLOCK_MIN, so the step does NOT shrink while still searching for a flip.
 # Set BLOCK_ANNEAL=1 to recover the old iteration-thirds taper (0.05 -> 0.02 -> 0.005 of K), which is
 # only useful once a flip already exists and you are sparsifying.
-BLOCK_FRAC = _env_float("PERTURB_FW_BLOCK_FRAC", 0.1)   # block as a fraction of K (flat by default)
+BLOCK_FRAC = _env_float("PERTURB_FW_BLOCK_FRAC", 0.15)   # block as a fraction of K (flat by default)
 BLOCK_MIN = _env_int("PERTURB_FW_BLOCK_MIN", 256)         # floor on block size (keeps steps from going tiny)
 BLOCK_ANNEAL = _env_bool("PERTURB_FW_BLOCK_ANNEAL", False)  # taper the block over iterations (sparsify mode)
 
 # --- Phase D (partial restart) ------------------------------------------------------------
-RESTART_PATIENCE = _env_int("PERTURB_FW_RESTART_PATIENCE", 8)
+RESTART_PATIENCE = _env_int("PERTURB_FW_RESTART_PATIENCE", 10)
 RESTART_MIN_IMPROVE = _env_float("PERTURB_FW_RESTART_MIN_IMPROVE", 1e-3)
 RESTART_TURNOVER_THRESH = _env_float("PERTURB_FW_RESTART_TURNOVER", 0.05)
 RESTART_FRACTION = _env_float("PERTURB_FW_RESTART_FRACTION", 0.1)
-RESTART_PROPOSALS = _env_int("PERTURB_FW_RESTART_PROPOSALS", 64)
+RESTART_PROPOSALS = _env_int("PERTURB_FW_RESTART_PROPOSALS", 48)
 
 # --- Phase E (cardinality continuation) ---------------------------------------------------
 REDUCTION_FRACTION = _env_float("PERTURB_FW_REDUCTION_FRACTION", 0.1)
@@ -223,7 +223,7 @@ ITERATIONS_PER_K = _env_int("PERTURB_FW_ITERATIONS_PER_K", 60)
 # (it closes on max-iters / convergence). The instant the first flip appears, a budget of
 # OPTIM_SECONDS is armed; all optimization after the flip (further refinement + Phase E
 # sparsification) must finish within that window.
-OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 15.0)
+OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 20.0)
 
 # --- Post-flip objective (maximize the full score, use the whole budget) -------------------------
 # The validator scores total = perturbation(L∞,RMSE) + 0.03·clip(-margin/10,0,1) + 0.01·clip(px/8,0,1).
@@ -257,10 +257,36 @@ KSAT_ABS_TOL = _env_int("PERTURB_KSAT_ABS_TOL", 8)        # absolute tol floor s
 # peak lives — above-boundary K has worse RMSE and is already covered by the binary-search probes). Every
 # expensive probe/retry is skipped when its analytic score upper bound can't beat the current Bank best.
 COUPLED_BOUNDARY_ITER_FRAC = _env_float("PERTURB_COUPLED_BOUNDARY_ITER_FRAC", 0.4)
-COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.95, 0.85, 0.7, 0.55))
+COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.85, 0.7, 0.55, 0.4, 0.25))
 COUPLED_REFINE_FULL = _env_int("PERTURB_COUPLED_REFINE_FULL", 2)  # screened candidates given the full budget
 COUPLED_RETRY_FRAC = _env_float("PERTURB_COUPLED_RETRY_FRAC", 0.6)
 COUPLED_PARENTS = _env_int("PERTURB_COUPLED_PARENTS", 3)
+# Budget-aware anchor (coupled Phase 1). The saturating anchor deepens the FIRST flip at its own K to
+# CW margin <= CEIL. On a robust image where CEIL is slow/unreachable, a full-budget anchor can eat the
+# whole post-flip window buying at most the 0.03 margin bonus while the K/RMSE search — which may raise
+# score more — starves. BUT margin deepening in this optimizer is NON-monotonic and often DELAYED (block
+# swaps / sign turnover pay off only after tens of iters), so a too-eager early stop bails at margin ~-4/-5
+# on images that would have reached CEIL. So: (a) always give the anchor a real chance — run at least
+# ANCHOR_MIN_ITERS before ANY slope-based early stop; (b) preserve the optimizer trajectory across chunks
+# (continue from the LIVE state, not the best-margin snapshot — see _quick_anchor), so delayed nonlinear
+# drops are not thrown away; (c) never bail once the margin is already close to CEIL (<= -ANCHOR_PUSH_MARGIN
+# it is nearly saturated — finish it); (d) only after the warmup, stop on a sustained stall (margin gain
+# < ANCHOR_MIN_MARGIN_GAIN for ANCHOR_STALL_CHUNKS chunks in a row => ~a 20-iter flat window) or the
+# iter/time caps. Whatever depth it reached is a valid anchor; the score-ranked Bank + K sweep take over.
+# Set the gate off to restore the old fixed full-budget anchor.
+COUPLED_QUICK_ANCHOR = _env_bool("PERTURB_COUPLED_QUICK_ANCHOR", True)
+ANCHOR_CHUNK_ITERS = _env_int("PERTURB_ANCHOR_CHUNK_ITERS", 5)         # iters per slope-check chunk (small: fine stall resolution)
+ANCHOR_MIN_ITERS = _env_int("PERTURB_ANCHOR_MIN_ITERS", 30)          # never slope-bail before this many iters (give delayed deepening a chance)
+ANCHOR_MAX_ITERS = _env_int("PERTURB_ANCHOR_MAX_ITERS", 45)          # hard cap on total anchor iters
+ANCHOR_MAX_FRAC = _env_float("PERTURB_ANCHOR_MAX_FRAC", 0.20)        # post-warmup cap: fraction of remaining post-flip budget
+ANCHOR_MIN_MARGIN_GAIN = _env_float("PERTURB_ANCHOR_MIN_MARGIN_GAIN", 0.1)  # min best-|margin| drop/chunk to count as progress
+ANCHOR_STALL_CHUNKS = _env_int("PERTURB_ANCHOR_STALL_CHUNKS", 3)     # consecutive weak chunks (post-warmup) before bailing
+ANCHOR_PUSH_MARGIN = _env_float("PERTURB_ANCHOR_PUSH_MARGIN", 8.0)   # once best margin <= -this, never stall-bail (close to CEIL)
+# Phase-3 refine budget is decided PER CANDIDATE by how close it already is to CEIL, not by whether the
+# anchor saturated: a screened candidate at CW margin <= -COUPLED_REFINE_DEEP_MARGIN is close enough to be
+# worth the full MAX_ITERATIONS deepen; a shallow one gets the bounded ITERATIONS_PER_K pass so it can't
+# grind an unreachable CEIL. This lets a good candidate recover even when the anchor itself fell short.
+COUPLED_REFINE_DEEP_MARGIN = _env_float("PERTURB_COUPLED_REFINE_DEEP_MARGIN", 6.0)
 
 # --- INNER support-quality refinement (all strategies, after the K-search) -----------------------
 # The K-search picks a good cardinality; it does NOT guarantee the best coordinates/signs AT that K
@@ -298,7 +324,7 @@ FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 5)    # reserved
 # relaxes a level back toward the env baseline. level L scales a knob by TUNE_FACTOR**L (capped).
 # Higher TEMPERATURE at high levels also de-saturates the BIG_INIT logits, unfreezing Phase B.
 ADAPTIVE_TUNE = _env_bool("PERTURB_ADAPTIVE_TUNE", True)   # enable the controller (active during optim)
-TUNE_INTERVAL = _env_int("PERTURB_TUNE_INTERVAL", 40)     # optim iterations per evaluation window
+TUNE_INTERVAL = _env_int("PERTURB_TUNE_INTERVAL", 60)     # optim iterations per evaluation window
 TUNE_MIN_IMPROVE = _env_float("PERTURB_TUNE_MIN_IMPROVE", 0.02)  # abs best-margin drop/window => progress
 TUNE_MIN_REL = _env_float("PERTURB_TUNE_MIN_REL", 0.01)   # relative drop/window => progress
 TUNE_GOOD_REL = _env_float("PERTURB_TUNE_GOOD_REL", 0.05)  # relax a level when relative drop exceeds this
