@@ -1023,6 +1023,7 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
     best_state = copy.deepcopy(initial_state)
     margin_history: list[float] = []
     turnover_history: list[float] = []
+    stall_win: list[float] = []   # C2: sliding best-margin window for the deepen early-stop
 
     def _out(ok: bool):
         return (best_state, ok, state) if return_state else (best_state, ok)
@@ -1057,6 +1058,22 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
             if state.margin < best_state.margin:
                 best_state = copy.deepcopy(state)
             if _reached(best_state.margin, deepen_target):
+                return _out(True)
+
+        # C2: diminishing-returns early stop for standalone deepen calls (deepen_target set). Once a
+        # good-enough margin (<= -DEEPEN_STALL_FLOOR) is banked AND it has stalled over the window, return
+        # so the caller redirects the rest of the budget to the RMSE (cardinality) search. The window is
+        # larger than ANCHOR_CHUNK_ITERS, so this never fires inside _quick_anchor's chunks (that path runs
+        # its own stall logic). FIND (deepen_target None) is exempt — it already stops at the first flip.
+        if (K.DEEPEN_STALL_STOP and deepen_target is not None
+                and best_state.margin <= -K.DEEPEN_STALL_FLOOR):
+            stall_win.append(best_state.margin)
+            if len(stall_win) > max(2, int(K.DEEPEN_STALL_WINDOW)):
+                stall_win.pop(0)
+            if (len(stall_win) >= max(2, int(K.DEEPEN_STALL_WINDOW))
+                    and stall_win[0] - min(stall_win) < K.DEEPEN_STALL_MIN_IMPROVE):
+                logger.info(f"[optimK] deepen stalled at K={K_cur} margin={best_state.margin:.4f} "
+                            f"iter={iteration} -> early stop (redirect budget to RMSE)")
                 return _out(True)
 
     return _out(best_state.margin < 0)
@@ -1285,6 +1302,22 @@ def _score_upper_bound(ctx: Context, K_new: int) -> float:
     return validator_score(ctx.q, rmse, -10.0, 10 ** 9, ctx.cap)  # margin -10 => full bonus; huge px => full novelty
 
 
+def _state_from_delta(ctx: Context, template: State, res: dict) -> State:
+    """Reconstruct an optimizer State from a banked result's byte delta, borrowing the path/clean fields
+    from `template` (Phase A's state). Used by the opt-in C3 anchor-from-bank warm start (default off):
+    the mask/sign come from the sparse banked flip, and the mask logits are rebuilt so TopK(a) reproduces
+    that support. margin/x_adv are taken straight from the banked result (already exact-evaluated)."""
+    st = copy.deepcopy(template)
+    delta = res["delta"]
+    st.mask = delta != 0
+    st.sign[st.mask] = delta.sign()[st.mask].to(st.sign.dtype)
+    st.a = K.MASK_NOISE * torch.randn_like(st.a)
+    st.a[st.mask] += K.BIG_INIT
+    st.margin = float(res["margin"])
+    st.x_adv = res["cand"]
+    return st
+
+
 def _quick_anchor(ctx: Context, flip_state: State, target: float) -> tuple[State, bool]:
     """Budget-aware anchor (coupled Phase 1). Deepen the first flip at its OWN K toward `target`, giving
     the optimizer a REAL chance to reach CEIL (margin deepening here is non-monotonic and often delayed)
@@ -1361,10 +1394,19 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
     # --- Phase 1: anchor -> a validated saturating upper bound. Budget-aware: deepen only until the
     #     marginal return dries up (QuickAnchor), so a hard/unreachable CEIL can't eat the whole window. -
     parents: list = []
+    # C3 (opt-in, default OFF): if the Bank already holds a flip sparser than the dense FIND state, anchor
+    # from IT instead — tighter binary-search bracket + sparse start. Off by default (the dense anchor
+    # doubles as a saturating-upper-bound validator, which a sparse start cannot provide).
+    anchor_src = flip_state
+    if K.POSTFLIP_ANCHOR_FROM_BANK and ctx.bank.best_safe is not None:
+        b = ctx.bank.best_safe
+        if b.get("delta") is not None and int(b["nz"]) < _k_of(flip_state):
+            anchor_src = _state_from_delta(ctx, flip_state, b)
+            logger.info(f"[coupled] C3 anchor-from-bank: K {_k_of(flip_state)} -> {_k_of(anchor_src)}")
     if K.COUPLED_QUICK_ANCHOR:
-        anchor, anchor_ok = _quick_anchor(ctx, flip_state, target)
+        anchor, anchor_ok = _quick_anchor(ctx, anchor_src, target)
     else:
-        anchor, _ = OptimizeFixedK(ctx, flip_state, _k_of(flip_state), r_iters, deepen_target=target)
+        anchor, _ = OptimizeFixedK(ctx, anchor_src, _k_of(anchor_src), r_iters, deepen_target=target)
         anchor_ok = _saturates(anchor, target)
     _remember_parent(ctx, parents, anchor, K.COUPLED_PARENTS)
     hi = max(K_floor, _k_of(anchor))
@@ -1399,7 +1441,14 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
                         f"score={_state_score(ctx, cand):.4f} bracket=[{lo},{hi}]")
         K_sat = hi
     else:
-        logger.info("[coupled] anchor did not saturate -> score-sweep around K_start (no K_sat)")
+        # C1: no saturating margin exists, but RMSE is still minimizable. Run a flip-preserving,
+        # score-gated cardinality descent (deepen_per_level=False keeps the achieved margin and shrinks K
+        # while total score holds within SCORE_TOL). Bank-gated: can only raise the returned score. Center
+        # the Phase-3 sweep on the descended (sparse) K instead of the dense anchor.
+        logger.info("[coupled] anchor did not saturate -> flip-preserving score-gated descent (C1)")
+        descended, _ = ReduceCardinality(ctx, anchor, _k_of(anchor), K_min, deepen_per_level=False)
+        _remember_parent(ctx, parents, descended, K.COUPLED_PARENTS)
+        K_sat = _k_of(descended)
 
     # --- Phase 3: SCREEN-then-refine (#3, #7) -> cheaply sample the curve around/below K_sat, skipping
     #     any K whose analytic ceiling can't beat the Bank, then spend the budget only on the best

@@ -288,6 +288,24 @@ ANCHOR_PUSH_MARGIN = _env_float("PERTURB_ANCHOR_PUSH_MARGIN", 8.0)   # once best
 # grind an unreachable CEIL. This lets a good candidate recover even when the anchor itself fell short.
 COUPLED_REFINE_DEEP_MARGIN = _env_float("PERTURB_COUPLED_REFINE_DEEP_MARGIN", 6.0)
 
+# --- C2: diminishing-returns early stop for STANDALONE margin-deepen calls (OptimizeFixedK) --------
+# Complements the QuickAnchor (which already stall-stops the anchor). This covers the OTHER deepen calls
+# — binary-search retries and Phase-3 refines — so a shallow-but-stalled candidate stops grinding an
+# (effectively) unreachable CEIL and hands the remaining budget to the K/RMSE search. The window is set
+# LARGER than ANCHOR_CHUNK_ITERS on purpose, so it can never fill (and thus never fire) inside the
+# anchor's chunks — that path keeps its own stall logic. FIND (deepen_target None) and pre-floor margins
+# are exempt: the floor guarantees a strong margin (>= this depth) even on the earliest possible stop.
+DEEPEN_STALL_STOP = _env_bool("PERTURB_DEEPEN_STALL_STOP", True)
+DEEPEN_STALL_FLOOR = _env_float("PERTURB_DEEPEN_STALL_FLOOR", 8.0)   # only early-stop once margin <= -this
+DEEPEN_STALL_WINDOW = _env_int("PERTURB_DEEPEN_STALL_WINDOW", 12)    # iters in the sliding best-margin window
+DEEPEN_STALL_MIN_IMPROVE = _env_float("PERTURB_DEEPEN_STALL_MIN_IMPROVE", 0.3)  # min |margin| gain/window to keep going
+
+# --- C3 (opt-in, default OFF): warm-start the post-flip anchor from the Bank's sparsest flip ---------
+# Anchor from the already-banked sparse flip instead of the dense K_init FIND state: tighter binary-
+# search bracket + sparse start. OFF by default — the dense anchor doubles as a saturating-upper-bound
+# validator (a sparse start cannot distinguish "K too small to saturate" from "image genuinely hard").
+POSTFLIP_ANCHOR_FROM_BANK = _env_bool("PERTURB_POSTFLIP_ANCHOR_FROM_BANK", False)
+
 # --- INNER support-quality refinement (all strategies, after the K-search) -----------------------
 # The K-search picks a good cardinality; it does NOT guarantee the best coordinates/signs AT that K
 # (WarmStartSmallerK ranks by first-order retention; the deepen swaps accept by margin). This pass takes
