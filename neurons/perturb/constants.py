@@ -174,7 +174,7 @@ RANK_FUSION = _env_bool("PERTURB_FW_RANK_FUSION", True)
 # them in the same batched pass; the Bank keeps the sparsest flipping rung, so you land sparse directly
 # instead of shrinking from K_init. Falls through to the fixed-K optimizer if no rung flips.
 GROW_LADDER = _env_bool("PERTURB_FW_GROW_LADDER", True)
-GROW_RUNGS = _env_floats("PERTURB_FW_GROW_RUNGS", (0.005, 0.01, 0.05, 0.1, 0.2, 0.4, 0.7))  # fractions of N
+GROW_RUNGS = _env_floats("PERTURB_FW_GROW_RUNGS", (0.01, 0.05, 0.1, 0.2, 0.4, 0.7))  # fractions of N
 GROW_VARIANTS = _env_int("PERTURB_FW_GROW_VARIANTS", 1)  # near-tie randomized order variants per rung
 
 # --- Feature guidance (Q1: feature-guided candidate selection) ----------------------------
@@ -208,7 +208,7 @@ BLOCK_MIN = _env_int("PERTURB_FW_BLOCK_MIN", 256)         # floor on block size 
 BLOCK_ANNEAL = _env_bool("PERTURB_FW_BLOCK_ANNEAL", False)  # taper the block over iterations (sparsify mode)
 
 # --- Phase D (partial restart) ------------------------------------------------------------
-RESTART_PATIENCE = _env_int("PERTURB_FW_RESTART_PATIENCE", 10)
+RESTART_PATIENCE = _env_int("PERTURB_FW_RESTART_PATIENCE", 8)
 RESTART_MIN_IMPROVE = _env_float("PERTURB_FW_RESTART_MIN_IMPROVE", 1e-3)
 RESTART_TURNOVER_THRESH = _env_float("PERTURB_FW_RESTART_TURNOVER", 0.05)
 RESTART_FRACTION = _env_float("PERTURB_FW_RESTART_FRACTION", 0.1)
@@ -276,11 +276,11 @@ COUPLED_PARENTS = _env_int("PERTURB_COUPLED_PARENTS", 3)
 # Set the gate off to restore the old fixed full-budget anchor.
 COUPLED_QUICK_ANCHOR = _env_bool("PERTURB_COUPLED_QUICK_ANCHOR", True)
 ANCHOR_CHUNK_ITERS = _env_int("PERTURB_ANCHOR_CHUNK_ITERS", 5)         # iters per slope-check chunk (small: fine stall resolution)
-ANCHOR_MIN_ITERS = _env_int("PERTURB_ANCHOR_MIN_ITERS", 30)          # never slope-bail before this many iters (give delayed deepening a chance)
-ANCHOR_MAX_ITERS = _env_int("PERTURB_ANCHOR_MAX_ITERS", 45)          # hard cap on total anchor iters
+ANCHOR_MIN_ITERS = _env_int("PERTURB_ANCHOR_MIN_ITERS", 25)          # never slope-bail before this many iters (give delayed deepening a chance)
+ANCHOR_MAX_ITERS = _env_int("PERTURB_ANCHOR_MAX_ITERS", 40)          # hard cap on total anchor iters
 ANCHOR_MAX_FRAC = _env_float("PERTURB_ANCHOR_MAX_FRAC", 0.20)        # post-warmup cap: fraction of remaining post-flip budget
 ANCHOR_MIN_MARGIN_GAIN = _env_float("PERTURB_ANCHOR_MIN_MARGIN_GAIN", 0.1)  # min best-|margin| drop/chunk to count as progress
-ANCHOR_STALL_CHUNKS = _env_int("PERTURB_ANCHOR_STALL_CHUNKS", 3)     # consecutive weak chunks (post-warmup) before bailing
+ANCHOR_STALL_CHUNKS = _env_int("PERTURB_ANCHOR_STALL_CHUNKS", 4)     # consecutive weak chunks (post-warmup) before bailing
 ANCHOR_PUSH_MARGIN = _env_float("PERTURB_ANCHOR_PUSH_MARGIN", 8.0)   # once best margin <= -this, never stall-bail (close to CEIL)
 # Phase-3 refine budget is decided PER CANDIDATE by how close it already is to CEIL, not by whether the
 # anchor saturated: a screened candidate at CW margin <= -COUPLED_REFINE_DEEP_MARGIN is close enough to be
@@ -296,7 +296,7 @@ COUPLED_REFINE_DEEP_MARGIN = _env_float("PERTURB_COUPLED_REFINE_DEEP_MARGIN", 6.
 # / strongest-feasible-in). Every candidate folds through the score-ranked Bank, so acceptance is by FULL
 # score automatically and it can only RAISE the returned score (or, out of budget, do nothing).
 REFINE_SUPPORT = _env_bool("PERTURB_REFINE_SUPPORT", True)
-REFINE_ROUNDS = _env_int("PERTURB_REFINE_ROUNDS", 3)                    # deletion+swap rounds (re-linearized)
+REFINE_ROUNDS = _env_int("PERTURB_REFINE_ROUNDS", 4)                    # deletion+swap rounds (re-linearized)
 REFINE_DELETION_POOL = _env_int("PERTURB_REFINE_DELETION_POOL", 128)   # weakest active coords tested for deletion
 REFINE_SWAP_POOL = _env_int("PERTURB_REFINE_SWAP_POOL", 128)           # strongest inactive coords for swap-in
 REFINE_SWAP_PROPOSALS = _env_int("PERTURB_REFINE_SWAP_PROPOSALS", 128)  # one-for-one swap proposals per round
@@ -324,7 +324,7 @@ FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 5)    # reserved
 # relaxes a level back toward the env baseline. level L scales a knob by TUNE_FACTOR**L (capped).
 # Higher TEMPERATURE at high levels also de-saturates the BIG_INIT logits, unfreezing Phase B.
 ADAPTIVE_TUNE = _env_bool("PERTURB_ADAPTIVE_TUNE", True)   # enable the controller (active during optim)
-TUNE_INTERVAL = _env_int("PERTURB_TUNE_INTERVAL", 60)     # optim iterations per evaluation window
+TUNE_INTERVAL = _env_int("PERTURB_TUNE_INTERVAL", 50)     # optim iterations per evaluation window
 TUNE_MIN_IMPROVE = _env_float("PERTURB_TUNE_MIN_IMPROVE", 0.02)  # abs best-margin drop/window => progress
 TUNE_MIN_REL = _env_float("PERTURB_TUNE_MIN_REL", 0.01)   # relative drop/window => progress
 TUNE_GOOD_REL = _env_float("PERTURB_TUNE_GOOD_REL", 0.05)  # relax a level when relative drop exceeds this
