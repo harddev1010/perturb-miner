@@ -24,6 +24,34 @@ from .calibration import candidate_kappa_vec
 
 
 # ==========================================================================================
+# Forward/backward pass accounting. Every model forward funnels through fwd_logits, so the
+# whole engine's compute is captured in one place; backward image-grads are added at each
+# autograd site. Counted in IMAGES (batch rows), reset per perturb() call.
+# ==========================================================================================
+_PASS = {"fwd": 0, "bwd": 0}
+
+
+def reset_passes() -> None:
+    _PASS["fwd"] = 0
+    _PASS["bwd"] = 0
+
+
+def passes() -> tuple[int, int]:
+    """(forward_images, backward_images) since the last reset_passes()."""
+    return _PASS["fwd"], _PASS["bwd"]
+
+
+def fwd_logits(model, image_bchw: torch.Tensor) -> torch.Tensor:
+    """logits_for_images + forward-image accounting (single forward chokepoint)."""
+    _PASS["fwd"] += int(image_bchw.shape[0])
+    return logits_for_images(model=model, image_bchw=image_bchw)
+
+
+def count_bwd(n_images: int) -> None:
+    _PASS["bwd"] += int(n_images)
+
+
+# ==========================================================================================
 # Validator-faithful metrics (moved verbatim from the legacy miner).
 # ==========================================================================================
 def png_roundtrip(image_chw: torch.Tensor, device: torch.device) -> torch.Tensor:
@@ -90,7 +118,7 @@ def validator_score(linf: float, rmse: float, margin: float, pixels: int, effect
 def logits_of(model, x_chw: torch.Tensor) -> torch.Tensor:
     """Single-image forward -> logits[0] (no grad). One choke point for the engine's probes."""
     with torch.no_grad():
-        return logits_for_images(model=model, image_bchw=x_chw.unsqueeze(0))[0]
+        return fwd_logits(model, x_chw.unsqueeze(0))[0]
 
 
 def cw_margin(logits: torch.Tensor, target_index: int) -> float:
@@ -118,11 +146,12 @@ def top_wrong_classes(logits: torch.Tensor, target_index: int, m: int) -> list[i
 def margin_and_grad(model, x_chw: torch.Tensor, target_index: int):
     """Hard CW margin and its input gradient (boundary direction ∇ℓ_true - ∇max_other)."""
     x = x_chw.detach().clone().requires_grad_(True)
-    logits = logits_for_images(model=model, image_bchw=x.unsqueeze(0))[0]
+    logits = fwd_logits(model, x.unsqueeze(0))[0]
     others = logits.clone()
     others[target_index] = float("-inf")
     margin = logits[target_index] - others.max()
     grad = torch.autograd.grad(margin, x)[0]
+    count_bwd(1)
     return float(margin.item()), grad.detach()
 
 
@@ -140,7 +169,7 @@ def loss_grad(model, x_chw: torch.Tensor, target_index: int, kind: str,
     Returns (value: float, move_dir_flat: Tensor, score_flat: Tensor).
     """
     x = x_chw.detach().clone().requires_grad_(True)
-    logits = logits_for_images(model=model, image_bchw=x.unsqueeze(0))[0]
+    logits = fwd_logits(model, x.unsqueeze(0))[0]
 
     if kind == "ce":
         value_t = F.cross_entropy(logits.unsqueeze(0), torch.tensor([target_index], device=logits.device))
@@ -180,6 +209,7 @@ def loss_grad(model, x_chw: torch.Tensor, target_index: int, kind: str,
         raise ValueError(f"unknown loss kind: {kind}")
 
     grad = torch.autograd.grad(value_t, x)[0].detach().view(-1)
+    count_bwd(1)
     move_dir = grad.sign() if ascend else -grad.sign()
     return float(value_t.item()), move_dir, grad.abs()
 
@@ -195,7 +225,7 @@ def margins_with_tf32(model, batch_bchw: torch.Tensor, target_index: int, cudnn_
     torch.backends.cudnn.allow_tf32 = cudnn_enabled
     try:
         with torch.no_grad():
-            logits = logits_for_images(model=model, image_bchw=batch_bchw)
+            logits = fwd_logits(model, batch_bchw)
             return cw_margin_batch(logits, target_index)
     finally:
         torch.backends.cudnn.allow_tf32 = prev_cd
@@ -282,6 +312,8 @@ class Context:
     first_flip_time: float | None = None  # wall-clock when the first flip was banked (arms the optim deadline)
     tuner: object | None = None  # adaptive hyperparameter controller (perturb.AdaptiveTuner)
     clean_relevance: torch.Tensor | None = None  # cached clean-image feature-relevance map (invariant)
+    last_iters: int = 0          # iterations run by the most recent OptimizeFixedK call (for concise logs)
+    log_swaps: bool = False       # emit [phaseC] swap lines at INFO (scoped to Find Flip; debug elsewhere)
 
 
 def out_of_budget(ctx: "Context") -> bool:
@@ -337,7 +369,7 @@ class Bank:
 
 def _forward_margins(ctx: Context, batch_bchw: torch.Tensor) -> torch.Tensor:
     with torch.no_grad():
-        logits = logits_for_images(model=ctx.model, image_bchw=batch_bchw)
+        logits = fwd_logits(ctx.model, batch_bchw)
         return cw_margin_batch(logits, ctx.target_index)
 
 

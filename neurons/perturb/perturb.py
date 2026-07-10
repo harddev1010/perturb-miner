@@ -39,8 +39,6 @@ from dataclasses import dataclass, replace
 import torch
 import torch.nn.functional as F
 
-from perturbnet.model import logits_for_images
-
 from . import constants as K
 from .calibration import env_fingerprint, get_calibrator
 from .utils import (
@@ -48,13 +46,17 @@ from .utils import (
     Context,
     apply_delta_bytes,
     batch_eval,
+    count_bwd,
     estimate_k,
     exact_worst_margin,
+    fwd_logits,
     logits_of,
     loss_grad,
     margin_and_grad,
     movable,
     out_of_budget,
+    passes,
+    reset_passes,
     top_wrong_classes,
     validator_score,
 )
@@ -149,10 +151,10 @@ class AdaptiveTuner:
 
     def _log(self, why: str) -> None:
         p = self.params
-        logger.info(f"[tune] {why} level={self.level} eta={p['ETA_MASK']:.2f} temp={p['TEMPERATURE']:.2f} "
-                    f"block_frac={p['BLOCK_FRAC']:.3f} block_min={p['BLOCK_MIN']} "
-                    f"proposals={p['PROPOSAL_COUNT']} swap_int={p['SWAP_INTERVAL']} "
-                    f"restart_frac={p['RESTART_FRACTION']:.3f}")
+        logger.debug(f"[tune] {why} level={self.level} eta={p['ETA_MASK']:.2f} temp={p['TEMPERATURE']:.2f} "
+                     f"block_frac={p['BLOCK_FRAC']:.3f} block_min={p['BLOCK_MIN']} "
+                     f"proposals={p['PROPOSAL_COUNT']} swap_int={p['SWAP_INTERVAL']} "
+                     f"restart_frac={p['RESTART_FRACTION']:.3f}")
 
     def observe(self, best_margin: float) -> None:
         """Call once per optim iteration with the current global-best margin."""
@@ -274,7 +276,7 @@ def _batched_grads(ctx: Context, images: list[torch.Tensor],
     pairwise margin z_y - z_c. The losses are row-separable, so backward of their sum yields each row's
     own input gradient. Returns (values, grads[B, N]). Replaces ~9 sequential backwards in Phase A."""
     batch = torch.stack([im.detach() for im in images], dim=0).to(ctx.device).requires_grad_(True)
-    logits = logits_for_images(model=ctx.model, image_bchw=batch)  # [B, num_classes]
+    logits = fwd_logits(ctx.model, batch)  # [B, num_classes]
     y = ctx.target_index
     losses, values = [], []
     for i, (kind, c) in enumerate(specs):
@@ -288,6 +290,7 @@ def _batched_grads(ctx: Context, images: list[torch.Tensor],
         losses.append(v)
         values.append(float(v.item()))
     grads = torch.autograd.grad(torch.stack(losses).sum(), batch)[0].detach().view(len(images), -1)
+    count_bwd(len(images))
     return values, grads
 
 
@@ -334,12 +337,13 @@ def _feature_relevance(ctx: Context, x_chw: torch.Tensor) -> torch.Tensor | None
     handle = layer.register_forward_hook(hook)
     try:
         x = x_chw.detach().clone().requires_grad_(True)
-        logits = logits_for_images(model=model, image_bchw=x.unsqueeze(0))[0]
+        logits = fwd_logits(model, x.unsqueeze(0))[0]
         others = logits.clone()
         others[ctx.target_index] = float("-inf")
         margin = logits[ctx.target_index] - others.max()
         model.zero_grad(set_to_none=True)
         margin.backward()
+        count_bwd(1)
         feat = store.get("f")
         fgrad = None if feat is None else feat.grad
         if feat is None or fgrad is None:
@@ -609,6 +613,7 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
     """Phase A. Build a fixed-K support from clean + targeted + random-start + feature-guided
     candidates, initialize the continuous logits/signs, and (so a flip can be found without the
     optimizer) verify each source's support ladder into the Bank. Returns (state, seed_results)."""
+    t0 = time.time()
     n = ctx.clean_u8.numel()
     seed_deltas: list[torch.Tensor] = []
     beams: list[torch.Tensor] = []        # per-source score vectors, fused by percentile rank (T1.3)
@@ -651,8 +656,8 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
     beams.append(clean_score)
     candidate_lists.append(_top_indices(clean_score, round(0.5 * K_init)))
     seed_deltas += _support_ladder(ctx, clean_sign * clean_score, clean_margin)
-    logger.info(f"[phaseA] A1 clean gradient: margin={clean_margin:.4f} "
-                f"legal={(clean_score > 0).sum().item()} top={round(0.5 * K_init)}")
+    logger.debug(f"[phaseA] A1 clean gradient: margin={clean_margin:.4f} "
+                 f"legal={(clean_score > 0).sum().item()} top={round(0.5 * K_init)}")
 
     # A2. Target-specific beams (pairwise margins kept separate for generation; T2.2).
     per_target = max(1, round(K_init / (4 * max(1, K.TARGET_COUNT))))
@@ -662,7 +667,7 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
         candidate_lists.append(_top_indices(tscore, per_target))
         aggregate_gradient += tgrad
         seed_deltas += _support_ladder(ctx, tsign * tscore, tval)
-        logger.info(f"[phaseA] A2 target={c}: value={tval:.4f} kc={_kc_of(ctx, tsign * tscore, tval)} top={per_target}")
+        logger.debug(f"[phaseA] A2 target={c}: value={tval:.4f} kc={_kc_of(ctx, tsign * tscore, tval)} top={per_target}")
 
     # A3. Random-start beams.
     per_random = max(1, round(K_init / (4 * max(1, K.RANDOM_START_COUNT))))
@@ -671,7 +676,7 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
         beams.append(rscore)
         candidate_lists.append(_top_indices(rscore, per_random))
         seed_deltas += _support_ladder(ctx, rsign * rscore, clean_margin)
-        logger.info(f"[phaseA] A3 random-start {r + 1}/{K.RANDOM_START_COUNT}: top={per_random}")
+        logger.debug(f"[phaseA] A3 random-start {r + 1}/{K.RANDOM_START_COUNT}: top={per_random}")
 
     # A4. Feature-guided beam (Q1); clean map cached (T3.1).
     if K.FEATURE_GUIDED:
@@ -681,12 +686,12 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
             beams.append(fscore)
             candidate_lists.append(_top_indices(fscore, fquota))
             seed_deltas += _support_ladder(ctx, clean_sign * fscore, clean_margin)
-            logger.info(f"[phaseA] A4 feature-guided ({'gate' if K.FEATURE_GATE else 'pure'}): "
-                        f"top={fquota} nonzero={(fscore > 0).sum().item()}")
+            logger.debug(f"[phaseA] A4 feature-guided ({'gate' if K.FEATURE_GATE else 'pure'}): "
+                         f"top={fquota} nonzero={(fscore > 0).sum().item()}")
         else:
-            logger.info("[phaseA] A4 feature-guided: no hookable conv layer -> skipped")
+            logger.debug("[phaseA] A4 feature-guided: no hookable conv layer -> skipped")
     else:
-        logger.info("[phaseA] A4 feature-guided: disabled")
+        logger.debug("[phaseA] A4 feature-guided: disabled")
 
     # ---- Normalized-rank beam fusion (T1.3): fuse beams by percentile rank, not by clean_score ----
     if K.RANK_FUSION and beams:
@@ -707,7 +712,7 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
             seed_deltas.append(_make_delta(ctx, m, agg_sign))
             for _ in range(K.GROW_VARIANTS):
                 seed_deltas.append(_project_sampled(ctx, agg_sign * fused_score, kr))
-        logger.info(f"[phaseA] grow ladder: rungs={rung_ks} (fused-ranked, batched)")
+        logger.debug(f"[phaseA] grow ladder: rungs={rung_ks} (fused-ranked, batched)")
 
     # A4'/merge. Union of per-beam quotas -> K distinct coords, trimmed/filled by the FUSED rank (T1.3).
     union = torch.cat([c for c in candidate_lists if c.numel() > 0]) if candidate_lists else \
@@ -728,8 +733,8 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
             if len(keep) >= K_init:
                 break
         initial_support = torch.tensor(keep, dtype=torch.long, device=ctx.clean_u8.device)
-    logger.info(f"[phaseA] merged support: union={union.numel()} -> initial_support={initial_support.numel()} "
-                f"(K_init={K_init}) fusion={'on' if K.RANK_FUSION else 'off'}")
+    logger.debug(f"[phaseA] merged support: union={union.numel()} -> initial_support={initial_support.numel()} "
+                 f"(K_init={K_init}) fusion={'on' if K.RANK_FUSION else 'off'}")
 
     # A5. Initialize mask logits: small noise + a large boost on the seeded support.
     a = K.MASK_NOISE * torch.randn(n, device=ctx.clean_u8.device)
@@ -758,8 +763,12 @@ def InitializeAttack(ctx: Context, targets: list[int], K_init: int) -> tuple[Sta
         margin, x_adv, _ = _evaluate_state(ctx, mask, sign)
     flips = sum(1 for r in seed_results if r.get("quality"))
     best_seed = min((r["margin"] for r in seed_results), default=float("inf"))
-    logger.info(f"[phaseA] seeded+verified {len(seed_deltas)} candidates: quality_flips={flips} "
-                f"best_margin={best_seed:.4f} init_state_margin={margin:.4f}")
+    logger.debug(f"[phaseA] seeded+verified {len(seed_deltas)} candidates: quality_flips={flips} "
+                 f"best_margin={best_seed:.4f} init_state_margin={margin:.4f}")
+    k_flip = ctx.bank.best_flip["nz"] if ctx.bank.best_flip is not None else None
+    logger.info(f"[phaseA] done: tried={len(seed_deltas)} candidates found_flip={flips > 0}"
+                + (f" K_flip={k_flip}" if flips > 0 else "")
+                + f" spent={time.time() - t0:.3f}s")
 
     state = State(
         a=a, v=v, mask=mask, sign=sign, margin=margin, x_adv=x_adv,
@@ -935,8 +944,10 @@ def ExactBlockSwap(ctx: Context, state: State, block: int) -> tuple[State, bool]
             if state.mask.any() else state.a.median()
         boost = 1e-3
         state.a[masks[best] & ~state.previous_mask if state.previous_mask is not None else masks[best]] = threshold + boost
-        logger.info(f"[phaseC] block-swap accepted: margin={state.margin:.4f} block={block} "
-                    f"proposal={best}/{len(proposals)}")
+        n = state.mask.numel()
+        (logger.info if ctx.log_swaps else logger.debug)(
+            f"[phaseC] swap: cands={len(proposals)} block={block} "
+            f"({100.0 * block / max(1, n):.2f}% of N) margin={state.margin:.4f}")
         return state, True
     return state, False
 
@@ -996,7 +1007,7 @@ def PartialRestart(ctx: Context, state: State, K_cur: int) -> State:
         state.sign = signs[best]
         state.margin = margins[best]
         state.x_adv = res[best]["cand"]
-        logger.info(f"[phaseD] partial restart: replaced {restart_count}/{K_cur} margin={state.margin:.4f}")
+        logger.debug(f"[phaseD] partial restart: replaced {restart_count}/{K_cur} margin={state.margin:.4f}")
     return state
 
 
@@ -1025,10 +1036,14 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
     turnover_history: list[float] = []
     stall_win: list[float] = []   # C2: sliding best-margin window for the deepen early-stop
 
+    ran = 0
+
     def _out(ok: bool):
+        ctx.last_iters = ran
         return (best_state, ok, state) if return_state else (best_state, ok)
 
     for iteration in range(1, max_iterations + 1):
+        ran = iteration
         if _oob(ctx):
             break
         state = DynamicMaskOptimizationStep(ctx, state, K_cur)
@@ -1040,7 +1055,7 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
         if ctx.tuner is not None:
             ctx.tuner.observe(best_state.margin)
         if _reached(best_state.margin, deepen_target):
-            logger.info(f"[optimK] flip at K={K_cur} iter={iteration} margin={best_state.margin:.4f}")
+            logger.debug(f"[optimK] flip at K={K_cur} iter={iteration} margin={best_state.margin:.4f}")
             return _out(True)
 
         if iteration % max(1, int(_p(ctx, "SWAP_INTERVAL"))) == 0 and not _oob(ctx):
@@ -1072,8 +1087,8 @@ def OptimizeFixedK(ctx: Context, initial_state: State, K_cur: int, max_iteration
                 stall_win.pop(0)
             if (len(stall_win) >= max(2, int(K.DEEPEN_STALL_WINDOW))
                     and stall_win[0] - min(stall_win) < K.DEEPEN_STALL_MIN_IMPROVE):
-                logger.info(f"[optimK] deepen stalled at K={K_cur} margin={best_state.margin:.4f} "
-                            f"iter={iteration} -> early stop (redirect budget to RMSE)")
+                logger.debug(f"[optimK] deepen stalled at K={K_cur} margin={best_state.margin:.4f} "
+                             f"iter={iteration} -> early stop (redirect budget to RMSE)")
                 return _out(True)
 
     return _out(best_state.margin < 0)
@@ -1109,7 +1124,7 @@ def WarmStartSmallerK(ctx: Context, successful_state: State, K_new: int) -> Stat
     margin, x_adv, _ = _evaluate_state(ctx, new_state.mask, new_state.sign)
     new_state.margin = margin
     new_state.x_adv = x_adv
-    logger.info(f"[phaseE] warm-start K_new={K_new} retained={retained.numel()} margin={margin:.4f}")
+    logger.debug(f"[phaseE] warm-start K_new={K_new} retained={retained.numel()} margin={margin:.4f}")
     return new_state
 
 
@@ -1167,13 +1182,13 @@ def ReduceCardinality(ctx: Context, flip_state: State, K_start: int, minimum_K: 
         if success and cand_score >= best_score - K.SCORE_TOL:
             best_state, best_score, K_current = optimized, max(best_score, cand_score), K_new
             misses = 0
-            logger.info(f"[reduce] K={K_current} margin={optimized.margin:.4f} score={cand_score:.4f}")
+            logger.debug(f"[reduce] K={K_current} margin={optimized.margin:.4f} score={cand_score:.4f}")
         else:
             # Smaller K lost score (or would not flip): try a finer step, then accept the score peak.
             reduction_fraction *= 0.5
             misses += 1
-            logger.info(f"[reduce] reject K_new={K_new} (score={cand_score:.4f} vs {best_score:.4f}); "
-                        f"finer step -> {reduction_fraction:.4f}")
+            logger.debug(f"[reduce] reject K_new={K_new} (score={cand_score:.4f} vs {best_score:.4f}); "
+                         f"finer step -> {reduction_fraction:.4f}")
             if misses >= 2 or reduction_fraction < 1e-3:
                 break
     return best_state, K_current
@@ -1202,9 +1217,14 @@ def SupportRefine(ctx: Context) -> None:
     d = best["delta"]
     x_adv = best["cand"]
     prev = float(best["score"])
+    logger.info(f"[refine] SupportRefine start: rounds<={max(1, int(K.REFINE_ROUNDS))} "
+                f"K={best['nz']} score={prev:.4f}")
+    t_sr = time.time()
+    rounds = 0
     for _ in range(max(1, int(K.REFINE_ROUNDS))):
         if _oob(ctx):
             break
+        rounds += 1
         mask = d != 0
         sign = d.sign()
         active = mask.nonzero(as_tuple=True)[0]
@@ -1238,8 +1258,8 @@ def SupportRefine(ctx: Context) -> None:
         prev = float(cur["score"]); d = cur["delta"]; x_adv = cur["cand"]
     fin = ctx.bank.best_safe
     if fin is not None:
-        logger.info(f"[refine] support-refine best=({fin['nz']}ch pixels={fin['pixels']} "
-                    f"margin={fin['margin']:.4f} score={fin['score']:.4f})")
+        logger.info(f"[refine] SupportRefine done: rounds_ran={rounds} spent={time.time() - t_sr:.3f}s "
+                    f"best=({fin['nz']}ch pixels={fin['pixels']} margin={fin['margin']:.4f} score={fin['score']:.4f})")
 
 
 # ==========================================================================================
@@ -1343,6 +1363,8 @@ def _quick_anchor(ctx: Context, flip_state: State, target: float) -> tuple[State
     max_iters = max(min_iters, chunk, int(K.ANCHOR_MAX_ITERS))
     push = -abs(float(K.ANCHOR_PUSH_MARGIN))                  # best margin <= push => never stall-bail
     t_cap = time.time() + max(0.0, K.ANCHOR_MAX_FRAC) * max(0.0, ctx.time_left())
+    logger.info(f"[postflip:E1] QuickAnchor start: iters<={max_iters} K_flip={Kc}")
+    t_e1 = time.time()
     live = best = flip_state                                  # `live` carries the trajectory; `best` the depth
     prev_margin = best.margin
     weak = done = 0
@@ -1352,7 +1374,8 @@ def _quick_anchor(ctx: Context, flip_state: State, target: float) -> tuple[State
         if best_c.margin < best.margin:
             best = best_c
         if _saturates(best, target):
-            logger.info(f"[quick-anchor] saturated iter={done} margin={best.margin:.4f}")
+            logger.info(f"[postflip:E1] QuickAnchor done: iters_ran={done} spent={time.time() - t_e1:.3f}s "
+                        f"saturates=True margin={best.margin:.4f}")
             return best, True
         gain = prev_margin - best.margin                     # >= 0: deepening of the BEST margin this chunk
         prev_margin = best.margin
@@ -1360,13 +1383,16 @@ def _quick_anchor(ctx: Context, flip_state: State, target: float) -> tuple[State
         # Early stops apply only AFTER the warmup and only while NOT already near CEIL.
         if done >= min_iters and best.margin > push:
             if time.time() >= t_cap:
-                logger.info(f"[quick-anchor] time cap iter={done} margin={best.margin:.4f} -> score/K search")
+                logger.debug(f"[quick-anchor] time cap iter={done} margin={best.margin:.4f}")
                 break
             if weak >= max(1, int(K.ANCHOR_STALL_CHUNKS)):
-                logger.info(f"[quick-anchor] stalled (gain<{K.ANCHOR_MIN_MARGIN_GAIN} x{weak}) iter={done} "
-                            f"margin={best.margin:.4f} -> score/K search")
+                logger.debug(f"[quick-anchor] stalled (gain<{K.ANCHOR_MIN_MARGIN_GAIN} x{weak}) iter={done} "
+                             f"margin={best.margin:.4f}")
                 break
-    return best, _saturates(best, target)
+    sat = _saturates(best, target)
+    logger.info(f"[postflip:E1] QuickAnchor done: iters_ran={done} spent={time.time() - t_e1:.3f}s "
+                f"saturates={sat} margin={best.margin:.4f}")
+    return best, sat
 
 
 def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
@@ -1402,17 +1428,23 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
         b = ctx.bank.best_safe
         if b.get("delta") is not None and int(b["nz"]) < _k_of(flip_state):
             anchor_src = _state_from_delta(ctx, flip_state, b)
-            logger.info(f"[coupled] C3 anchor-from-bank: K {_k_of(flip_state)} -> {_k_of(anchor_src)}")
+            logger.debug(f"[coupled] C3 anchor-from-bank: K {_k_of(flip_state)} -> {_k_of(anchor_src)}")
     if K.COUPLED_QUICK_ANCHOR:
-        anchor, anchor_ok = _quick_anchor(ctx, anchor_src, target)
+        anchor, anchor_ok = _quick_anchor(ctx, anchor_src, target)   # E1 (logs its own start/end)
     else:
+        logger.info(f"[postflip:E1] Anchor start: iters={r_iters} K_flip={_k_of(anchor_src)}")
+        t_e1 = time.time()
         anchor, _ = OptimizeFixedK(ctx, anchor_src, _k_of(anchor_src), r_iters, deepen_target=target)
         anchor_ok = _saturates(anchor, target)
+        logger.info(f"[postflip:E1] Anchor done: iters_ran={ctx.last_iters} spent={time.time() - t_e1:.3f}s "
+                    f"saturates={anchor_ok} margin={anchor.margin:.4f}")
     _remember_parent(ctx, parents, anchor, K.COUPLED_PARENTS)
     hi = max(K_floor, _k_of(anchor))
-    logger.info(f"[coupled] anchor K={_k_of(anchor)} margin={anchor.margin:.4f} saturates={anchor_ok}")
 
     # --- Phase 2: bracket-validated binary search for K_sat (only under a real saturating anchor). ---
+    logger.info(f"[postflip:E2] Ksat-search start: bracket=[{K_floor},{hi}] anchor_saturates={anchor_ok}")
+    t_e2 = time.time()
+    probes = 0
     K_sat = hi
     if anchor_ok:
         lo, src = K_floor, anchor
@@ -1421,6 +1453,7 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
             if hi - lo <= tol:
                 break
             mid = (lo + hi) // 2
+            probes += 1
             cand = _probe_k(ctx, src, mid, b_iters, target)
             _remember_parent(ctx, parents, cand, K.COUPLED_PARENTS)
             if _saturates(cand, target):
@@ -1429,6 +1462,7 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
                   and _score_upper_bound(ctx, mid) > _bank_best_score(ctx) + K.SCORE_TOL):
                 # Near-miss whose ceiling can still beat the Bank: may be an optimizer false negative ->
                 # retry once from a diverse parent with the full budget before conceding the bracket (#5).
+                probes += 1
                 retry = _probe_k(ctx, _best_parent(parents, mid), mid, r_iters, target)
                 _remember_parent(ctx, parents, retry, K.COUPLED_PARENTS)
                 if _saturates(retry, target):
@@ -1437,18 +1471,20 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
                     lo = mid
             else:
                 lo = mid                                   # confident non-saturation (or can't beat Bank)
-            logger.info(f"[coupled] probe K={mid} margin={cand.margin:.4f} "
-                        f"score={_state_score(ctx, cand):.4f} bracket=[{lo},{hi}]")
+            logger.debug(f"[coupled] probe K={mid} margin={cand.margin:.4f} "
+                         f"score={_state_score(ctx, cand):.4f} bracket=[{lo},{hi}]")
         K_sat = hi
     else:
         # C1: no saturating margin exists, but RMSE is still minimizable. Run a flip-preserving,
         # score-gated cardinality descent (deepen_per_level=False keeps the achieved margin and shrinks K
         # while total score holds within SCORE_TOL). Bank-gated: can only raise the returned score. Center
         # the Phase-3 sweep on the descended (sparse) K instead of the dense anchor.
-        logger.info("[coupled] anchor did not saturate -> flip-preserving score-gated descent (C1)")
+        logger.debug("[coupled] anchor did not saturate -> flip-preserving score-gated descent (C1)")
         descended, _ = ReduceCardinality(ctx, anchor, _k_of(anchor), K_min, deepen_per_level=False)
         _remember_parent(ctx, parents, descended, K.COUPLED_PARENTS)
         K_sat = _k_of(descended)
+    logger.info(f"[postflip:E2] Ksat-search done: probes={probes} K_sat={K_sat} "
+                f"spent={time.time() - t_e2:.3f}s")
 
     # --- Phase 3: SCREEN-then-refine (#3, #7) -> cheaply sample the curve around/below K_sat, skipping
     #     any K whose analytic ceiling can't beat the Bank, then spend the budget only on the best
@@ -1461,17 +1497,20 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
     #     itself fell short. The score-ranked Bank keeps the true best K either way. --------------------
     hi_cap = _k_of(anchor)
     probe_ks = sorted({min(hi_cap, max(K_floor, int(round(m * K_sat)))) for m in K.COUPLED_REFINE_MULTS})
+    logger.info(f"[postflip:E3] refine-sweep start: probe_ks={probe_ks}")
+    t_e3 = time.time()
+    refined = 0
     screened: list[tuple[float, int, State]] = []
     for kk in probe_ks:
         if _oob(ctx):
             break
         if _score_upper_bound(ctx, kk) <= _bank_best_score(ctx) + K.SCORE_TOL:
-            logger.info(f"[coupled] skip K={kk} (UB {_score_upper_bound(ctx, kk):.4f} <= bank {_bank_best_score(ctx):.4f})")
+            logger.debug(f"[coupled] skip K={kk} (UB {_score_upper_bound(ctx, kk):.4f} <= bank {_bank_best_score(ctx):.4f})")
             continue
         cand = _probe_k(ctx, _best_parent(parents, kk), kk, b_iters, target)   # cheap screen
         _remember_parent(ctx, parents, cand, K.COUPLED_PARENTS)
         screened.append((_state_score(ctx, cand), kk, cand))
-        logger.info(f"[coupled] screen K={kk} margin={cand.margin:.4f} score={_state_score(ctx, cand):.4f}")
+        logger.debug(f"[coupled] screen K={kk} margin={cand.margin:.4f} score={_state_score(ctx, cand):.4f}")
     screened.sort(key=lambda t: t[0], reverse=True)
     for _, kk, cand in screened[: max(1, int(K.COUPLED_REFINE_FULL))]:
         if _oob(ctx):
@@ -1480,14 +1519,17 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
         cand_iters = K.MAX_ITERATIONS if cand.margin <= -K.COUPLED_REFINE_DEEP_MARGIN else max(1, int(K.ITERATIONS_PER_K))
         full, _ = OptimizeFixedK(ctx, cand, kk, cand_iters, deepen_target=target)
         _remember_parent(ctx, parents, full, K.COUPLED_PARENTS)
-        logger.info(f"[coupled] refine K={kk} margin={full.margin:.4f} score={_state_score(ctx, full):.4f} iters={cand_iters}")
+        refined += 1
+        logger.debug(f"[coupled] refine K={kk} margin={full.margin:.4f} score={_state_score(ctx, full):.4f} iters={cand_iters}")
+    logger.info(f"[postflip:E3] refine-sweep done: screened={len(screened)} refined={refined} "
+                f"spent={time.time() - t_e3:.3f}s")
 
     best = ctx.bank.best_safe
     if best is not None:
-        logger.info(f"[coupled] K_sat~{K_sat} best=({best['nz']}ch pixels={best['pixels']} "
+        logger.info(f"[postflip] result: K_sat~{K_sat} best=({best['nz']}ch pixels={best['pixels']} "
                     f"margin={best['margin']:.4f} score={best['score']:.4f})")
     else:
-        logger.info("[coupled] no safe flip banked")
+        logger.info("[postflip] result: no safe flip banked")
 
 
 def _interp_margin(K_new: int, samples: list[tuple[int, float]]) -> float:
@@ -1595,18 +1637,18 @@ def search(ctx: Context) -> None:
         # ---- Phase A: initialization (multi-source seeding, including feature guidance) ----
         state, _ = InitializeAttack(ctx, targets, K_init)
 
-        inc = _incumbent(ctx)
-        if inc is not None:
-            logger.info(f"[search] Phase A found a returnable flip: channels={inc['nz']} "
-                        f"margin={inc['margin']:.4f}")
-
         # ---- Optimizer (gated by RUN_OPTIM) ----
         # FIND: get the first flip at K_init (deepen_target=None). No margin-grinding at this large K —
         # RMSE (cardinality) is the bigger lever and the post-flip strategy handles both.
         if K.RUN_OPTIM:
+            logger.info(f"[find-flip] start: iters={K.MAX_ITERATIONS} K_init={K_init} target=flip(margin<0)")
+            t_ff = time.time()
+            ctx.log_swaps = True
             successful_state, success = OptimizeFixedK(ctx, state, K_init, K.MAX_ITERATIONS)
-            logger.info(f"[search] FIND OptimizeFixedK(K={K_init}) success={success} "
-                        f"margin={successful_state.margin:.4f} strategy={K.POSTFLIP_STRATEGY}")
+            ctx.log_swaps = False
+            logger.info(f"[find-flip] done: found={success} iters_ran={ctx.last_iters} "
+                        f"spent={time.time() - t_ff:.3f}s margin={successful_state.margin:.4f}"
+                        + (f" K_flip={_k_of(successful_state)}" if success else ""))
             if success:
                 if K.POSTFLIP_STRATEGY == "strict":
                     PostFlipStrict(ctx, successful_state, K_init, K_min)
@@ -1645,6 +1687,7 @@ def perturb(
     """Find a sparse envelope-safe ±k_min/255 flip via the Dynamic Sparse Fixed-q framework (Phase A
     seeding; Phases B-E implemented but gated off by default). Returns the clean image if none found."""
     t_start = start_time if start_time is not None else time.time()
+    reset_passes()
     clean = clean.to(device).clamp(0.0, 1.0)
 
     floor = float(min_delta)
@@ -1725,10 +1768,12 @@ def perturb(
         except Exception as err:
             logger.debug(f"[kappa] calibration update skipped: {err}")
 
+    n_fwd, n_bwd = passes()
     if chosen is None:
         logger.info(
             f"[perturb] no {'' if ctx.allow_unsafe else 'safe '}flip -> clean "
             f"(m0={m0:.4f} elapsed={time.time() - t_start:.3f}s has_flip={ctx.bank.has_flip} "
+            f"fwd={n_fwd} bwd={n_bwd} "
             f"tf32={'on' if K.TF32_ON else 'off'} envelope={'on' if envelope else 'off'} "
             f"kappa={kappa:.4f}{f'~n{kappa_n}' if use_dynamic else ''})"
         )
@@ -1739,6 +1784,7 @@ def perturb(
         f"[perturb] flip channels={chosen['nz']} ({pct:.2f}%) pixels={chosen.get('pixels', -1)} "
         f"margin={chosen['margin']:.4f} score={chosen.get('score', 0.0):.4f} "
         f"rmse={chosen['rmse']:.6f} linf={chosen['linf']:.6f} elapsed={time.time() - t_start:.3f}s "
+        f"fwd={n_fwd} bwd={n_bwd} "
         f"m0={m0:.4f} tf32={'on' if K.TF32_ON else 'off'} envelope={'on' if envelope else 'off'} "
         f"kappa={kappa:.4f}{f'~n{kappa_n}' if use_dynamic else ''} safe={chosen is ctx.bank.best_safe}"
     )
