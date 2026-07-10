@@ -109,8 +109,11 @@ class R2AdversarialDatasetExporter:
         self.run_id = run_id
         self.netuid = int(netuid)
         self.validator_hotkey = validator_hotkey
-        self.enabled = bool(C.R2_EXPORT_ENABLED)
-        self.bucket = os.getenv("PERTURB_R2_BUCKET", "").strip()
+        self.backend = str(C.RESPONSE_STORAGE_BACKEND).strip().lower() or "r2"
+        if self.backend not in {"r2", "hippius"}:
+            self._raise_config_error(f"Invalid PERTURB_RESPONSE_STORAGE_BACKEND={self.backend!r}; expected 'r2' or 'hippius'.")
+        self.enabled = bool(C.RESPONSE_STORAGE_ENABLED)
+        self.bucket = self._env_for_backend("BUCKET").strip()
         self.prefix = C.R2_PREFIX.strip().strip("/")
         self.storage_mode = (storage_mode or C.STORAGE_MODE).strip().lower()
         if not self.storage_mode:
@@ -127,39 +130,57 @@ class R2AdversarialDatasetExporter:
         if not self.enabled:
             return
         if not self.bucket:
-            self._raise_config_error("R2 export is enabled but PERTURB_R2_BUCKET is empty.")
+            self._raise_config_error(f"{self.backend} response storage is enabled but bucket is empty.")
         try:
             import boto3  # type: ignore[reportMissingImports]
         except Exception as exc:
-            self._raise_config_error(f"R2 export is enabled but boto3 is unavailable: {exc}")
+            self._raise_config_error(f"{self.backend} response storage is enabled but boto3 is unavailable: {exc}")
 
-        endpoint_url = os.getenv("PERTURB_R2_ENDPOINT_URL", "").strip()
-        access_key = os.getenv("PERTURB_R2_ACCESS_KEY_ID", "").strip()
-        secret_key = os.getenv("PERTURB_R2_SECRET_ACCESS_KEY", "").strip()
+        endpoint_url = self._endpoint_url_for_backend()
+        access_key = self._env_for_backend("ACCESS_KEY_ID").strip()
+        secret_key = self._env_for_backend("SECRET_ACCESS_KEY").strip()
         if not endpoint_url or not access_key or not secret_key:
             self._raise_config_error(
-                "R2 export is enabled and requires PERTURB_R2_ENDPOINT_URL, "
-                "PERTURB_R2_ACCESS_KEY_ID, and PERTURB_R2_SECRET_ACCESS_KEY."
+                f"{self.backend} response storage requires endpoint URL, access key ID, and secret access key."
             )
         self.miner_key_secret = secret_key
 
-        self.client = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url,
-            aws_access_key_id=access_key,
-            aws_secret_access_key=secret_key,
-            region_name=os.getenv("PERTURB_R2_REGION", "auto"),
-        )
+        client_kwargs = {
+            "endpoint_url": endpoint_url,
+            "aws_access_key_id": access_key,
+            "aws_secret_access_key": secret_key,
+            "region_name": self._region_for_backend(),
+        }
+        if self.backend == "hippius":
+            from botocore.config import Config as BotoConfig
+
+            client_kwargs["config"] = BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"})
+        self.client = boto3.client("s3", **client_kwargs)
         self.thread = threading.Thread(target=self._worker, name="r2-adversarial-exporter", daemon=True)
         self.thread.start()
         logger.info(
-            f"R2 adversarial dataset export enabled bucket={self.bucket} "
+            f"Response image storage enabled backend={self.backend} bucket={self.bucket} "
             f"prefix={self.prefix} storage_mode={self.storage_mode}"
         )
 
     def _raise_config_error(self, message: str) -> None:
         logger.warning(message)
         raise RuntimeError(message)
+
+    def _env_for_backend(self, suffix: str) -> str:
+        if self.backend == "hippius":
+            return os.getenv(f"PERTURB_HIPPIUS_{suffix}", "").strip()
+        return os.getenv(f"PERTURB_R2_{suffix}", "").strip()
+
+    def _endpoint_url_for_backend(self) -> str:
+        if self.backend == "hippius":
+            return os.getenv("PERTURB_HIPPIUS_ENDPOINT_URL", C.HIPPIUS_ENDPOINT_URL).strip()
+        return os.getenv("PERTURB_R2_ENDPOINT_URL", "").strip()
+
+    def _region_for_backend(self) -> str:
+        if self.backend == "hippius":
+            return os.getenv("PERTURB_HIPPIUS_REGION", C.HIPPIUS_REGION).strip() or "decentralized"
+        return os.getenv("PERTURB_R2_REGION", "auto").strip() or "auto"
 
     def miner_storage_key(self, *, miner_uid: int, miner_hotkey: str) -> str:
         """Opaque stable key for latest-mode object paths.
@@ -255,20 +276,21 @@ class R2AdversarialDatasetExporter:
             except Exception as exc:
                 failed_uploads += 1
                 logger.warning(
-                    f"R2 adversarial dataset export failed before leaderboard URL "
+                    f"Response image storage failed before leaderboard URL backend={self.backend} "
                     f"task_id={task_id} image_id={image_id}: {exc}"
                 )
         if selected:
             uploaded_count = len(image_url_by_storage_key)
             if failed_uploads:
                 logger.warning(
-                    f"R2 export completed with failures task_id={task_id} image_id={image_id} "
+                    f"Response image storage completed with failures backend={self.backend} "
+                    f"task_id={task_id} image_id={image_id} "
                     f"uploaded={uploaded_count} failed={failed_uploads} attempted={len(selected)} "
                     f"storage_mode={self.storage_mode}"
                 )
             else:
                 logger.info(
-                    f"R2 export succeeded task_id={task_id} image_id={image_id} "
+                    f"Response image storage succeeded backend={self.backend} task_id={task_id} image_id={image_id} "
                     f"uploaded={uploaded_count} storage_mode={self.storage_mode}"
                 )
         return image_url_by_storage_key
@@ -335,7 +357,7 @@ class R2AdversarialDatasetExporter:
         try:
             self.queue.put_nowait((record, perturbed_image_b64))
         except queue.Full:
-            logger.warning("R2 adversarial dataset export queue is full; dropping example.")
+            logger.warning("Response image storage queue is full; dropping example.")
 
     def close(self, timeout_seconds: float = 10.0) -> None:
         if not self.enabled or self.thread is None:
@@ -355,7 +377,7 @@ class R2AdversarialDatasetExporter:
             try:
                 self._upload(record=record, perturbed_image_b64=perturbed_image_b64)
             except Exception as exc:
-                logger.warning(f"R2 adversarial dataset export failed image_id={record.image_id}: {exc}")
+                logger.warning(f"Response image storage failed backend={self.backend} image_id={record.image_id}: {exc}")
             finally:
                 self.queue.task_done()
 

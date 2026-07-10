@@ -69,6 +69,7 @@ ANALYZE_BUCKET_MARGIN_WEIGHT = _env_float("ANALYZE_BUCKET_MARGIN_WEIGHT", 0.03)
 ANALYZE_BUCKET_NOVELTY_WEIGHT = _env_float("ANALYZE_BUCKET_NOVELTY_WEIGHT", 0.01)
 ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS = _env_int("ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS", 8)
 STORAGE_MODE = os.getenv("PERTURB_STORAGE_MODE", "latest").strip().lower() or "latest"
+RESPONSE_STORAGE_BACKEND = os.getenv("PERTURB_RESPONSE_STORAGE_BACKEND", "r2").strip().lower() or "r2"
 BURN_RATE_ENDPOINT = "https://api.perturbai.io/api/v1/burn-rate"
 DEFAULT_BURN_RATE = 0.0
 BURN_RATE_FETCH_TIMEOUT_SECONDS = 5.0
@@ -78,9 +79,11 @@ LEADERBOARD_API_URL = "https://api.perturbai.io/api/v1/report"
 LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL = "https://api.perturbai.io/api/v1/last-weight-update"
 LEADERBOARD_REPORT_TIMEOUT_SECONDS = 10.0
 LEADERBOARD_NO_IMAGE_URL = ""
-R2_EXPORT_ENABLED = _env_bool("PERTURB_R2_EXPORT_ENABLED", False)
+RESPONSE_STORAGE_ENABLED = _env_bool("PERTURB_RESPONSE_STORAGE_ENABLED", False)
 R2_PREFIX = "adversarial-dataset"
 R2_PRESIGNED_URL_EXPIRES_SECONDS = 604800
+HIPPIUS_ENDPOINT_URL = os.getenv("PERTURB_HIPPIUS_ENDPOINT_URL", "https://s3.hippius.com").strip()
+HIPPIUS_REGION = os.getenv("PERTURB_HIPPIUS_REGION", "decentralized").strip() or "decentralized"
 
 VALIDATOR_CONFIG = {
     "imagenet100_repo_id": IMAGENET100_REPO_ID,
@@ -102,6 +105,7 @@ VALIDATOR_CONFIG = {
     "analyze_bucket_novelty_weight": ANALYZE_BUCKET_NOVELTY_WEIGHT,
     "analyze_bucket_novelty_target_pixels": ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS,
     "storage_mode": STORAGE_MODE,
+    "response_storage_backend": RESPONSE_STORAGE_BACKEND,
     "burn_rate_endpoint": BURN_RATE_ENDPOINT,
     "default_burn_rate": DEFAULT_BURN_RATE,
     "burn_rate_fetch_timeout_seconds": BURN_RATE_FETCH_TIMEOUT_SECONDS,
@@ -111,9 +115,11 @@ VALIDATOR_CONFIG = {
     "leaderboard_last_weight_update_api_url": LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,
     "leaderboard_report_timeout_seconds": LEADERBOARD_REPORT_TIMEOUT_SECONDS,
     "leaderboard_no_image_url": LEADERBOARD_NO_IMAGE_URL,
-    "r2_export_enabled": R2_EXPORT_ENABLED,
+    "response_storage_enabled": RESPONSE_STORAGE_ENABLED,
     "r2_prefix": R2_PREFIX,
     "r2_presigned_url_expires_seconds": R2_PRESIGNED_URL_EXPIRES_SECONDS,
+    "hippius_endpoint_url": HIPPIUS_ENDPOINT_URL,
+    "hippius_region": HIPPIUS_REGION,
 }
 
 # Validator scoring defaults.
