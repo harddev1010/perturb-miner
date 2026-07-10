@@ -395,10 +395,14 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
     Envelope: for flipped candidates, a second batched TF32-on forward yields max(off,on).
     OOM-safe: halves the batch and retries on CUDA OOM.
 
-    Deadline-aware: tracks an EMA of per-chunk wall time in ctx.t_eval and STOPS launching new chunks once
-    time_left <= EVAL_TIME_MARGIN·t_eval, returning the results graded so far (always >=1 chunk). This is
-    what keeps a large candidate list from running many forward batches past the deadline. Callers iterate
-    or zip over the returned list, so a short (partial) result is safe everywhere.
+    Deadline-aware: tracks an EMA of per-full-chunk wall time in ctx.t_eval and refuses to START any chunk
+    it cannot finish in time (time_left <= EVAL_TIME_MARGIN·t_eval·(chunk_size/bs)), returning the results
+    graded so far. The size-scaling lets a cheap single-candidate eval through on a thin budget while gating
+    a full chunk. Once *any* chunk has been measured (t_eval>0) this fires even before the first chunk of a
+    call, so a stage that inherits a cost estimate (e.g. the q2 fallback's Phase A) can't overrun a tiny
+    reserve; when nothing has ever been measured (t_eval==0) at least one chunk always runs so a fresh
+    search grades something. Callers iterate/zip over the returned list, so a short (or empty) result is
+    safe everywhere.
     """
     if not cand_list:
         return []
@@ -407,10 +411,17 @@ def batch_eval(ctx: Context, cand_list: list[torch.Tensor]) -> list[dict]:
     i = 0
     half_q = 0.5 * ctx.q
     while i < len(cand_list):
-        # Once a chunk cost is known, don't start a chunk we cannot finish before the deadline.
-        if results and ctx.t_eval > 0.0 and ctx.time_left() <= K.EVAL_TIME_MARGIN * ctx.t_eval:
-            break
         chunk = cand_list[i:i + bs]
+        # Deadline-aware: never START a chunk we cannot finish in time. t_eval is the measured cost of a
+        # FULL bs-sized chunk, so scale it by THIS chunk's actual size for the estimate. Unlike the old
+        # gate, this fires even BEFORE the first chunk of a call once *any* chunk has ever been measured
+        # (t_eval > 0) — so a stage that inherits a cost estimate (e.g. the q2 fallback's Phase A) can't
+        # blow a whole 7-14s chunk past a tiny reserve. When nothing has ever been measured (t_eval == 0)
+        # we cannot estimate, so we always run at least this one chunk: a fresh search must still grade
+        # *something*. Small chunks (e.g. the q2 dense backstop's single candidate) scale to a near-free
+        # estimate and are let through even on a thin budget.
+        if ctx.t_eval > 0.0 and ctx.time_left() <= K.EVAL_TIME_MARGIN * ctx.t_eval * (len(chunk) / bs):
+            break
         t0 = time.monotonic()
         try:
             seen_list = [c if ctx.skip_roundtrip else png_roundtrip(c, ctx.device) for c in chunk]

@@ -333,7 +333,7 @@ NOVELTY_TARGET_PIXELS = _env_int("ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS", 8)
 # rung. Capped at q=2 (never q>=3): q=2 tops out at ~0.77 total score, but that dwarfs the 0 of a clean
 # return (which also drags the validator's 300-sample average). Phase A only, time-boxed — a fast net.
 FALLBACK_Q2 = _env_bool("PERTURB_FALLBACK_Q2", True)
-FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 5)    # reserved q=2 budget; reclaimed the instant a q=1 flip banks
+FALLBACK_Q2_SECONDS = _env_float("PERTURB_FALLBACK_Q2_SECONDS", 6)    # reserved q=2 budget; reclaimed the instant a q=1 flip banks
 
 # --- Adaptive hyperparameter controller ---------------------------------------------------
 # Starts every tunable knob at its env value, then watches the BEST margin over a sliding window.
