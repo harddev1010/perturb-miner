@@ -131,14 +131,13 @@ Edit required fields in `scripts/validator.env`:
 
 - `WALLET_NAME`
 - `WALLET_HOTKEY`
-- `PERTURB_R2_BUCKET`
-- `PERTURB_R2_ENDPOINT_URL`
-- `PERTURB_R2_ACCESS_KEY_ID`
-- `PERTURB_R2_SECRET_ACCESS_KEY`
 
 Optional:
 
 - `HF_TOKEN` (speeds up the one-time ImageNet-100 download)
+- `PERTURB_RESPONSE_STORAGE_ENABLED` (`false` default)
+- `PERTURB_RESPONSE_STORAGE_BACKEND` (`r2` default, or `hippius`)
+- Response image storage credentials for the selected backend
 - `PERTURB_STORAGE_MODE` (`latest` default, or `all`)
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` for quieter logs)
 
@@ -159,7 +158,7 @@ Expected log behavior:
 
 - Challenge generation does not depend on external image APIs or LLM verification.
 - ImageNet-100 selection walks the entire train split (~126k images) once in random order before reshuffling for the next epoch; the order, cursor, and epoch persist across restarts so no image repeats within an epoch.
-- R2 export is enabled by default. The validator checks R2 configuration before the challenge loop and stops with a warning if bucket, endpoint, or credentials are missing.
+- Response image export uses Cloudflare R2 by default and can be switched to Hippius S3-compatible storage with `PERTURB_RESPONSE_STORAGE_BACKEND="hippius"`. The validator checks the selected storage configuration before the challenge loop and stops with a warning if bucket, endpoint, or credentials are missing.
 
 ## Installation and Setup (Miner Side)
 
