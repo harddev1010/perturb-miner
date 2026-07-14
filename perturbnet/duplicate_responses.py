@@ -3,19 +3,19 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 
-DUPLICATE_RESPONSE_REASON = "duplicate_response_fastest_wins"
+DUPLICATE_RESPONSE_REASON = "duplicate_response"
 
 
-def apply_fastest_wins(
+def zero_duplicate_responses(
     *,
     results_by_uid: Sequence[tuple[int, Any]],
     response_hash_by_uid: dict[int, str],
 ) -> None:
-    """Zero slower duplicate responses, keeping only the fastest scorer.
+    """Zero all duplicated responses.
 
     Duplicate equality is exact-match on response content hash, calculated from
     the base64-decoded submitted image bytes by the caller. Only positive-score
-    responses participate. If latencies tie, lower UID wins deterministically.
+    responses participate.
     """
     result_by_uid = {uid: result for uid, result in results_by_uid}
     grouped_uids_by_hash: dict[str, list[int]] = {}
@@ -29,12 +29,6 @@ def apply_fastest_wins(
     for duplicate_group in grouped_uids_by_hash.values():
         if len(duplicate_group) <= 1:
             continue
-        winner_uid = min(
-            duplicate_group,
-            key=lambda uid: (int(result_by_uid[uid].response_time_ms), int(uid)),
-        )
         for uid in duplicate_group:
-            if uid == winner_uid:
-                continue
             result_by_uid[uid].score = 0.0
             result_by_uid[uid].reason = DUPLICATE_RESPONSE_REASON

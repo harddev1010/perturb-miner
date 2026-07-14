@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
 import base64
 import hashlib
-import io
 import json
 import logging as pylogging
 import math
 import os
-import random
 import time
 from collections import Counter
 from dataclasses import dataclass
@@ -22,12 +19,13 @@ import torch
 import torch.nn.functional as F
 
 from perturbnet import constants as C
-from perturbnet.duplicate_responses import apply_fastest_wins
+from perturbnet.api_client import SubmittedResponse, get_current_task, get_submitted_responses
+from perturbnet.duplicate_responses import zero_duplicate_responses
 from perturbnet.emissions import ranked_emission_shares
-from perturbnet.image_io import changed_pixel_count, decode_image_b64, quantize_image_uint8_grid
+from perturbnet.image_io import changed_pixel_count, decode_image_b64, image_url_to_b64, quantize_image_uint8_grid
 from perturbnet.leaderboard_payload import build_report, update_score_histories
 from perturbnet.leaderboard_reporter import LeaderboardReporter
-from perturbnet.metagraph_utils import miner_incentive, miner_uids as metagraph_miner_uids
+from perturbnet.metagraph_utils import miner_uids as metagraph_miner_uids
 from perturbnet.model import (
     label_for_index,
     load_efficientnet_v2_l,
@@ -36,8 +34,7 @@ from perturbnet.model import (
     predict_label,
     resolve_target_index,
 )
-from perturbnet.protocol import AttackChallenge
-from perturbnet.r2_adversarial_exporter import AdversarialExportCandidate, R2AdversarialDatasetExporter
+from perturbnet.task_timing import sleep_until_next_task_boundary
 
 logger = pylogging.getLogger(__name__)
 
@@ -51,7 +48,6 @@ class ChallengeSpec:
     true_label: str
     epsilon: float
     norm_type: str
-    timeout_seconds: int
 
 
 @dataclass
@@ -59,7 +55,6 @@ class EvaluationResult:
     score: float
     reason: str
     model_prediction: str = ""
-    response_time_ms: int = 0
     norm: float = 0.0
     rmse: float = 0.0
     epsilon: float = 0.0
@@ -98,15 +93,6 @@ def _make_subtensor(config):
         return subtensor_cls(network=network)
     except Exception:
         return subtensor_cls(config=config)
-
-
-def _make_dendrite(wallet):
-    if hasattr(bt, "dendrite"):
-        return bt.dendrite(wallet=wallet)
-    dendrite_cls = getattr(bt, "Dendrite", None)
-    if dendrite_cls is None:
-        raise RuntimeError("No dendrite constructor found in bittensor.")
-    return dendrite_cls(wallet=wallet)
 
 
 def _configure_log_level(level_raw: str) -> None:
@@ -157,23 +143,13 @@ class PerturbValidator:
         self.wallet = _make_wallet(config=self.config)
         self.subtensor = _make_subtensor(config=self.config)
         self.metagraph = self.subtensor.metagraph(netuid=self.config.netuid)
-        self.dendrite = _make_dendrite(wallet=self.wallet)
-        self._query_loop = asyncio.new_event_loop()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.system_random = random.SystemRandom()
-
         self.model = load_efficientnet_v2_l(self.device)
         self.step = 0
         self.last_weight_block = 0
         self.state_path = os.path.join(self.config.logging.logging_dir, C.VALIDATOR_STATE_FILENAME)
         hotkey = getattr(self.wallet.hotkey, "ss58_address", "unknown")
         self.run_id = f"{str(hotkey)[:8]}-n{self.config.netuid}-p{os.getpid()}"
-        self.adversarial_exporter = R2AdversarialDatasetExporter(
-            run_id=self.run_id,
-            netuid=int(self.config.netuid),
-            validator_hotkey=str(hotkey),
-            storage_mode=str(getattr(self.config.perturb, "storage_mode", C.STORAGE_MODE)),
-        )
         self.leaderboard_reporter = LeaderboardReporter(
             enabled=bool(getattr(self.config.perturb, "leaderboard_reporting_enabled", True)),
             api_url=str(getattr(self.config.perturb, "leaderboard_api_url", C.LEADERBOARD_API_URL)),
@@ -184,20 +160,14 @@ class PerturbValidator:
                     C.LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,
                 )
             ),
+            api_key=str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY)),
             timeout_seconds=float(getattr(self.config.perturb, "leaderboard_report_timeout_seconds", 10.0)),
             wallet=self.wallet,
             validator_hotkey=str(hotkey),
         )
         self.reason_counts_total: Counter[str] = Counter()
         self.miner_emission_share = 1
-        self.imagenet100_order_seed = 0
-        self.imagenet100_order_cursor = 0
-        self.imagenet100_order_fingerprint = ""
-        self.imagenet100_order_epoch = 0
-        self._imagenet100_index: list[tuple[str, int]] = []
-        self._imagenet100_dataset: Any | None = None
-        self._imagenet100_order_cache: list[str] = []
-        self._imagenet100_order_cache_key: tuple[str, int] = ("", 0)
+        self.last_validated_api_task_id = ""
 
         self.processed_counts = np.zeros(int(self.metagraph.n), dtype=np.int32)
         self.score_histories: list[list[float]] = [[] for _ in range(int(self.metagraph.n))]
@@ -207,6 +177,15 @@ class PerturbValidator:
         self.uid_hotkeys: list[str] = list(self.metagraph.hotkeys[: int(self.metagraph.n)])
 
         self._load_state()
+
+    def _api_key(self) -> str:
+        return str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY)).strip()
+
+    def _ensure_api_key(self) -> None:
+        if not self._api_key():
+            msg = "PERTURB_API_KEY is not set; validator cannot fetch submitted responses."
+            logger.error(msg)
+            raise RuntimeError(msg)
 
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
@@ -307,10 +286,7 @@ class PerturbValidator:
                 value = saved_hotkeys[idx]
                 if isinstance(value, str):
                     self.uid_hotkeys[idx] = value
-        self.imagenet100_order_seed = max(0, int(state.get("imagenet100_order_seed", 0)))
-        self.imagenet100_order_cursor = max(0, int(state.get("imagenet100_order_cursor", 0)))
-        self.imagenet100_order_fingerprint = str(state.get("imagenet100_order_fingerprint", "") or "")
-        self.imagenet100_order_epoch = max(0, int(state.get("imagenet100_order_epoch", 0)))
+        self.last_validated_api_task_id = str(state.get("last_validated_api_task_id", "") or "")
         self._reconcile_uid_identities()
 
     def _save_state(self) -> None:
@@ -327,13 +303,8 @@ class PerturbValidator:
                 for history in self.leaderboard_score_histories
             ],
             "uid_hotkeys": self.uid_hotkeys,
-            "imagenet100_order_seed": int(self.imagenet100_order_seed),
-            "imagenet100_order_cursor": int(self.imagenet100_order_cursor),
-            "imagenet100_order_fingerprint": self.imagenet100_order_fingerprint,
-            "imagenet100_order_epoch": int(self.imagenet100_order_epoch),
+            "last_validated_api_task_id": self.last_validated_api_task_id,
         }
-        # Atomic write: a crash mid-save must never corrupt the state file,
-        # otherwise a restart could reset the traversal and repeat images.
         tmp_path = f"{self.state_path}.tmp"
         with open(tmp_path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle)
@@ -341,323 +312,39 @@ class PerturbValidator:
             os.fsync(handle.fileno())
         os.replace(tmp_path, self.state_path)
 
-    def _seed_from_block(self, block: int) -> int:
-        digest = hashlib.sha256(f"{C.SUBNET_NAMESPACE}:{self.config.netuid}:{block}".encode("utf-8")).hexdigest()
-        return int(digest[:16], 16)
-
-    def _sample_epsilon(self, seed: int) -> float:
-        # Deterministic epsilon in [0.06, 0.2]
-        return 0.06 + (seed % 1400) / 10000.0
-
-    def _load_imagenet100_index(self) -> list[tuple[str, int]]:
-        """Open the full ImageNet-100 train split (~126k images) with random
-        access; ids map to dataset row indices."""
-        if self._imagenet100_index:
-            return self._imagenet100_index
-
-        from perturbnet.imagenet100_bootstrap import imagenet100_dataset_version, load_imagenet100
-
-        repo_id = str(getattr(self.config.perturb, "imagenet100_repo_id", C.IMAGENET100_REPO_ID))
-        split = str(getattr(self.config.perturb, "imagenet100_split", C.IMAGENET100_SPLIT))
-        dataset = load_imagenet100(repo_id=repo_id, split=split)
-        version = imagenet100_dataset_version(dataset=dataset, repo_id=repo_id, split=split)
-        total_rows = int(dataset.num_rows)
-        if total_rows <= 0:
-            raise RuntimeError(f"ImageNet-100 dataset is empty: repo={repo_id} split={split}")
-        self._imagenet100_dataset = dataset
-        self._imagenet100_index = [(f"hf-{version}-{row:07d}", row) for row in range(total_rows)]
-        logger.info(f"Loaded ImageNet-100 challenge index images={total_rows} repo={repo_id} split={split}")
-        return self._imagenet100_index
-
-    def _imagenet100_fingerprint(self, image_ids: Sequence[str]) -> str:
-        digest = hashlib.sha256()
-        for image_id in sorted(image_ids):
-            digest.update(image_id.encode("utf-8"))
-            digest.update(b"\0")
-        return digest.hexdigest()
-
-    def _derive_imagenet100_order(self, image_ids: Sequence[str], seed: int) -> list[str]:
-        # Deterministic shuffle from the persisted seed: restarts rebuild the
-        # exact same traversal order without storing ~126k ids in state.
-        order = sorted(image_ids)
-        random.Random(seed).shuffle(order)
-        return order
-
-    def _reset_imagenet100_order(self, fingerprint: str, epoch: int) -> None:
-        self.imagenet100_order_seed = self.system_random.randrange(1, 2**63)
-        self.imagenet100_order_cursor = 0
-        self.imagenet100_order_fingerprint = fingerprint
-        self.imagenet100_order_epoch = epoch
-        self._imagenet100_order_cache = []
-        self._imagenet100_order_cache_key = ("", 0)
-
-    def _ensure_imagenet100_order(self, image_ids: Sequence[str]) -> None:
-        fingerprint = self._imagenet100_fingerprint(image_ids)
-        if self.imagenet100_order_fingerprint != fingerprint or self.imagenet100_order_seed <= 0:
-            self._reset_imagenet100_order(fingerprint=fingerprint, epoch=0)
-            logger.info(f"Initialized ImageNet-100 random traversal images={len(image_ids)}")
-        elif self.imagenet100_order_cursor >= len(image_ids):
-            self._reset_imagenet100_order(fingerprint=fingerprint, epoch=self.imagenet100_order_epoch + 1)
-            logger.info(
-                f"ImageNet-100 traversal exhausted; reshuffled for epoch={self.imagenet100_order_epoch} "
-                f"images={len(image_ids)}"
-            )
-        cache_key = (self.imagenet100_order_fingerprint, int(self.imagenet100_order_seed))
-        if self._imagenet100_order_cache_key != cache_key or not self._imagenet100_order_cache:
-            self._imagenet100_order_cache = self._derive_imagenet100_order(
-                image_ids=image_ids, seed=int(self.imagenet100_order_seed)
-            )
-            self._imagenet100_order_cache_key = cache_key
-
-    def _mark_imagenet100_image_used(self, image_id: str) -> None:
-        order = self._imagenet100_order_cache
-        if self.imagenet100_order_cursor < len(order) and order[self.imagenet100_order_cursor] != image_id:
-            logger.warning("Accepted ImageNet-100 image does not match traversal cursor; advancing anyway.")
-        self.imagenet100_order_cursor += 1
-
-    def _imagenet100_image_bytes(self, source: int) -> bytes:
-        if self._imagenet100_dataset is None:
-            raise RuntimeError("ImageNet-100 dataset is not loaded")
-        example = self._imagenet100_dataset[int(source)]
-        image = example.get("image")
-        if image is None:
-            raise ValueError(f"ImageNet-100 row {source} has no image payload")
-        buffer = io.BytesIO()
-        image.convert("RGB").save(buffer, format="JPEG", quality=95)
-        return buffer.getvalue()
-
-    def _sample_imagenet100_image(self) -> tuple[str, str]:
-        index = self._load_imagenet100_index()
-        source_by_id = {image_id: source for image_id, source in index}
-        image_ids = list(source_by_id.keys())
-        self._ensure_imagenet100_order(image_ids=image_ids)
-        if not self._imagenet100_order_cache:
-            raise RuntimeError("ImageNet-100 traversal order is empty")
-        image_id = self._imagenet100_order_cache[self.imagenet100_order_cursor]
-        try:
-            raw = self._imagenet100_image_bytes(source_by_id[image_id])
-            if not raw:
-                raise ValueError(f"ImageNet-100 image is empty: {image_id}")
-        except Exception:
-            # Skip corrupt/unreadable entries permanently in this traversal.
-            self._mark_imagenet100_image_used(image_id=image_id)
-            self._save_state()
-            raise
-        return image_id, base64.b64encode(raw).decode("utf-8")
-
-    def generate_challenge(self, block: int) -> ChallengeSpec:
-        model_name = C.MODEL_NAME
-        base_seed = self._seed_from_block(block)
-        self._log_step_start(
-            "generate_challenge",
-            block=block,
-            base_seed=base_seed,
-            max_attempts=self.config.perturb.max_challenge_attempts,
+    def challenge_from_task_api(self, *, task_id: str, image_url: str) -> ChallengeSpec:
+        image_b64 = image_url_to_b64(
+            image_url,
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
         )
-        for attempt in range(self.config.perturb.max_challenge_attempts):
-            seed = base_seed + attempt
-            self._log_summary(
-                "challenge_attempt",
-                attempt=attempt + 1,
-                max_attempts=self.config.perturb.max_challenge_attempts,
-                seed=seed,
-                source="imagenet100",
-            )
-            self._log_step_start(
-                "challenge_attempt_internal",
-                attempt=attempt + 1,
-            )
-            try:
-                self._log_step_start("challenge_sample_imagenet100", seed=seed)
-                image_id, image_b64 = self._sample_imagenet100_image()
-            except Exception as exc:
-                logger.warning(f"ImageNet-100 challenge image sample failed, retrying: {exc}")
-                continue
-
-            epsilon = self._sample_epsilon(seed)
-            task_id = f"{block}-{seed}"
-            self._log_step_start("challenge_prepare", task_id=task_id, epsilon=f"{epsilon:.4f}")
-
-            try:
-                self._log_step_start("challenge_model_inference", task_id=task_id)
-                image = decode_image_b64(image_b64).to(self.device)
-                predicted = predict_label(self.model, image)
-                predicted_label = normalize_prediction_label(predicted)
-                self._log_summary("challenge_model_output", image_id=image_id, predicted_label=predicted_label)
-            except Exception as exc:
-                logger.warning(f"Challenge decode/model validation failed, retrying: {exc}")
-                self._mark_imagenet100_image_used(image_id=image_id)
-                self._save_state()
-                continue
-
-            self._mark_imagenet100_image_used(image_id=image_id)
-            self._save_state()
-            return ChallengeSpec(
-                task_id=task_id,
-                image_id=image_id,
-                model_name=model_name,
-                clean_image_b64=image_b64,
-                # Use exact EfficientNet class label for miner targeting and response verification.
-                true_label=predicted_label,
-                epsilon=epsilon,
-                norm_type="Linf",
-                timeout_seconds=self.config.perturb.timeout_seconds,
-            )
-
-        raise RuntimeError("Unable to build a validated challenge after max attempts")
-
-    def _available_miner_uids(self) -> list[int]:
-        my_hotkey = self.wallet.hotkey.ss58_address
-        candidate_uids: list[int] = []
-        for uid in range(int(self.metagraph.n)):
-            if self.metagraph.hotkeys[uid] == my_hotkey:
-                continue
-            if self.metagraph.axons[uid].ip == "0.0.0.0":
-                continue
-            candidate_uids.append(uid)
-
-        if len(candidate_uids) <= 1:
-            return candidate_uids
-
-        # Merge miners that likely belong to the same operator:
-        # - same coldkey OR same axon ip
-        # Keep only the lowest uid representative from each merged group.
-        parent: dict[int, int] = {uid: uid for uid in candidate_uids}
-
-        def _find(uid: int) -> int:
-            while parent[uid] != uid:
-                parent[uid] = parent[parent[uid]]
-                uid = parent[uid]
-            return uid
-
-        def _union(a: int, b: int) -> None:
-            ra = _find(a)
-            rb = _find(b)
-            if ra == rb:
-                return
-            if ra < rb:
-                parent[rb] = ra
-            else:
-                parent[ra] = rb
-
-        first_uid_by_coldkey: dict[str, int] = {}
-        first_uid_by_ip: dict[str, int] = {}
-        coldkeys = getattr(self.metagraph, "coldkeys", [])
-        for uid in candidate_uids:
-            coldkey = ""
-            if uid < len(coldkeys):
-                coldkey = str(coldkeys[uid] or "").strip()
-            if coldkey:
-                seen_uid = first_uid_by_coldkey.get(coldkey)
-                if seen_uid is None:
-                    first_uid_by_coldkey[coldkey] = uid
-                else:
-                    _union(seen_uid, uid)
-
-            ip = str(getattr(self.metagraph.axons[uid], "ip", "") or "").strip()
-            if ip:
-                seen_uid = first_uid_by_ip.get(ip)
-                if seen_uid is None:
-                    first_uid_by_ip[ip] = uid
-                else:
-                    _union(seen_uid, uid)
-
-        min_uid_by_group: dict[int, int] = {}
-        for uid in candidate_uids:
-            root = _find(uid)
-            current_min = min_uid_by_group.get(root)
-            if current_min is None or uid < current_min:
-                min_uid_by_group[root] = uid
-
-        return sorted(min_uid_by_group.values())
-
-    def _valuable_miner_uids(self, candidate_uids: Sequence[int]) -> list[int]:
-        history_size = int(self.config.perturb.history_size)
-        return [uid for uid in candidate_uids if len(self.score_histories[uid]) >= history_size]
-
-    def _select_random_miners(self, candidate_uids: Sequence[int], seed: int) -> list[int]:
-        if not candidate_uids:
-            return []
-        valuable = self._valuable_miner_uids(candidate_uids)
-        pool = list(candidate_uids)
-        k = min(int(self.config.perturb.k_miners), len(pool))
-        rng = random.Random(seed)
-        if k <= 0:
-            return []
-        if not valuable:
-            return sorted(rng.sample(pool, k=k))
-
-        valuable_set = set(valuable)
-        newcomers = [uid for uid in pool if uid not in valuable_set]
-        ratio = float(max(0.0, min(1.0, self.config.perturb.miner_exploration_ratio)))
-        explore_k = min(len(newcomers), int(round(k * ratio)))
-        if newcomers and ratio > 0.0 and explore_k == 0:
-            explore_k = 1
-        exploit_k = min(len(valuable), k - explore_k)
-        if exploit_k + explore_k < k:
-            explore_k = min(len(newcomers), explore_k + (k - (exploit_k + explore_k)))
-
-        selected: list[int] = []
-        if exploit_k > 0:
-            selected.extend(rng.sample(list(valuable), k=exploit_k))
-        if explore_k > 0:
-            selected.extend(rng.sample(newcomers, k=explore_k))
-
-        if len(selected) < k:
-            remaining = [uid for uid in pool if uid not in set(selected)]
-            selected.extend(rng.sample(remaining, k=min(k - len(selected), len(remaining))))
-        return sorted(selected)
-
-    async def _query_miners(self, uids: Sequence[int], challenge: ChallengeSpec):
-        self._log_step_start(
-            "query_miners",
-            task_id=challenge.task_id,
-            miner_count=len(uids),
-            timeout=challenge.timeout_seconds,
+        image = decode_image_b64(image_b64).to(self.device)
+        predicted_label = normalize_prediction_label(predict_label(self.model, image))
+        return ChallengeSpec(
+            task_id=task_id,
+            image_id=task_id,
+            model_name=C.MODEL_NAME,
+            clean_image_b64=image_b64,
+            true_label=predicted_label,
+            epsilon=float(getattr(self.config.perturb, "max_linf_delta", C.MAX_LINF_DELTA)),
+            norm_type="Linf",
         )
-        axons = [self.metagraph.axons[uid] for uid in uids]
-        synapse = AttackChallenge(
-            task_id=challenge.task_id,
-            model_name=challenge.model_name,
-            clean_image_b64=challenge.clean_image_b64,
-            true_label=challenge.true_label,
-            epsilon=challenge.epsilon,
-            norm_type=challenge.norm_type,
-            min_delta=self.config.perturb.min_linf_delta,
-            timeout_seconds=challenge.timeout_seconds,
-        )
-        responses = await self.dendrite.forward(
-            axons=axons,
-            synapse=synapse,
-            deserialize=False,
-            timeout=challenge.timeout_seconds,
-        )
-        return responses
-
-    def _run_query_miners(self, uids: Sequence[int], challenge: ChallengeSpec):
-        # Keep a persistent event loop for dendrite calls; asyncio.run() closes
-        # the loop each call and can trigger "Event loop is closed" on reuse.
-        if self._query_loop.is_closed():
-            self._query_loop = asyncio.new_event_loop()
-        return self._query_loop.run_until_complete(self._query_miners(uids, challenge))
 
     def verify_and_score(
         self,
         challenge: ChallengeSpec,
         perturbed_image_b64: str,
-        response_time_ms: int,
         novelty_pixel_count: int | None = None,
     ) -> EvaluationResult:
         try:
             x_clean = quantize_image_uint8_grid(decode_image_b64(challenge.clean_image_b64).to(self.device))
             x_adv = quantize_image_uint8_grid(decode_image_b64(perturbed_image_b64).to(self.device))
         except Exception as exc:
-            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}", response_time_ms=response_time_ms)
+            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}")
 
         if x_adv.shape != x_clean.shape:
-            return EvaluationResult(score=0.0, reason="shape_mismatch", response_time_ms=response_time_ms)
+            return EvaluationResult(score=0.0, reason="shape_mismatch")
         if x_adv.min().item() < 0.0 or x_adv.max().item() > 1.0:
-            return EvaluationResult(score=0.0, reason="value_out_of_range", response_time_ms=response_time_ms)
+            return EvaluationResult(score=0.0, reason="value_out_of_range")
 
         prediction = ""
         prediction_index: int | None = None
@@ -672,7 +359,6 @@ class PerturbValidator:
             return EvaluationResult(
                 score=0.0,
                 reason=f"model_inference_failed:{exc}",
-                response_time_ms=response_time_ms,
             )
 
         if challenge.norm_type == "Linf":
@@ -687,7 +373,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_delta",
                 model_prediction=prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 epsilon=float(challenge.epsilon),
             )
@@ -697,7 +382,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="above_max_delta",
                 model_prediction=prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
@@ -715,7 +399,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="label_match_with_original",
                 model_prediction=normalized_prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
@@ -730,7 +413,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_ssim",
                 model_prediction=normalized_prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
@@ -744,7 +426,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_psnr_db",
                 model_prediction=normalized_prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
@@ -766,9 +447,6 @@ class PerturbValidator:
         total_weight = max(1e-12, linf_weight + rmse_weight)
         perturbation_score = ((linf_weight * linf_score) + (rmse_weight * rmse_score)) / total_weight
 
-        time_ratio = response_time_ms / (challenge.timeout_seconds * 1000.0)
-        speed_score = 1.0 - min(time_ratio, 1.0)
-
         margin_score = 0.0
         if logits is not None and true_index is not None and 0 <= true_index < logits.shape[1]:
             row = logits[0]
@@ -786,7 +464,6 @@ class PerturbValidator:
 
         score = (
             C.PERTURBATION_WEIGHT * perturbation_score
-            + C.SPEED_WEIGHT * speed_score
             + float(getattr(self.config.perturb, "analyze_bucket_margin_weight", 0.03)) * margin_score
             + float(getattr(self.config.perturb, "analyze_bucket_novelty_weight", 0.01)) * novelty_score
         )
@@ -794,7 +471,6 @@ class PerturbValidator:
             score=float(score),
             reason="success",
             model_prediction=normalized_prediction,
-            response_time_ms=response_time_ms,
             norm=float(norm),
             rmse=float(rmse),
             epsilon=float(challenge.epsilon),
@@ -821,16 +497,11 @@ class PerturbValidator:
         challenge: ChallengeSpec,
         results_by_uid: Sequence[tuple[int, EvaluationResult]],
         image_url_by_uid: dict[int, str],
-        available_miner_count: int,
     ) -> None:
         self.leaderboard_reporter.submit(
             build_report(
                 task_id=challenge.task_id,
                 validator_hotkey=str(getattr(self.wallet.hotkey, "ss58_address", "")),
-                total_miners=len(self._leaderboard_miner_uids()),
-                available_miners=int(available_miner_count),
-                hotkeys=self.metagraph.hotkeys,
-                incentives_by_uid={uid: miner_incentive(self.metagraph, uid) for uid, _ in results_by_uid},
                 score_histories=self.leaderboard_score_histories,
                 avg_window=int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),
                 results_by_uid=results_by_uid,
@@ -859,6 +530,88 @@ class PerturbValidator:
         own_hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "") or "")
         own_uid = self.metagraph.hotkeys.index(own_hotkey) if own_hotkey in self.metagraph.hotkeys else None
         return [uid for uid in metagraph_miner_uids(self.metagraph) if own_uid is None or uid != own_uid]
+
+    def _wait_for_next_task_boundary(self) -> None:
+        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
+        slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
+        logger.info(f"Reached task boundary after waiting {slept:.2f}s")
+
+    def _wait_before_task_fetch(self) -> None:
+        delay = float(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_delay_seconds",
+                C.VALIDATOR_EVALUATION_DELAY_SECONDS,
+            )
+        )
+        logger.info(f"Waiting {delay:.2f}s after task boundary before fetching task")
+        time.sleep(max(0.0, delay))
+
+    def _fetch_current_task(self):
+        retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
+        retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
+        for attempt in range(1, retries + 1):
+            try:
+                task = get_current_task(
+                    base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                    timeout_seconds=float(
+                        getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(f"Task API request failed attempt={attempt}/{retries}: {exc}")
+                task = None
+            if task is not None:
+                return task
+            logger.info(f"No task available attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(retry_seconds)
+        return None
+
+    def _wait_for_submitted_responses(self, *, task_id: str) -> list[SubmittedResponse] | None:
+        poll_seconds = float(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_poll_seconds",
+                C.VALIDATOR_EVALUATION_POLL_SECONDS,
+            )
+        )
+        retries = int(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_poll_retries",
+                C.VALIDATOR_EVALUATION_POLL_RETRIES,
+            )
+        )
+        base_url = str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL))
+        api_key = self._api_key()
+        timeout_seconds = float(
+            getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+        )
+
+        for attempt in range(1, retries + 1):
+            try:
+                submitted_responses = get_submitted_responses(
+                    base_url=base_url,
+                    api_key=api_key,
+                    timeout_seconds=timeout_seconds,
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Submitted responses request failed task_id={task_id} attempt={attempt}/{retries}: {exc}"
+                )
+                submitted_responses = []
+            if submitted_responses:
+                logger.info(
+                    f"Submitted responses available task_id={task_id} count={len(submitted_responses)} "
+                    f"attempt={attempt}/{retries}"
+                )
+                return submitted_responses
+            logger.info(f"No submitted responses yet task_id={task_id} attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(max(0.1, poll_seconds))
+        logger.warning(f"No submitted responses after {retries} attempts task_id={task_id}")
+        return None
 
     def _fallback_burn_rate(self) -> float:
         return min(max(float(getattr(self.config.perturb, "default_burn_rate", 0.0)), 0.0), 1.0)
@@ -994,11 +747,11 @@ class PerturbValidator:
         self.sync()
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             raise RuntimeError("Validator hotkey is not registered on this netuid.")
+        self._ensure_api_key()
 
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
         self._log_summary(
             "validator_config",
-            timeout=self.config.perturb.timeout_seconds,
             k_miners=self.config.perturb.k_miners,
             history_size=self.config.perturb.history_size,
             min_linf=self.config.perturb.min_linf_delta,
@@ -1006,7 +759,6 @@ class PerturbValidator:
             min_ssim=self.config.perturb.min_ssim,
             min_psnr_db=self.config.perturb.min_psnr_db,
             perturb_weight=C.PERTURBATION_WEIGHT,
-            speed_weight=C.SPEED_WEIGHT,
             tempo=tempo,
             run_id=self.run_id,
         )
@@ -1017,14 +769,24 @@ class PerturbValidator:
                 self.sync()
                 self._log_step_start("loop_get_current_block")
                 block = self.subtensor.get_current_block()
-                self._log_step_start("loop_generate_challenge", block=block)
-                try:
-                    challenge = self.generate_challenge(block=block)
-                except Exception as exc:
-                    logger.warning(
-                        f"Challenge generation failed; retrying in {C.CHALLENGE_RETRY_DELAY_SECONDS}s: {exc}"
+                self._log_step_start("loop_wait_task_boundary", block=block)
+                self._wait_for_next_task_boundary()
+                self._log_step_start("loop_wait_before_task_fetch", block=block)
+                self._wait_before_task_fetch()
+                self._log_step_start("loop_get_api_task", block=block)
+                task = self._fetch_current_task()
+                if task is None:
+                    continue
+                if task.task_id == self.last_validated_api_task_id:
+                    logger.info(
+                        f"Task unchanged task_id={task.task_id}; waiting for next task boundary"
                     )
-                    time.sleep(C.CHALLENGE_RETRY_DELAY_SECONDS)
+                    continue
+                try:
+                    challenge = self.challenge_from_task_api(task_id=task.task_id, image_url=task.image_url)
+                except Exception as exc:
+                    logger.warning(f"Task API challenge load failed task_id={task.task_id}: {exc}")
+                    time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
                     continue
                 self._log_summary(
                     "challenge_summary",
@@ -1033,122 +795,81 @@ class PerturbValidator:
                     true_label=challenge.true_label,
                 )
 
-                self._log_step_start("loop_discover_miners")
-                available_uids = self._available_miner_uids()
-                if not available_uids:
-                    logger.warning("No miners available")
-                    time.sleep(self.config.perturb.query_interval_seconds)
+                self._log_step_start("loop_wait_for_submitted_responses", task_id=challenge.task_id)
+                submitted_responses = self._wait_for_submitted_responses(task_id=challenge.task_id)
+                if not submitted_responses:
+                    self.last_validated_api_task_id = challenge.task_id
+                    self._save_state()
                     continue
-                self._log_step_start("loop_select_miners", candidate_count=len(available_uids))
-                valuable_uids = self._valuable_miner_uids(available_uids)
-                miner_uids = self._select_random_miners(available_uids, seed=self._seed_from_block(block))
-                if not miner_uids:
-                    logger.warning("Miner selection is empty")
-                    time.sleep(self.config.perturb.query_interval_seconds)
-                    continue
-                self._log_summary(
-                    "miner_selection",
-                    selected=len(miner_uids),
-                    valuable_pool=len(valuable_uids),
-                    total_pool=len(available_uids),
-                )
 
-                self._log_step_start("loop_query_miners", selected_count=len(miner_uids))
-                responses = self._run_query_miners(miner_uids, challenge)
-                self._log_step_start("loop_score_responses", response_count=len(responses))
+                submitted_response_by_uid: dict[int, SubmittedResponse] = {}
+                for item in submitted_responses:
+                    if 0 <= int(item.miner_uid) < int(self.metagraph.n):
+                        submitted_response_by_uid[int(item.miner_uid)] = item
+                miner_uids = sorted(submitted_response_by_uid)
+                available_uids = list(miner_uids)
+                if not miner_uids:
+                    logger.warning("Submitted response list had no valid metagraph miner UIDs.")
+                    time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
+                    continue
+                self._log_summary("miner_submission_selection", submitted=len(miner_uids))
+
+                self._log_step_start("loop_score_responses", response_count=len(miner_uids))
                 rewards: list[float] = []
                 results_by_uid: list[tuple[int, EvaluationResult]] = []
                 response_log_lines: list[str] = []
-                response_b64_by_uid: dict[int, str] = {}
                 response_hash_by_uid: dict[int, str] = {}
                 status_code_by_uid: dict[int, int] = {}
-                storage_key_by_uid: dict[int, str] = {}
-                responded_miner_count = 0
-                for uid, response in zip(miner_uids, responses):
-                    status_code = getattr(response.dendrite, "status_code", 0) if response.dendrite else 0
+                for uid in miner_uids:
+                    submitted = submitted_response_by_uid[uid]
+                    status_code = 200
+                    try:
+                        perturbed_image_b64 = image_url_to_b64(
+                            submitted.image_url,
+                            timeout_seconds=float(
+                                getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                            ),
+                        )
+                    except Exception as exc:
+                        status_code = 0
+                        perturbed_image_b64 = ""
+                        logger.warning(f"Submitted response download failed uid={uid} url={submitted.image_url}: {exc}")
                     status_code_by_uid[uid] = int(status_code)
-                    process_time = getattr(response.dendrite, "process_time", None) if response.dendrite else None
-                    response_time_ms = int((process_time or challenge.timeout_seconds) * 1000)
 
-                    if status_code != 200 or not response.perturbed_image_b64:
+                    if status_code != 200 or not perturbed_image_b64:
                         result = EvaluationResult(
                             score=0.0,
                             reason="response_missing_or_status_error",
                             model_prediction="unavailable",
-                            response_time_ms=response_time_ms,
                         )
                     else:
-                        responded_miner_count += 1
-                        # Duplicate detection is exact-match on submitted response bytes
-                        # (base64-decoded content), not perceptual similarity.
                         try:
-                            response_hash_by_uid[uid] = hashlib.sha256(
-                                base64.b64decode(response.perturbed_image_b64)
-                            ).hexdigest()
-                            response_b64_by_uid[uid] = response.perturbed_image_b64
+                            response_hash_by_uid[uid] = hashlib.sha256(base64.b64decode(perturbed_image_b64)).hexdigest()
                         except Exception:
                             pass
                         result = self.verify_and_score(
                             challenge=challenge,
-                            perturbed_image_b64=response.perturbed_image_b64,
-                            response_time_ms=response_time_ms,
+                            perturbed_image_b64=perturbed_image_b64,
                         )
                     results_by_uid.append((uid, result))
 
-                apply_fastest_wins(results_by_uid=results_by_uid, response_hash_by_uid=response_hash_by_uid)
+                zero_duplicate_responses(results_by_uid=results_by_uid, response_hash_by_uid=response_hash_by_uid)
 
-                export_candidates: list[AdversarialExportCandidate] = []
+                image_url_by_uid: dict[int, str] = {}
                 for uid, result in results_by_uid:
                     score = float(result.score)
                     rewards.append(score)
-                    response_hash = response_hash_by_uid.get(uid)
-                    response_b64 = response_b64_by_uid.get(uid)
-                    if result.reason == "success" and response_hash and response_b64:
-                        miner_hotkey = ""
-                        if uid < len(self.metagraph.hotkeys):
-                            miner_hotkey = str(self.metagraph.hotkeys[uid])
-                        miner_storage_key = self.adversarial_exporter.miner_storage_key(
-                            miner_uid=int(uid),
-                            miner_hotkey=miner_hotkey,
-                        )
-                        storage_key_by_uid[uid] = miner_storage_key
-                        export_candidates.append(
-                            AdversarialExportCandidate(
-                                miner_storage_key=miner_storage_key,
-                                adversarial_label=result.model_prediction,
-                                score=float(result.score),
-                                norm=float(result.norm),
-                                rmse=float(result.rmse),
-                                epsilon=float(result.epsilon),
-                                ssim=float(result.ssim),
-                                psnr_db=float(result.psnr_db),
-                                response_time_ms=int(result.response_time_ms),
-                                perturbed_image_b64=response_b64,
-                            )
-                        )
+                    if result.reason == "success":
+                        image_url_by_uid[uid] = submitted_response_by_uid[uid].image_url
                     self.reason_counts_total[result.reason] += 1
                     response_log_lines.append(
                         f"uid={uid} status={status_code_by_uid.get(uid, 0)} score={score:.6f} "
-                        f"response_time_ms={result.response_time_ms} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} "
                         f"norm={result.norm:.6f} rmse={result.rmse:.6f} epsilon={result.epsilon:.6f} "
                         f"ssim={result.ssim:.6f} psnr_db={result.psnr_db:.4f}"
                     )
 
-                image_url_by_storage_key = self.adversarial_exporter.submit_top_unique(
-                    image_id=challenge.image_id,
-                    task_id=challenge.task_id,
-                    block=int(block),
-                    model_name=challenge.model_name,
-                    true_label=challenge.true_label,
-                    candidates=export_candidates,
-                )
-                image_url_by_uid = {
-                    uid: image_url_by_storage_key[storage_key]
-                    for uid, storage_key in storage_key_by_uid.items()
-                    if storage_key in image_url_by_storage_key
-                }
                 all_zero_scores = bool(rewards) and all(score <= 0.0 for score in rewards)
 
                 self._log_step_start("loop_update_histories")
@@ -1160,14 +881,13 @@ class PerturbValidator:
                     challenge=challenge,
                     results_by_uid=leaderboard_results_by_uid,
                     image_url_by_uid=image_url_by_uid,
-                    available_miner_count=len(available_uids),
                 )
                 self._log_summary(
                     "leaderboard_report_queued",
                     task_id=challenge.task_id,
                     miners=len(leaderboard_results_by_uid),
                     valid=sum(1 for _, result in leaderboard_results_by_uid if result.reason == "success"),
-                    r2_uploaded=len(image_url_by_uid),
+                    response_urls=len(image_url_by_uid),
                     available=len(available_uids),
                 )
                 if all_zero_scores:
@@ -1206,6 +926,7 @@ class PerturbValidator:
                         reasons=",".join([f"{k}:{v}" for k, v in sorted(reason_counts.items())]),
                     )
                 
+                self.last_validated_api_task_id = challenge.task_id
                 self._log_step_start("loop_save_state")
                 self._save_state()
 
@@ -1216,16 +937,12 @@ class PerturbValidator:
                         self.last_weight_block = block
 
                 self.step += 1
-                time.sleep(self.config.perturb.query_interval_seconds)
             except KeyboardInterrupt:
                 logger.info("Validator stopped by user.")
                 break
             except Exception as exc:
                 logger.error(f"Validator loop error: {exc}")
                 time.sleep(5)
-        if not self._query_loop.is_closed():
-            self._query_loop.close()
-        self.adversarial_exporter.close()
         self.leaderboard_reporter.close()
 
 

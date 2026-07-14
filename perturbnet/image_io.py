@@ -4,6 +4,7 @@ import base64
 import io
 
 import numpy as np
+import requests
 import torch
 from PIL import Image
 
@@ -19,6 +20,16 @@ def encode_image_b64(image_chw: torch.Tensor) -> str:
     clipped = image_chw.detach().cpu().clamp(0.0, 1.0)
     arr = (clipped.permute(1, 2, 0).numpy() * 255.0).round().astype(np.uint8)
     image = Image.fromarray(arr, mode="RGB")
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+
+def image_url_to_b64(image_url: str, *, timeout_seconds: float = 10.0) -> str:
+    response = requests.get(image_url, timeout=timeout_seconds)
+    if response.status_code < 200 or response.status_code >= 300:
+        raise RuntimeError(f"image download failed HTTP {response.status_code}: {response.text[:120]}")
+    image = Image.open(io.BytesIO(response.content)).convert("RGB")
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return base64.b64encode(buffer.getvalue()).decode("utf-8")

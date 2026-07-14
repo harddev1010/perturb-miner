@@ -10,14 +10,14 @@ from typing import Any
 
 import requests
 
+from perturbnet import constants as C
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class LeaderboardMinerResult:
     uid: int
-    hotkey: str
-    incentive: float
     avg_score: float
     last_score: float
     graph: list[int | float]
@@ -29,8 +29,6 @@ class LeaderboardMinerResult:
 
 @dataclass(frozen=True)
 class LeaderboardNetworkMetrics:
-    total_miners: int
-    available_miners: int
     avg_score: float
     avg_rmse: float
     avg_norm: float
@@ -60,12 +58,14 @@ class LeaderboardReporter:
         enabled: bool,
         api_url: str,
         last_weight_update_api_url: str | None = None,
+        api_key: str = "",
         timeout_seconds: float,
         wallet: Any,
         validator_hotkey: str,
     ) -> None:
         self.enabled = bool(enabled)
         self.api_url = str(api_url).strip()
+        self.api_key = str(api_key).strip()
         self.last_weight_update_api_url = (
             str(last_weight_update_api_url).strip()
             if last_weight_update_api_url
@@ -180,14 +180,17 @@ class LeaderboardReporter:
         # data=body. Do not use requests.post(json=...), which re-serializes.
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         signature = self._sign_payload(body)
+        headers = {
+            "Content-Type": "application/json",
+            "X-Validator-Hotkey": self.validator_hotkey,
+            "X-Signature": signature,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         response = requests.post(
             self.api_url,
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Validator-Hotkey": self.validator_hotkey,
-                "X-Signature": signature,
-            },
+            headers=headers,
             timeout=self.timeout_seconds,
         )
         if response.status_code < 200 or response.status_code >= 300:
@@ -200,14 +203,17 @@ class LeaderboardReporter:
         }
         body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         signature = self._sign_payload(body)
+        headers = {
+            "Content-Type": "application/json",
+            "X-Validator-Hotkey": self.validator_hotkey,
+            "X-Signature": signature,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         response = requests.post(
             self.last_weight_update_api_url,
             data=body,
-            headers={
-                "Content-Type": "application/json",
-                "X-Validator-Hotkey": self.validator_hotkey,
-                "X-Signature": signature,
-            },
+            headers=headers,
             timeout=self.timeout_seconds,
         )
         if response.status_code < 200 or response.status_code >= 300:
