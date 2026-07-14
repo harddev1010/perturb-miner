@@ -536,7 +536,18 @@ class PerturbValidator:
         slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
         logger.info(f"Reached task boundary after waiting {slept:.2f}s")
 
-    def _fetch_new_task_at_boundary(self):
+    def _wait_before_task_fetch(self) -> None:
+        delay = float(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_delay_seconds",
+                C.VALIDATOR_EVALUATION_DELAY_SECONDS,
+            )
+        )
+        logger.info(f"Waiting {delay:.2f}s after task boundary before fetching task")
+        time.sleep(max(0.0, delay))
+
+    def _fetch_current_task(self):
         retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
         retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
         for attempt in range(1, retries + 1):
@@ -550,21 +561,14 @@ class PerturbValidator:
             except Exception as exc:
                 logger.warning(f"Task API request failed attempt={attempt}/{retries}: {exc}")
                 task = None
-            if task is not None and task.task_id != self.last_validated_api_task_id:
+            if task is not None:
                 return task
-            logger.info(f"No new task at boundary attempt={attempt}/{retries}")
+            logger.info(f"No task available attempt={attempt}/{retries}")
             if attempt < retries:
                 time.sleep(retry_seconds)
         return None
 
     def _wait_for_submitted_responses(self, *, task_id: str) -> list[SubmittedResponse] | None:
-        delay = float(
-            getattr(
-                self.config.perturb,
-                "validator_evaluation_delay_seconds",
-                C.VALIDATOR_EVALUATION_DELAY_SECONDS,
-            )
-        )
         poll_seconds = float(
             getattr(
                 self.config.perturb,
@@ -584,8 +588,6 @@ class PerturbValidator:
         timeout_seconds = float(
             getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
         )
-        logger.info(f"Waiting {delay:.2f}s before polling submitted responses task_id={task_id}")
-        time.sleep(max(0.0, delay))
 
         for attempt in range(1, retries + 1):
             try:
@@ -769,9 +771,16 @@ class PerturbValidator:
                 block = self.subtensor.get_current_block()
                 self._log_step_start("loop_wait_task_boundary", block=block)
                 self._wait_for_next_task_boundary()
+                self._log_step_start("loop_wait_before_task_fetch", block=block)
+                self._wait_before_task_fetch()
                 self._log_step_start("loop_get_api_task", block=block)
-                task = self._fetch_new_task_at_boundary()
+                task = self._fetch_current_task()
                 if task is None:
+                    continue
+                if task.task_id == self.last_validated_api_task_id:
+                    logger.info(
+                        f"Task unchanged task_id={task.task_id}; waiting for next task boundary"
+                    )
                     continue
                 try:
                     challenge = self.challenge_from_task_api(task_id=task.task_id, image_url=task.image_url)
