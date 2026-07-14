@@ -241,7 +241,18 @@ class PerturbMiner:
     def run(self) -> None:
         self.sync()
         self._miner_uid()
-        logger.info("Miner started. Polling task API.")
+        try:
+            current_task = get_current_task(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                timeout_seconds=float(
+                    getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"Initial task fetch failed: {exc}")
+            current_task = None
+        self.last_processed_task_id = current_task.task_id if current_task is not None else ""
+        logger.info(f"Miner started. baseline_task_id={self.last_processed_task_id or '(none)'}")
         while True:
             try:
                 self._wait_for_next_task_boundary()
