@@ -1,4 +1,7 @@
+from __future__ import annotations
+
 import argparse
+import hashlib
 import logging as pylogging
 import os
 import time
@@ -8,9 +11,12 @@ import bittensor as bt
 import torch
 import torch.nn.functional as F
 
-from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, resolve_target_index
-from perturbnet.protocol import AttackChallenge
+from perturbnet import constants as C
+from perturbnet.api_client import get_current_task, submit_miner_response
+from perturbnet.image_io import decode_image_b64, encode_image_b64, image_url_to_b64
+from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, predict_label, resolve_target_index
+from perturbnet.storage_uploader import ImageStorageUploader
+from perturbnet.task_timing import sleep_until_next_task_boundary
 
 logger = pylogging.getLogger(__name__)
 
@@ -59,16 +65,6 @@ def _make_subtensor(config):
         return subtensor_cls(config=config)
 
 
-def _make_axon(wallet, port: int):
-    resolved_port = int(port)
-    if hasattr(bt, "axon"):
-        return bt.axon(wallet=wallet, port=resolved_port)
-    axon_cls = getattr(bt, "Axon", None)
-    if axon_cls is None:
-        raise RuntimeError("No axon constructor found in bittensor.")
-    return axon_cls(wallet=wallet, port=resolved_port)
-
-
 def _configure_log_level(level_raw: str) -> None:
     level_name = (level_raw or "DEBUG").upper()
     requested_level = getattr(pylogging, level_name, pylogging.INFO)
@@ -88,23 +84,14 @@ class PerturbMiner:
         self.subtensor = self._init_subtensor_with_retry()
         self.metagraph = self._init_metagraph_with_retry()
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
         self.model = load_efficientnet_v2_l(self.device)
-
-        axon_port = int(getattr(getattr(self.config, "axon", object()), "port", 9000))
-        self.axon = _make_axon(wallet=self.wallet, port=axon_port)
-        self.axon.attach(
-            forward_fn=self.forward,
-            blacklist_fn=self.blacklist,
-            priority_fn=self.priority,
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "unknown"))
+        self.response_exporter = ImageStorageUploader(
+            run_id=f"miner-{hotkey[:8]}-{os.getpid()}",
+            netuid=int(self.config.netuid),
+            uploader_hotkey=hotkey,
         )
-
-    def _log_step_start(self, step_name: str, **context: typing.Any) -> None:
-        if context:
-            rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            logger.info(f"[STEP_START] {step_name} {rendered}")
-        else:
-            logger.info(f"[STEP_START] {step_name}")
+        self.last_processed_task_id = ""
 
     def _init_subtensor_with_retry(self):
         max_attempts = int(os.getenv("SUBTENSOR_CONNECT_RETRIES", "5"))
@@ -139,31 +126,21 @@ class PerturbMiner:
     def sync(self) -> None:
         self.metagraph.sync(subtensor=self.subtensor)
 
-    async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
-        self._log_step_start(
-            "miner_forward",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            norm_type=getattr(synapse, "norm_type", "unknown"),
-            epsilon=getattr(synapse, "epsilon", "unknown"),
-        )
-        if synapse.norm_type != "Linf":
-            logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
+    def _miner_uid(self) -> int:
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", ""))
+        if hotkey not in self.metagraph.hotkeys:
+            raise RuntimeError("Miner hotkey is not registered on this netuid.")
+        return int(self.metagraph.hotkeys.index(hotkey))
 
-        clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        target_index = resolve_target_index(synapse.true_label)
+    def _attack_image(self, *, task_id: str, clean_image_b64: str) -> tuple[str, str]:
+        clean = decode_image_b64(clean_image_b64).to(self.device)
+        predicted_label = predict_label(self.model, clean)
+        target_index = resolve_target_index(predicted_label)
         if target_index is None:
-            logger.warning(
-                f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
-            )
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
+            raise RuntimeError(f"Unable to resolve predicted label for task={task_id}: {predicted_label}")
 
-        epsilon = float(synapse.epsilon)
-        min_delta = float(getattr(synapse, "min_delta", 0.002))
-
-        # Basic default algorithm: small-step untargeted PGD.
+        epsilon = float(getattr(self.config.perturb, "max_linf_delta", C.MAX_LINF_DELTA))
+        min_delta = float(getattr(self.config.perturb, "min_linf_delta", C.MIN_LINF_DELTA))
         steps = 10
         step_size = max(epsilon / 4.0, 1.0 / 255.0)
         adv = clean.clone().detach()
@@ -188,74 +165,113 @@ class PerturbMiner:
                 best = adv.clone()
                 break
 
-        adv = best
-        synapse.perturbed_image_b64 = encode_image_b64(adv)
         logger.info(
-            f"Finished task={getattr(synapse, 'task_id', 'unknown')} target_idx={target_index} "
-            f"final_pred={final_pred} best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
+            f"Finished task={task_id} target_idx={target_index} final_pred={final_pred} "
+            f"best_delta={best_delta:.6f} min_delta={min_delta:.6f}"
         )
-        return synapse
+        return encode_image_b64(best), str(predicted_label)
 
-    async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
-        self._log_step_start(
-            "miner_blacklist",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+    def _upload_response(self, *, task_id: str, perturbed_image_b64: str) -> str:
+        uid = self._miner_uid()
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", ""))
+        miner_storage_key = self.response_exporter.miner_storage_key(miner_uid=uid, miner_hotkey=hotkey)
+        safe_task_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in task_id)
+        image_hash = hashlib.sha256(perturbed_image_b64.encode("utf-8")).hexdigest()[:12]
+        key = f"{C.STORAGE_PREFIX.strip().strip('/')}/miner-responses/{safe_task_id}/{miner_storage_key}_{image_hash}.png"
+        return self.response_exporter.upload_image_b64(key=key, image_b64=perturbed_image_b64)
+
+    def _submission_succeeded(self, response: typing.Any) -> bool:
+        if response is None:
+            return True
+        if isinstance(response, dict):
+            raw = response.get("success", response.get("ok", response.get("status")))
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"success", "succeeded", "ok", "true"}
+            has_miner_uid = any(key in response for key in ("miner_uid", "miner_id", "minerUid"))
+            has_image_url = any(response.get(key) for key in ("imageURL", "imageUrl", "image_url"))
+            if has_miner_uid and has_image_url:
+                return True
+        return False
+
+    def _process_task(self, *, task_id: str, image_url: str) -> None:
+        # Processing, upload, and API submission should complete within 20 seconds.
+        started_at = time.time()
+        clean_image_b64 = image_url_to_b64(
+            image_url,
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
         )
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            logger.warning("Blacklist reject: missing caller hotkey")
-            return True, "Missing caller hotkey"
-
-        hotkey = synapse.dendrite.hotkey
-        if hotkey not in self.metagraph.hotkeys:
-            logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
-            return True, "Unregistered caller"
-
-        uid = self.metagraph.hotkeys.index(hotkey)
-        if not self.metagraph.validator_permit[uid]:
-            logger.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
-            return True, "Caller is not validator"
-
-        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey}")
-        return False, "OK"
-
-    async def priority(self, synapse: AttackChallenge) -> float:
-        self._log_step_start(
-            "miner_priority",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+        perturbed_image_b64, _ = self._attack_image(task_id=task_id, clean_image_b64=clean_image_b64)
+        response_url = self._upload_response(
+            task_id=task_id,
+            perturbed_image_b64=perturbed_image_b64,
         )
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            logger.info("Priority=0.0: missing caller hotkey")
-            return 0.0
-        if synapse.dendrite.hotkey not in self.metagraph.hotkeys:
-            logger.info(f"Priority=0.0: unknown hotkey={synapse.dendrite.hotkey}")
-            return 0.0
-        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        priority = float(self.metagraph.S[uid])
-        logger.info(f"Priority computed: uid={uid} priority={priority:.6f}")
-        return priority
+        submit_response = submit_miner_response(
+            base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+            wallet=self.wallet,
+            image_url=response_url,
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+        )
+        if not self._submission_succeeded(submit_response):
+            raise RuntimeError(f"Response submission failed task={task_id} api_response={submit_response}")
+        elapsed = time.time() - started_at
+        logger.info(f"Submitted task={task_id} response_url={response_url} elapsed_seconds={elapsed:.2f}")
+
+    def _wait_for_next_task_boundary(self) -> None:
+        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
+        slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
+        logger.info(f"Reached task boundary after waiting {slept:.2f}s")
+
+    def _fetch_new_task_at_boundary(self):
+        retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
+        retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
+        for attempt in range(1, retries + 1):
+            task = get_current_task(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+            )
+            if task is not None and task.task_id != self.last_processed_task_id:
+                return task
+            logger.info(f"No new task at boundary attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(retry_seconds)
+        return None
 
     def run(self) -> None:
         self.sync()
-
-        if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
-            raise RuntimeError("Miner hotkey is not registered on this netuid.")
-
-        logger.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.network} with netuid: {self.config.netuid}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-        self.axon.start()
-
-        logger.info("Miner started. Waiting for validator queries.")
+        self._miner_uid()
+        try:
+            current_task = get_current_task(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                timeout_seconds=float(
+                    getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"Initial task fetch failed: {exc}")
+            current_task = None
+        self.last_processed_task_id = current_task.task_id if current_task is not None else ""
+        logger.info(f"Miner started. baseline_task_id={self.last_processed_task_id or '(none)'}")
         while True:
-            time.sleep(12)
-            self.sync()
+            try:
+                self._wait_for_next_task_boundary()
+                task = self._fetch_new_task_at_boundary()
+                if task is None:
+                    continue
+
+                logger.info(f"New task found task_id={task.task_id} image_url={task.image_url}")
+                try:
+                    self._process_task(task_id=task.task_id, image_url=task.image_url)
+                finally:
+                    self.last_processed_task_id = task.task_id
+            except Exception as exc:
+                logger.warning(f"Miner task loop failed: {exc}")
+                time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
 
 
 def build_config() -> typing.Any:
-    parser = argparse.ArgumentParser(description="Perturb subnet miner (default baseline)")
+    parser = argparse.ArgumentParser(description="Perturb subnet miner")
     parser.add_argument("--netuid", type=int, required=True)
     parser.add_argument("--network", type=str, default=os.getenv("NETWORK", "finney"))
     parser.add_argument(
@@ -268,12 +284,6 @@ def build_config() -> typing.Any:
     parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", type=str, default=os.getenv("HOTKEY_NAME", "default"))
     parser.add_argument("--logging-dir", dest="logging_dir", type=str, default=os.getenv("LOGGING_DIR", "./logs"))
     parser.add_argument("--log-level", dest="log_level", type=str, default=os.getenv("LOG_LEVEL", "DEBUG"))
-    parser.add_argument(
-        "--axon.port",
-        dest="axon_port",
-        type=int,
-        default=int(os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000"))),
-    )
 
     if hasattr(bt, "config"):
         config = bt.config(parser)
@@ -296,16 +306,15 @@ def build_config() -> typing.Any:
         config.logging = type("LoggingConfig", (), {})()
     config.logging.logging_dir = getattr(config.logging, "logging_dir", getattr(config, "logging_dir", "./logs"))
 
-    if not hasattr(config, "axon"):
-        config.axon = type("AxonConfig", (), {})()
-    config.axon.port = int(getattr(config.axon, "port", getattr(config, "axon_port", 9000)))
+    if not hasattr(config, "perturb"):
+        config.perturb = type("PerturbConfig", (), {})()
+    for key, value in C.VALIDATOR_CONFIG.items():
+        setattr(config.perturb, key, getattr(config.perturb, key, value))
 
     config.log_level = getattr(config, "log_level", os.getenv("LOG_LEVEL", "DEBUG"))
-
     return config
 
 
 if __name__ == "__main__":
     miner = PerturbMiner(config=build_config())
     miner.run()
-

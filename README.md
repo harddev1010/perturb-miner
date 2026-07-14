@@ -31,17 +31,17 @@ This repository provides:
 
 ### Miner responsibilities
 
-- Receive `AttackChallenge` over Axon
+- Poll the task API for the current task
 - Run baseline PGD-style attack
-- Return only `perturbed_image_b64`
+- Upload the perturbed image and submit its URL
 - Let validator handle all authoritative verification and scoring
 
 ### Challenge lifecycle
 
-1. Validator samples an image from a persisted random traversal over the full ImageNet-100 train split (no duplicates until all ~126k images are used)
-2. Validator runs `EfficientNetV2-L` and gets exact model label string
-3. Validator creates challenge where `true_label` is the exact EfficientNet label
-4. Validator sends challenge to sampled miners and scores returned perturbations
+1. The team task generator samples an ImageNet-100 image and publishes one API task
+2. Miners poll the task API, perturb the task image, upload the result, and submit the image URL
+3. Validators read submitted miner images from the API
+4. Validators score responses and report the full miner results
 
 ## Hardware and System Requirements
 
@@ -87,7 +87,6 @@ bash ./scripts/setup_common.sh validator
 `setup_common.sh` behavior by role:
 
 - both roles: install PM2, create `.venv`, install Python/Bittensor dependencies
-- `validator`: additionally bootstraps the ImageNet-100 challenge cache
 
 If `npm: command not found`, install Node.js first, then rerun:
 
@@ -114,12 +113,7 @@ bash ./scripts/setup_common.sh validator
 
 This section is specifically for validator operators.
 
-### 1) ImageNet-100 challenge data
-
-Validator setup automatically downloads the **full ImageNet-100 train split** (~126k images, ~8 GB download, ~17 GB on disk including the converted Arrow cache) from Hugging Face (`clane9/imagenet-100`) into the local Hugging Face cache. The download happens once during `bash ./scripts/setup_common.sh validator` and is re-checked by `bash ./scripts/run_validator.sh`; subsequent starts reuse the cache instantly. Validators traverse all images in a persisted random order with no repeats until the entire split has been used, then reshuffle for the next epoch.
-Optionally set `HF_TOKEN` in `scripts/validator.env` for a faster first download.
-
-### 2) Configure validator runtime
+### 1) Configure validator runtime
 
 Create validator env:
 
@@ -131,17 +125,14 @@ Edit required fields in `scripts/validator.env`:
 
 - `WALLET_NAME`
 - `WALLET_HOTKEY`
+- `PERTURB_API_KEY`
 
 Optional:
 
-- `HF_TOKEN` (speeds up the one-time ImageNet-100 download)
-- `PERTURB_RESPONSE_STORAGE_ENABLED` (`false` default)
-- `PERTURB_RESPONSE_STORAGE_BACKEND` (`r2` default, or `hippius`)
-- Response image storage credentials for the selected backend
-- `PERTURB_STORAGE_MODE` (`latest` default, or `all`)
+- `PERTURB_API_BASE_URL`
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` for quieter logs)
 
-### 3) Start validator
+### 2) Start validator
 
 ```bash
 bash ./scripts/run_validator.sh
@@ -149,16 +140,15 @@ bash ./scripts/run_validator.sh
 
 Expected log behavior:
 
-- challenge generation messages
-- miner selection messages
+- API task polling messages
+- submitted response scoring logs
 - per-miner score logs
 - periodic `set_weights` attempts
 
-### 4) Validator-side notes
+### 3) Validator-side notes
 
-- Challenge generation does not depend on external image APIs or LLM verification.
-- ImageNet-100 selection walks the entire train split (~126k images) once in random order before reshuffling for the next epoch; the order, cursor, and epoch persist across restarts so no image repeats within an epoch.
-- Response image export uses Cloudflare R2 by default and can be switched to Hippius S3-compatible storage with `PERTURB_RESPONSE_STORAGE_BACKEND="hippius"`. The validator checks the selected storage configuration before the challenge loop and stops with a warning if bucket, endpoint, or credentials are missing.
+- Validators fetch the task image and submitted miner image URLs from the API, then run local verification and scoring.
+- Validators use miner-submitted response URLs in leaderboard reports.
 
 ## Installation and Setup (Miner Side)
 
@@ -183,6 +173,8 @@ Optional:
 
 - `PYTHON_BIN`
 - `LOG_LEVEL` (`DEBUG` default, set `INFO`/`WARNING`/`ERROR` if you want quieter logs)
+- `PERTURB_API_BASE_URL`
+- Storage credentials (`PERTURB_STORAGE_BACKEND`, `PERTURB_STORAGE_BUCKET`, `PERTURB_STORAGE_ACCESS_KEY_ID`, `PERTURB_STORAGE_SECRET_ACCESS_KEY`; Hippius is default, R2 is supported)
 - `MINER_EXTRA_ARGS`
 
 ### 2) Start miner
@@ -193,43 +185,39 @@ bash ./scripts/run_miner.sh
 
 Expected log behavior:
 
-- `Serving miner axon...`
-- `Miner started. Waiting for validator queries.`
+- `Miner started. Polling task API.`
+- task upload/submission messages
 
 ### 3) Miner-side notes
 
 - Baseline miner is intentionally simple; competitive miners should optimize attack logic.
+- Miners don't serve an axon for challenge handling.
 - Validators handle all challenge verification and scoring.
+
+## Task Generation
+
+Task generation is run separately by the team through `generate_and_publish_task(...)`.
+
+The generator samples ImageNet-100, uploads the clean task image with the configured storage settings, and publishes the current API task with the provided hotkeys. Hippius is the default storage backend; set `PERTURB_STORAGE_BACKEND="r2"` to use R2.
 
 ## API and Protocol Contracts
 
-### ImageNet-100 input contract (validator challenge source)
+### Task API contract
 
-- The source is the full `clane9/imagenet-100` train split (~126k images), fixed in `perturbnet/constants.py`, downloaded once into the local Hugging Face cache (~8 GB download, ~17 GB on disk) and accessed by row index at runtime.
-- Optional: set `HF_TOKEN` in `scripts/validator.env` for faster, higher-rate-limit downloads from Hugging Face.
-- Validator persists the traversal seed, cursor, dataset fingerprint, and epoch in state; the shuffled order is rebuilt deterministically from the seed, so restarts/resumes continue the traversal without duplicate selections until the full split is exhausted.
-- Validator converts image bytes to base64 internally.
-- The model-predicted EfficientNet label becomes `true_label`.
+- Task generator publishes the current task with `task_id` and `imageURL`.
+- Miners read the current task from `GET /task`.
+- Miners submit response image URLs to `POST /submits`.
+- Validators read submitted response image URLs from `GET /submits` (Bearer auth, available while task status is `validating`).
 
-### Synapse contract (`AttackChallenge`)
+### Task generator
 
-Key fields sent to miners:
-
-- `task_id`
-- `model_name` (fixed `EfficientNetV2-L`)
-- `clean_image_b64`
-- `true_label` (exact EfficientNet class label)
-- `epsilon`, `norm_type`, `min_delta`, `timeout_seconds`
-
-Miner response field:
-
-- `perturbed_image_b64`
+Task generation is separated from validator runtime under `task_generator/`. It samples ImageNet-100, uploads the clean task image, and overwrites the current task row through the API.
 
 ### Leaderboard reporting
 
-After each scoring round, validators submit a signed leaderboard report to the API configured in `perturbnet/constants.py`. Reports are queued in a background thread; leaderboard API failures, non-2xx responses, or timeouts are logged and skipped without affecting validator scoring.
+After each scoring round, validators submit a leaderboard report to the API configured in `perturbnet/constants.py`. Reports are queued in a background thread; leaderboard API failures, non-2xx responses, or timeouts are logged and skipped without affecting validator scoring.
 
-Reports include network metrics and full miner details for every registered non-validator UID. Successful responses include presigned R2 image URLs for UI display; miners without an exported image use the configured placeholder image. Reports are authenticated by signing the exact JSON request bytes with the validator hotkey.
+Reports include network metrics and full miner details for every registered non-validator UID. Successful responses include presigned response-storage image URLs for UI display; miners without an exported image use the configured placeholder image.
 
 
 ## Scoring and Weighting
@@ -246,11 +234,10 @@ Per-response score (if verification passes):
 - `linf_score = (1 - linf_ratio)^2`
 - `rmse_score = (1 - rmse_ratio)^2`
 - `perturbation_score = weighted_avg(linf_score, rmse_score)` using `PERTURB_LINF_COMPONENT_WEIGHT` and `PERTURB_RMSE_COMPONENT_WEIGHT`
-- `speed_score = 1 - min(response_time / timeout, 1)`
 - `margin = best_non_true_logit - true_class_logit`
 - `margin_score = clamp(margin / 10, 0, 1)` using `ANALYZE_BUCKET_MARGIN_WEIGHT` (default `0.03`)
 - `novelty_score = clamp(changed_pixel_count / ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS, 0, 1)` using `ANALYZE_BUCKET_NOVELTY_WEIGHT` (default `0.01`)
-- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score + margin_weight * margin_score + novelty_weight * novelty_score`
+- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + margin_weight * margin_score + novelty_weight * novelty_score`
 
 Any verification or constraint failure gets `0.0`.
 
@@ -264,7 +251,7 @@ Weight setting:
 
 ## Integration Smoke Test
 
-Run after setup (reuses the downloaded ImageNet-100 dataset):
+Run after setup:
 
 ```bash
 python scripts/integration_smoke_test.py
@@ -272,9 +259,8 @@ python scripts/integration_smoke_test.py
 
 The smoke test validates:
 
-- ImageNet-100 local image load
 - local EfficientNetV2-L inference path
-- direct challenge label selection from model prediction
+- scoring dependencies
 
 ## Troubleshooting
 

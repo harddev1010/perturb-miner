@@ -19,7 +19,9 @@ fi
 
 if [[ -f "$ENV_FILE" ]]; then
   # shellcheck disable=SC1090
+  set -a
   source "$ENV_FILE"
+  set +a
 fi
 
 WALLET_NAME="${WALLET_NAME:-}"
@@ -29,7 +31,6 @@ NETWORK="${NETWORK:-local}"
 MINER_EXTRA_ARGS="${MINER_EXTRA_ARGS:-}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 LOG_LEVEL="${LOG_LEVEL:-DEBUG}"
-MINER_PORT="${MINER_PORT:-9000}"
 
 if [[ -z "$WALLET_NAME" || -z "$WALLET_HOTKEY" ]]; then
   echo "WALLET_NAME and WALLET_HOTKEY must be set in $ENV_FILE"
@@ -51,14 +52,13 @@ python -m pip install -r requirements.txt
 python -m pip install -e .
 
 if [[ "${1:-}" == "--foreground" ]]; then
-  echo "Starting miner (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK port=$MINER_PORT)..."
+  echo "Starting miner (wallet=$WALLET_NAME hotkey=$WALLET_HOTKEY netuid=$NETUID network=$NETWORK)..."
   python neurons/miner.py \
     $MINER_EXTRA_ARGS \
     --netuid "$NETUID" \
     --network "$NETWORK" \
     --wallet.name "$WALLET_NAME" \
     --wallet.hotkey "$WALLET_HOTKEY" \
-    --axon.port "$MINER_PORT" \
     --log-level "$LOG_LEVEL"
   exit 0
 fi
@@ -74,7 +74,6 @@ pm2 start ".venv/bin/python" --name perturb-miner -- \
   --network "$NETWORK" \
   --wallet.name "$WALLET_NAME" \
   --wallet.hotkey "$WALLET_HOTKEY" \
-  --axon.port "$MINER_PORT" \
   --log-level "$LOG_LEVEL"
 pm2 save
 pm2 status perturb-miner
