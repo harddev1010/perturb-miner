@@ -18,8 +18,6 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class LeaderboardMinerResult:
     uid: int
-    hotkey: str
-    incentive: float
     avg_score: float
     last_score: float
     graph: list[int | float]
@@ -31,8 +29,6 @@ class LeaderboardMinerResult:
 
 @dataclass(frozen=True)
 class LeaderboardNetworkMetrics:
-    total_miners: int
-    available_miners: int
     avg_score: float
     avg_rmse: float
     avg_norm: float

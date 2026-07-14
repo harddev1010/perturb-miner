@@ -196,22 +196,17 @@ Expected log behavior:
 
 ## Task Generation
 
-Task generation is run separately by the team:
+Task generation is run separately by the team through `generate_and_publish_task(...)`.
 
-```bash
-cp task_generator/task_generator.env.example task_generator/task_generator.env
-python task_generator/publish_task.py
-```
-
-The generator samples ImageNet-100, uploads the clean task image with the same storage settings, and publishes the current API task. Hippius is the default storage backend; set `PERTURB_STORAGE_BACKEND="r2"` to use R2.
+The generator samples ImageNet-100, uploads the clean task image with the configured storage settings, and publishes the current API task with the provided hotkeys. Hippius is the default storage backend; set `PERTURB_STORAGE_BACKEND="r2"` to use R2.
 
 ## API and Protocol Contracts
 
 ### Task API contract
 
 - Task generator publishes the current task with `task_id` and `imageURL`.
-- Miners read the current task from `GET /task/`.
-- Miners submit response image URLs to `POST /response/submit`.
+- Miners read the current task from `GET /task`.
+- Miners submit response image URLs to `POST /submits`.
 - Validators read submitted response image URLs from `GET /response/`.
 
 ### Task generator

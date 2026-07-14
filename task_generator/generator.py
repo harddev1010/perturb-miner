@@ -147,13 +147,15 @@ def generate_and_publish_task(
     *,
     state_path: str | os.PathLike[str] = "task_generator_state.json",
     status: str = "open",
+    hotkeys: Sequence[str],
 ) -> GeneratedTask:
+    netuid = int(os.getenv("NETUID", "26"))
     generator = TaskGenerator(state_path=state_path)
     image_id, image_b64, label = generator.generate()
     task_id = f"{int(time.time())}-{image_id}"
     exporter = ImageStorageUploader(
         run_id="task-generator",
-        netuid=int(os.getenv("NETUID", "26")),
+        netuid=netuid,
         uploader_hotkey="task-generator",
     )
     image_key = f"{C.STORAGE_PREFIX.strip().strip('/')}/tasks/current.png"
@@ -164,6 +166,7 @@ def generate_and_publish_task(
         task_id=task_id,
         image_url=image_url,
         status=status,
+        hotkeys=[str(hotkey) for hotkey in hotkeys],
         timeout_seconds=C.PERTURB_API_TIMEOUT_SECONDS,
     )
     return GeneratedTask(task_id=task_id, image_url=image_url, image_id=image_id, true_label=label)

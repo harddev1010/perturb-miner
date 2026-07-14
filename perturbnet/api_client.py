@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import requests
@@ -50,7 +51,7 @@ def sign_body(wallet: Any, body: bytes) -> str:
 
 
 def get_current_task(*, base_url: str, timeout_seconds: float) -> CurrentTask | None:
-    response = requests.get(_url(base_url, "/task/"), timeout=timeout_seconds)
+    response = requests.get(_url(base_url, "/task"), timeout=timeout_seconds)
     payload = _json_response(response)
     if not isinstance(payload, dict):
         return None
@@ -68,13 +69,14 @@ def post_task(
     task_id: str,
     image_url: str,
     status: str,
+    hotkeys: list[str],
     timeout_seconds: float,
 ) -> Any:
-    payload = {"task_id": task_id, "imageURL": image_url, "status": status}
+    payload = {"task_id": task_id, "imageURL": image_url, "status": status, "hotkeys": hotkeys}
     response = requests.post(
-        _url(base_url, "/task/"),
+        _url(base_url, "/task"),
         json=payload,
-        headers={"X-API-Key": api_key} if api_key else {},
+        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
         timeout=timeout_seconds,
     )
     return _json_response(response)
@@ -87,11 +89,15 @@ def submit_miner_response(
     image_url: str,
     timeout_seconds: float,
 ) -> Any:
-    payload = {"imageURL": image_url}
-    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     hotkey = str(getattr(getattr(wallet, "hotkey", None), "ss58_address", ""))
+    payload = {
+        "miner_hotkey": hotkey,
+        "timestamp": datetime.now(UTC).isoformat(),
+        "imageURL": image_url,
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     response = requests.post(
-        _url(base_url, "/response/submit"),
+        _url(base_url, "/submits"),
         data=body,
         headers={
             "Content-Type": "application/json",
@@ -134,12 +140,3 @@ def get_submitted_responses(*, base_url: str, api_key: str, timeout_seconds: flo
             responses.append(SubmittedResponse(miner_uid=miner_uid, image_url=image_url))
     return responses
 
-
-def update_responses(*, base_url: str, api_key: str, payload: dict[str, Any], timeout_seconds: float) -> Any:
-    response = requests.put(
-        _url(base_url, "/response/"),
-        json=payload,
-        headers={"X-API-Key": api_key} if api_key else {},
-        timeout=timeout_seconds,
-    )
-    return _json_response(response)

@@ -25,7 +25,7 @@ from perturbnet.emissions import ranked_emission_shares
 from perturbnet.image_io import changed_pixel_count, decode_image_b64, image_url_to_b64, quantize_image_uint8_grid
 from perturbnet.leaderboard_payload import build_report, update_score_histories
 from perturbnet.leaderboard_reporter import LeaderboardReporter
-from perturbnet.metagraph_utils import miner_incentive, miner_uids as metagraph_miner_uids
+from perturbnet.metagraph_utils import miner_uids as metagraph_miner_uids
 from perturbnet.model import (
     label_for_index,
     load_efficientnet_v2_l,
@@ -501,16 +501,11 @@ class PerturbValidator:
         challenge: ChallengeSpec,
         results_by_uid: Sequence[tuple[int, EvaluationResult]],
         image_url_by_uid: dict[int, str],
-        available_miner_count: int,
     ) -> None:
         self.leaderboard_reporter.submit(
             build_report(
                 task_id=challenge.task_id,
                 validator_hotkey=str(getattr(self.wallet.hotkey, "ss58_address", "")),
-                total_miners=len(self._leaderboard_miner_uids()),
-                available_miners=int(available_miner_count),
-                hotkeys=self.metagraph.hotkeys,
-                incentives_by_uid={uid: miner_incentive(self.metagraph, uid) for uid, _ in results_by_uid},
                 score_histories=self.leaderboard_score_histories,
                 avg_window=int(getattr(self.config.perturb, "history_size", C.HISTORY_SIZE)),
                 results_by_uid=results_by_uid,
@@ -827,7 +822,6 @@ class PerturbValidator:
                     challenge=challenge,
                     results_by_uid=leaderboard_results_by_uid,
                     image_url_by_uid=image_url_by_uid,
-                    available_miner_count=len(available_uids),
                 )
                 self._log_summary(
                     "leaderboard_report_queued",
