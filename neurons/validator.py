@@ -34,7 +34,7 @@ from perturbnet.model import (
     predict_label,
     resolve_target_index,
 )
-from perturbnet.task_timing import next_task_boundary, sleep_until_next_task_boundary
+from perturbnet.task_timing import sleep_until_next_task_boundary
 
 logger = pylogging.getLogger(__name__)
 
@@ -563,7 +563,7 @@ class PerturbValidator:
                 time.sleep(retry_seconds)
         return None
 
-    def _wait_until_evaluation_enabled(self, *, task_id: str) -> bool:
+    def _wait_for_submitted_responses(self, *, task_id: str) -> list[SubmittedResponse] | None:
         delay = float(
             getattr(
                 self.config.perturb,
@@ -578,31 +578,44 @@ class PerturbValidator:
                 C.VALIDATOR_EVALUATION_POLL_SECONDS,
             )
         )
-        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
-        deadline = next_task_boundary(cadence_seconds=cadence)
-        logger.info(f"Waiting {delay:.2f}s before checking evaluation readiness task_id={task_id}")
+        retries = int(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_poll_retries",
+                C.VALIDATOR_EVALUATION_POLL_RETRIES,
+            )
+        )
+        base_url = str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL))
+        api_key = str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY))
+        timeout_seconds = float(
+            getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+        )
+        logger.info(f"Waiting {delay:.2f}s before polling submitted responses task_id={task_id}")
         time.sleep(max(0.0, delay))
 
-        while time.time() < deadline:
+        for attempt in range(1, retries + 1):
             try:
-                task = get_current_task(
-                    base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                    timeout_seconds=float(
-                        getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
-                    ),
+                submitted_responses = get_submitted_responses(
+                    base_url=base_url,
+                    api_key=api_key,
+                    timeout_seconds=timeout_seconds,
                 )
             except Exception as exc:
-                logger.warning(f"Task API readiness request failed task_id={task_id}: {exc}")
-                task = None
-            if task is not None and task.task_id != task_id:
-                logger.info(f"Task changed before evaluation enabled old_task_id={task_id} new_task_id={task.task_id}")
-                return False
-            if task is not None and task.evaluation_enabled:
-                logger.info(f"Evaluation enabled task_id={task_id} status={task.status}")
-                return True
-            time.sleep(max(0.1, poll_seconds))
-        logger.warning(f"Evaluation was not enabled before next task boundary task_id={task_id}")
-        return False
+                logger.warning(
+                    f"Submitted responses request failed task_id={task_id} attempt={attempt}/{retries}: {exc}"
+                )
+                submitted_responses = []
+            if submitted_responses:
+                logger.info(
+                    f"Submitted responses available task_id={task_id} count={len(submitted_responses)} "
+                    f"attempt={attempt}/{retries}"
+                )
+                return submitted_responses
+            logger.info(f"No submitted responses yet task_id={task_id} attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(max(0.1, poll_seconds))
+        logger.warning(f"No submitted responses after {retries} attempts task_id={task_id}")
+        return None
 
     def _fallback_burn_rate(self) -> float:
         return min(max(float(getattr(self.config.perturb, "default_burn_rate", 0.0)), 0.0), 1.0)
@@ -780,27 +793,11 @@ class PerturbValidator:
                     true_label=challenge.true_label,
                 )
 
-                if not self._wait_until_evaluation_enabled(task_id=challenge.task_id):
+                self._log_step_start("loop_wait_for_submitted_responses", task_id=challenge.task_id)
+                submitted_responses = self._wait_for_submitted_responses(task_id=challenge.task_id)
+                if not submitted_responses:
                     self.last_validated_api_task_id = challenge.task_id
                     self._save_state()
-                    continue
-
-                self._log_step_start("loop_get_submitted_responses", task_id=challenge.task_id)
-                try:
-                    submitted_responses = get_submitted_responses(
-                        base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                        api_key=str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY)),
-                        timeout_seconds=float(
-                            getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
-                        ),
-                    )
-                except Exception as exc:
-                    logger.info(f"Submitted responses unavailable task_id={challenge.task_id}: {exc}")
-                    time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
-                    continue
-                if not submitted_responses:
-                    logger.info(f"No submitted responses available task_id={challenge.task_id}")
-                    time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
                     continue
 
                 submitted_response_by_uid: dict[int, SubmittedResponse] = {}

@@ -12,33 +12,6 @@ import requests
 class CurrentTask:
     task_id: str
     image_url: str
-    status: str = ""
-    evaluation_enabled: bool = False
-
-
-def _as_bool(value: Any) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on", "enabled", "ready", "open"}
-    return False
-
-
-def _evaluation_enabled_from_payload(payload: dict[str, Any]) -> bool:
-    for key in (
-        "evaluation_enabled",
-        "evaluationEnabled",
-        "evaluation_ready",
-        "evaluationReady",
-        "can_evaluate",
-        "canEvaluate",
-    ):
-        if key in payload:
-            return _as_bool(payload.get(key))
-    status = str(payload.get("status") or "").strip().lower()
-    return status in {"evaluation", "evaluation_enabled", "evaluation_ready", "ready_for_evaluation", "scoring"}
 
 
 @dataclass(frozen=True)
@@ -86,12 +59,7 @@ def get_current_task(*, base_url: str, timeout_seconds: float) -> CurrentTask | 
     image_url = _image_url_from_payload(payload)
     if not task_id or not image_url:
         return None
-    return CurrentTask(
-        task_id=task_id,
-        image_url=image_url,
-        status=str(payload.get("status") or "").strip(),
-        evaluation_enabled=_evaluation_enabled_from_payload(payload),
-    )
+    return CurrentTask(task_id=task_id, image_url=image_url)
 
 
 def post_task(
