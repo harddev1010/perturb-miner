@@ -82,7 +82,6 @@ PERTURB_API_BASE_URL = os.getenv("PERTURB_API_BASE_URL", "https://api.perturbai.
 PERTURB_API_KEY = os.getenv("PERTURB_API_KEY", "").strip()
 PERTURB_API_TIMEOUT_SECONDS = _env_float("PERTURB_API_TIMEOUT_SECONDS", 10.0)
 TASK_POLL_TIME = _env_float("PERTURB_TASK_POLL_TIME", 1.0)
-SLEEP_TIME = _env_float("PERTURB_SLEEP_TIME", 60.0)
 TASK_CADENCE_SECONDS = _env_int("PERTURB_TASK_CADENCE_SECONDS", 120)
 TASK_FETCH_RETRIES = _env_int("PERTURB_TASK_FETCH_RETRIES", 5)
 TASK_FETCH_RETRY_SECONDS = _env_float("PERTURB_TASK_FETCH_RETRY_SECONDS", 1.0)
@@ -130,7 +129,6 @@ VALIDATOR_CONFIG = {
     "api_key": PERTURB_API_KEY,
     "api_timeout_seconds": PERTURB_API_TIMEOUT_SECONDS,
     "task_poll_time": TASK_POLL_TIME,
-    "sleep_time": SLEEP_TIME,
     "task_cadence_seconds": TASK_CADENCE_SECONDS,
     "task_fetch_retries": TASK_FETCH_RETRIES,
     "task_fetch_retry_seconds": TASK_FETCH_RETRY_SECONDS,

@@ -940,7 +940,6 @@ class PerturbValidator:
                         self.last_weight_block = block
 
                 self.step += 1
-                time.sleep(float(getattr(self.config.perturb, "sleep_time", C.SLEEP_TIME)))
             except KeyboardInterrupt:
                 logger.info("Validator stopped by user.")
                 break
