@@ -1,162 +1,48 @@
 """
-miner.py — Perturb subnet miner (netuid 26) — bittensor plumbing + forward().
+miner.py — Perturb subnet miner (task-API flow) — bittensor plumbing + perturb().
+
+Network flow (post axon-removal refactor): the miner polls the task API for the current clean image,
+computes an adversarial perturbation, uploads the result image to object storage, then submits the
+response URL back to the API. There is no axon / validator dendrite query anymore.
 
 The attack engine lives in the neurons/perturb/ package (batched flip-first pipeline: multi-loss
 qFGSM, one-byte PGD, top-M boundary, saliency, gradient-seeded Square). This file only wires the
-axon, loads the model, warms it up, and routes each AttackChallenge through perturb().
+task loop, loads the model, warms it up, and routes each clean image through perturb().
 
 Tunable env vars + algorithm switches are documented in neurons/perturb/constants.py and perturb.py.
 The previous inline "dynamic chunked" engine is preserved in neurons/miner_backup/miner_chunked_0618.py.
 """
 
+from __future__ import annotations
+
 import argparse
-import json
+import hashlib
 import logging as pylogging
 import os
-import re
 import time
 import typing
 
 import bittensor as bt
 import torch
 
+from perturbnet import constants as C
+from perturbnet.api_client import get_current_task, submit_miner_response
 from perturbnet.constants import MAX_LINF_DELTA
-from perturbnet.image_io import decode_image_b64, encode_image_b64
-from perturbnet.model import load_efficientnet_v2_l, logits_for_images, resolve_target_index
-from perturbnet.protocol import AttackChallenge
+from perturbnet.image_io import decode_image_b64, encode_image_b64, image_url_to_b64
+from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_label, resolve_target_index
+from perturbnet.storage_uploader import ImageStorageUploader
+from perturbnet.task_timing import sleep_until_next_task_boundary
 
 from neurons.perturb import perturb
 from neurons.perturb.utils import cw_margin, estimate_validator_score, png_roundtrip, validator_score
 
 logger = pylogging.getLogger(__name__)
 
-# When perturb() finds no flip, dump the challenge's input params here (one JSON per case) for offline
-# debugging/replay. Override the location with PERTURB_ERROR_CASES_DIR.
-_ERROR_CASES_DIR = os.getenv("PERTURB_ERROR_CASES_DIR", "/workspace/Perturb_error_cases")
-
-# When perturb() DOES find a flip but only at a coarser byte step than the ideal L∞=1/255 (the q=2
-# fallback, or a large min_delta forcing k_min>=2), dump it here. These are processed properly but sit
-# in the lower-scoring q>1 tail — worth studying offline. Override with PERTURB_NONQ1_CASES_DIR.
-_NONQ1_CASES_DIR = os.getenv("PERTURB_NONQ1_CASES_DIR", "/workspace/Perturb_nonq1_cases")
-
-# Every incoming AttackChallenge is also archived here (one JSON per request). Only the newest
-# _ATTACK_CHALLENGES_KEEP files are retained; older ones are rotated into _ATTACK_HISTORY_DIR.
-_ATTACK_CHALLENGES_DIR = os.getenv("PERTURB_ATTACK_CHALLENGES_DIR", "/workspace/Perturb_attack_challenges")
-_ATTACK_HISTORY_DIR = os.getenv("PERTURB_ATTACK_HISTORY_DIR", "/workspace/Perturb_attack_history")
-_ATTACK_CHALLENGES_KEEP = int(os.getenv("PERTURB_ATTACK_CHALLENGES_KEEP", "200"))
+# Total wall-clock budget the engine gets per task. The download/upload/submit round-trip must also
+# fit inside the ~20s task window, so the attack timeout is held below that. Override via env.
+_ATTACK_TIMEOUT_SECONDS = float(os.getenv("PERTURB_ATTACK_TIMEOUT_SECONDS", "15.0"))
 
 
-def _rotate_attack_challenges() -> None:
-    """Keep only the newest _ATTACK_CHALLENGES_KEEP files in _ATTACK_CHALLENGES_DIR; move the rest
-    (oldest first, by mtime) into _ATTACK_HISTORY_DIR."""
-    entries = [
-        os.path.join(_ATTACK_CHALLENGES_DIR, n)
-        for n in os.listdir(_ATTACK_CHALLENGES_DIR)
-        if n.endswith(".json")
-    ]
-    if len(entries) <= _ATTACK_CHALLENGES_KEEP:
-        return
-    entries.sort(key=os.path.getmtime)  # oldest first
-    overflow = entries[: len(entries) - _ATTACK_CHALLENGES_KEEP]
-    os.makedirs(_ATTACK_HISTORY_DIR, exist_ok=True)
-    for src in overflow:
-        dst = os.path.join(_ATTACK_HISTORY_DIR, os.path.basename(src))
-        try:
-            os.replace(src, dst)
-        except Exception as err:
-            logger.warning(f"[attack-challenge] failed to archive {src}: {err}")
-
-
-def _store_attack_challenge(synapse: AttackChallenge) -> None:
-    """Persist every incoming challenge's AttackChallenge input params to {timestamp}_{task_id}.json
-    under _ATTACK_CHALLENGES_DIR, then rotate so only the latest _ATTACK_CHALLENGES_KEEP remain.
-    Best-effort: failures are logged, never raised, so they can't disturb the response."""
-    try:
-        os.makedirs(_ATTACK_CHALLENGES_DIR, exist_ok=True)
-        task_id = str(getattr(synapse, "task_id", "unknown"))
-        safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id) or "unknown"
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(_ATTACK_CHALLENGES_DIR, f"{timestamp}_{safe_task}.json")
-        # Several requests can share a task_id / land in the same second; don't clobber.
-        if os.path.exists(path):
-            path = os.path.join(_ATTACK_CHALLENGES_DIR, f"{timestamp}_{safe_task}_{os.urandom(3).hex()}.json")
-        payload = {
-            "saved_at": timestamp,
-            "task_id": task_id,
-            "model_name": getattr(synapse, "model_name", None),
-            "true_label": getattr(synapse, "true_label", None),
-            "epsilon": getattr(synapse, "epsilon", None),
-            "norm_type": getattr(synapse, "norm_type", None),
-            "min_delta": getattr(synapse, "min_delta", None),
-            "timeout_seconds": getattr(synapse, "timeout_seconds", None),
-            "clean_image_b64": getattr(synapse, "clean_image_b64", None),
-        }
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        _rotate_attack_challenges()
-    except Exception as err:
-        logger.warning(f"[attack-challenge] failed to store challenge task={getattr(synapse, 'task_id', 'unknown')}: {err}")
-
-
-def _dump_case(synapse: AttackChallenge, reason: str, directory: str,
-               tag: str = "case", extra: typing.Optional[dict] = None) -> None:
-    """Persist a challenge's AttackChallenge input params to {timestamp}_{task_id}.json under `directory`.
-    `extra` merges extra fields (e.g. the measured q / L∞ / score) into the payload. Best-effort:
-    failures are logged, never raised, so they can't disturb the response."""
-    try:
-        os.makedirs(directory, exist_ok=True)
-        task_id = str(getattr(synapse, "task_id", "unknown"))
-        safe_task = re.sub(r"[^A-Za-z0-9_.-]", "_", task_id) or "unknown"
-        timestamp = time.strftime("%Y%m%d_%H%M%S")
-        path = os.path.join(directory, f"{timestamp}_{safe_task}.json")
-        # Several requests can share a task_id / land in the same second; don't clobber.
-        if os.path.exists(path):
-            path = os.path.join(directory, f"{timestamp}_{safe_task}_{os.urandom(3).hex()}.json")
-        payload = {
-            "reason": reason,
-            "saved_at": timestamp,
-            "task_id": task_id,
-            "model_name": getattr(synapse, "model_name", None),
-            "true_label": getattr(synapse, "true_label", None),
-            "epsilon": getattr(synapse, "epsilon", None),
-            "norm_type": getattr(synapse, "norm_type", None),
-            "min_delta": getattr(synapse, "min_delta", None),
-            "timeout_seconds": getattr(synapse, "timeout_seconds", None),
-            "clean_image_b64": getattr(synapse, "clean_image_b64", None),
-        }
-        if extra:
-            payload.update(extra)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-        logger.info(f"[{tag}] saved challenge -> {path} (reason={reason})")
-    except Exception as err:
-        logger.warning(f"[{tag}] failed to save challenge task={getattr(synapse, 'task_id', 'unknown')}: {err}")
-
-
-def _dump_error_case(synapse: AttackChallenge, reason: str) -> None:
-    """Dump a no-flip / exception challenge to _ERROR_CASES_DIR for offline replay."""
-    _dump_case(synapse, reason, _ERROR_CASES_DIR, tag="error-case")
-
-
-def _warmup(model: torch.nn.Module, device: torch.device) -> None:
-    """Warm CUDA kernels / allocator / cuDNN at first load so the first real challenge does not
-    pay JIT + autotune latency. Exercises the exact inference path: forward + backward + PNG round-trip."""
-    t0 = time.time()
-    try:
-        logger.info(f"[MINER] warmup start device={device.type}")
-        x = torch.rand(1, 3, 480, 480, device=device, requires_grad=True)
-        logits_for_images(model=model, image_bchw=x).sum().backward()
-        _ = png_roundtrip(torch.rand(3, 480, 480, device=device), device)
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-        logger.info(f"[MINER] warmup done device={device.type} elapsed={time.time() - t0:.2f}s")
-    except Exception as err:
-        logger.warning(f"[MINER] warmup skipped: {err}")
-
-
-# ==========================================================================================
-# Bittensor plumbing — UNCHANGED from the stock miner.
-# ==========================================================================================
 def _make_wallet(config):
     wallet_name = getattr(config.wallet, "name", getattr(config, "wallet_name", "default"))
     wallet_hotkey = getattr(config.wallet, "hotkey", getattr(config, "wallet_hotkey", "default"))
@@ -201,25 +87,6 @@ def _make_subtensor(config):
         return subtensor_cls(config=config)
 
 
-def _make_axon(wallet, config):
-    resolved_config = config() if callable(config) else config
-    axon_cfg = getattr(resolved_config, "axon", None)
-    kwargs: dict = {"wallet": wallet}
-    port = getattr(axon_cfg, "port", None)
-    if port:
-        kwargs["port"] = int(port)
-    external_ip = getattr(axon_cfg, "external_ip", None)
-    if external_ip:
-        kwargs["external_ip"] = external_ip
-    external_port = getattr(axon_cfg, "external_port", None)
-    if external_port:
-        kwargs["external_port"] = int(external_port)
-    axon_cls = bt.axon if hasattr(bt, "axon") else getattr(bt, "Axon", None)
-    if axon_cls is None:
-        raise RuntimeError("No axon constructor found in bittensor.")
-    return axon_cls(**kwargs)
-
-
 def _configure_log_level(level_raw: str) -> None:
     level_name = (level_raw or "DEBUG").upper()
     requested_level = getattr(pylogging, level_name, pylogging.INFO)
@@ -229,6 +96,22 @@ def _configure_log_level(level_raw: str) -> None:
         format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
     )
     pylogging.getLogger().setLevel(level)
+
+
+def _warmup(model: torch.nn.Module, device: torch.device) -> None:
+    """Warm CUDA kernels / allocator / cuDNN at first load so the first real task does not pay
+    JIT + autotune latency. Exercises the exact inference path: forward + backward + PNG round-trip."""
+    t0 = time.time()
+    try:
+        logger.info(f"[MINER] warmup start device={device.type}")
+        x = torch.rand(1, 3, 480, 480, device=device, requires_grad=True)
+        logits_for_images(model=model, image_bchw=x).sum().backward()
+        _ = png_roundtrip(torch.rand(3, 480, 480, device=device), device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        logger.info(f"[MINER] warmup done device={device.type} elapsed={time.time() - t0:.2f}s")
+    except Exception as err:
+        logger.warning(f"[MINER] warmup skipped: {err}")
 
 
 class PerturbMiner:
@@ -244,23 +127,15 @@ class PerturbMiner:
             f"cuda_available={torch.cuda.is_available()} "
             f"cuda_device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'n/a'}"
         )
-
         self.model = load_efficientnet_v2_l(self.device)
         _warmup(self.model, self.device)
-
-        self.axon = _make_axon(wallet=self.wallet, config=self.config)
-        self.axon.attach(
-            forward_fn=self.forward,
-            blacklist_fn=self.blacklist,
-            priority_fn=self.priority,
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", "unknown"))
+        self.response_exporter = ImageStorageUploader(
+            run_id=f"miner-{hotkey[:8]}-{os.getpid()}",
+            netuid=int(self.config.netuid),
+            uploader_hotkey=hotkey,
         )
-
-    def _log_step_start(self, step_name: str, **context: typing.Any) -> None:
-        if context:
-            rendered = " ".join([f"{k}={v}" for k, v in context.items()])
-            logger.info(f"[STEP_START] {step_name} {rendered}")
-        else:
-            logger.info(f"[STEP_START] {step_name}")
+        self.last_processed_task_id = ""
 
     def _init_subtensor_with_retry(self):
         max_attempts = int(os.getenv("SUBTENSOR_CONNECT_RETRIES", "5"))
@@ -295,155 +170,166 @@ class PerturbMiner:
     def sync(self) -> None:
         self.metagraph.sync(subtensor=self.subtensor)
 
-    async def forward(self, synapse: AttackChallenge) -> AttackChallenge:
-        t_received = time.time()
-        self._log_step_start(
-            "miner_forward",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            norm_type=getattr(synapse, "norm_type", "unknown"),
-            epsilon=getattr(synapse, "epsilon", "unknown"),
-        )
-        _store_attack_challenge(synapse)
-        if synapse.norm_type != "Linf":
-            logger.info(f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unsupported norm_type={synapse.norm_type}")
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
-
-        clean = decode_image_b64(synapse.clean_image_b64).to(self.device)
-        target_index = resolve_target_index(synapse.true_label)
-        if target_index is None:
-            logger.warning(
-                f"Skipping task={getattr(synapse, 'task_id', 'unknown')}: unresolved true_label={getattr(synapse, 'true_label', None)}"
-            )
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            return synapse
-
-        epsilon = float(synapse.epsilon)
-        min_delta = float(getattr(synapse, "min_delta", 0.002))
-        timeout_seconds = float(getattr(synapse, "timeout_seconds", 15.0))
-
-        try:
-            adv = perturb(
-                self.model,
-                clean,
-                target_index,
-                epsilon,
-                min_delta,
-                self.device,
-                timeout_seconds=timeout_seconds,
-                start_time=t_received,
-            )
-            adv_b64 = encode_image_b64(adv)
-            seen = decode_image_b64(adv_b64).to(self.device)
-            diff = seen - clean
-            norm = float(diff.abs().max().item())
-            rmse = float(torch.sqrt(torch.mean(diff ** 2)).item())
-            # Clean tier: perturb() returned the clean image (no flip found). Pass the original
-            # bytes through verbatim rather than re-encoding, and dump the case for offline replay.
-            if norm < min_delta:
-                synapse.perturbed_image_b64 = synapse.clean_image_b64
-                _dump_error_case(synapse, "no_flip")
-            else:
-                synapse.perturbed_image_b64 = adv_b64
-            h, w = clean.shape[1], clean.shape[2]
-            # Log BOTH: pert_score = L∞+RMSE component only; score = the FULL validator objective
-            # (adds 0.03·margin + 0.01·novelty). The full score is what the validator actually assigns —
-            # it is normally HIGHER than pert_score, so don't read pert_score as "the score".
-            if norm < min_delta:
-                pert_score = full_score = 0.0
-            else:
-                pert_score = estimate_validator_score(norm, rmse, epsilon)
-                with torch.no_grad():
-                    adv_logits = logits_for_images(model=self.model, image_bchw=seen.unsqueeze(0))[0]
-                cw = cw_margin(adv_logits, target_index)  # true - best_other; validator margin = -cw
-                changed_pixels = int((diff.abs() > (0.5 / 255.0)).any(dim=0).sum().item())
-                full_score = validator_score(norm, rmse, cw, changed_pixels, min(epsilon, MAX_LINF_DELTA))
-                # Flip found, but at a coarser byte step than the ideal L∞=1/255 (q=2 fallback, or a
-                # large min_delta forcing k_min>=2). Processed properly yet in the lower-scoring q>1
-                # tail — dump it (enriched with the measured q/L∞/RMSE/score) for offline study.
-                k_used = int(round(norm * 255.0))
-                if k_used > 1:
-                    _dump_case(
-                        synapse, f"q{k_used}_flip", _NONQ1_CASES_DIR, tag="nonq1-case",
-                        extra={"k": k_used, "linf": norm, "rmse": rmse, "score": full_score,
-                               "margin": float(-cw), "changed_pixels": changed_pixels},
-                    )
-            logger.info(
-                f"Finished task={getattr(synapse, 'task_id', 'unknown')} dim={h}x{w} "
-                f"rmse={rmse:.6f} pert_score={pert_score:.4f} score={full_score:.4f} "
-                f"elapsed={time.time() - t_received:.3f}s"
-            )
-            logger.info("-" * 77)
-        except Exception as err:
-            logger.exception(f"Perturb failed task={getattr(synapse, 'task_id', 'unknown')}: {err}")
-            synapse.perturbed_image_b64 = synapse.clean_image_b64
-            _dump_error_case(synapse, "exception")
-        return synapse
-
-    async def blacklist(self, synapse: AttackChallenge) -> typing.Tuple[bool, str]:
-        self._log_step_start(
-            "miner_blacklist",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
-        )
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            logger.warning("Blacklist reject: missing caller hotkey")
-            return True, "Missing caller hotkey"
-
-        hotkey = synapse.dendrite.hotkey
+    def _miner_uid(self) -> int:
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", ""))
         if hotkey not in self.metagraph.hotkeys:
-            logger.warning(f"Blacklist reject: unregistered caller hotkey={hotkey}")
-            return True, "Unregistered caller"
+            raise RuntimeError("Miner hotkey is not registered on this netuid.")
+        return int(self.metagraph.hotkeys.index(hotkey))
 
-        uid = self.metagraph.hotkeys.index(hotkey)
-        if not self.metagraph.validator_permit[uid]:
-            logger.warning(f"Blacklist reject: caller uid={uid} lacks validator permit")
-            return True, "Caller is not validator"
+    def _attack_image(self, *, task_id: str, clean_image_b64: str) -> tuple[str, str]:
+        """Run the neurons/perturb engine on the clean image. Returns (perturbed_image_b64,
+        predicted_label). Falls back to the clean bytes verbatim when no envelope-safe flip is found."""
+        t_received = time.time()
+        clean = decode_image_b64(clean_image_b64).to(self.device)
+        predicted_label = predict_label(self.model, clean)
+        target_index = resolve_target_index(predicted_label)
+        if target_index is None:
+            raise RuntimeError(f"Unable to resolve predicted label for task={task_id}: {predicted_label}")
 
-        logger.info(f"Blacklist allow: caller uid={uid} hotkey={hotkey}")
-        return False, "OK"
+        epsilon = float(getattr(self.config.perturb, "max_linf_delta", C.MAX_LINF_DELTA))
+        min_delta = float(getattr(self.config.perturb, "min_linf_delta", C.MIN_LINF_DELTA))
 
-    async def priority(self, synapse: AttackChallenge) -> float:
-        self._log_step_start(
-            "miner_priority",
-            task_id=getattr(synapse, "task_id", "unknown"),
-            caller_hotkey=getattr(getattr(synapse, "dendrite", None), "hotkey", None),
+        adv = perturb(
+            self.model,
+            clean,
+            target_index,
+            epsilon,
+            min_delta,
+            self.device,
+            timeout_seconds=_ATTACK_TIMEOUT_SECONDS,
+            start_time=t_received,
         )
-        if synapse.dendrite is None or synapse.dendrite.hotkey is None:
-            logger.info("Priority=0.0: missing caller hotkey")
-            return 0.0
-        if synapse.dendrite.hotkey not in self.metagraph.hotkeys:
-            logger.info(f"Priority=0.0: unknown hotkey={synapse.dendrite.hotkey}")
-            return 0.0
-        uid = self.metagraph.hotkeys.index(synapse.dendrite.hotkey)
-        priority = float(self.metagraph.S[uid])
-        logger.info(f"Priority computed: uid={uid} priority={priority:.6f}")
-        return priority
+        adv_b64 = encode_image_b64(adv)
+        seen = decode_image_b64(adv_b64).to(self.device)
+        diff = seen - clean
+        norm = float(diff.abs().max().item())
+        rmse = float(torch.sqrt(torch.mean(diff ** 2)).item())
+
+        # Clean tier: perturb() returned the clean image (no flip found). Pass the original bytes
+        # through verbatim rather than the re-encoded ones.
+        if norm < min_delta:
+            logger.info(
+                f"No flip found task={task_id} target_idx={target_index} norm={norm:.6f} "
+                f"min_delta={min_delta:.6f} elapsed={time.time() - t_received:.3f}s"
+            )
+            return clean_image_b64, str(predicted_label)
+
+        # Log BOTH: pert_score = L∞+RMSE component only; score = the FULL validator objective
+        # (adds margin + novelty terms). The full score is what the validator actually assigns.
+        pert_score = estimate_validator_score(norm, rmse, epsilon)
+        with torch.no_grad():
+            adv_logits = logits_for_images(model=self.model, image_bchw=seen.unsqueeze(0))[0]
+        cw = cw_margin(adv_logits, target_index)  # true - best_other; validator margin = -cw
+        changed_pixels = int((diff.abs() > (0.5 / 255.0)).any(dim=0).sum().item())
+        full_score = validator_score(norm, rmse, cw, changed_pixels, min(epsilon, MAX_LINF_DELTA))
+        logger.info(
+            f"Finished task={task_id} target_idx={target_index} k={int(round(norm * 255.0))} "
+            f"linf={norm:.6f} rmse={rmse:.6f} pert_score={pert_score:.4f} score={full_score:.4f} "
+            f"elapsed={time.time() - t_received:.3f}s"
+        )
+        return adv_b64, str(predicted_label)
+
+    def _upload_response(self, *, task_id: str, perturbed_image_b64: str) -> str:
+        uid = self._miner_uid()
+        hotkey = str(getattr(self.wallet.hotkey, "ss58_address", ""))
+        miner_storage_key = self.response_exporter.miner_storage_key(miner_uid=uid, miner_hotkey=hotkey)
+        safe_task_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in task_id)
+        image_hash = hashlib.sha256(perturbed_image_b64.encode("utf-8")).hexdigest()[:12]
+        key = f"{C.STORAGE_PREFIX.strip().strip('/')}/miner-responses/{safe_task_id}/{miner_storage_key}_{image_hash}.png"
+        return self.response_exporter.upload_image_b64(key=key, image_b64=perturbed_image_b64)
+
+    def _submission_succeeded(self, response: typing.Any) -> bool:
+        if response is None:
+            return True
+        if isinstance(response, dict):
+            raw = response.get("success", response.get("ok", response.get("status")))
+            if isinstance(raw, bool):
+                return raw
+            if isinstance(raw, str):
+                return raw.strip().lower() in {"success", "succeeded", "ok", "true"}
+            has_miner_uid = any(key in response for key in ("miner_uid", "miner_id", "minerUid"))
+            has_image_url = any(response.get(key) for key in ("imageURL", "imageUrl", "image_url"))
+            if has_miner_uid and has_image_url:
+                return True
+        return False
+
+    def _process_task(self, *, task_id: str, image_url: str) -> None:
+        # Processing, upload, and API submission should complete within 20 seconds.
+        started_at = time.time()
+        clean_image_b64 = image_url_to_b64(
+            image_url,
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+        )
+        perturbed_image_b64, _ = self._attack_image(task_id=task_id, clean_image_b64=clean_image_b64)
+        response_url = self._upload_response(
+            task_id=task_id,
+            perturbed_image_b64=perturbed_image_b64,
+        )
+        submit_response = submit_miner_response(
+            base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+            wallet=self.wallet,
+            image_url=response_url,
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+        )
+        if not self._submission_succeeded(submit_response):
+            raise RuntimeError(f"Response submission failed task={task_id} api_response={submit_response}")
+        elapsed = time.time() - started_at
+        logger.info(f"Submitted task={task_id} response_url={response_url} elapsed_seconds={elapsed:.2f}")
+
+    def _wait_for_next_task_boundary(self) -> None:
+        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
+        slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
+        logger.info(f"Reached task boundary after waiting {slept:.2f}s")
+
+    def _fetch_new_task_at_boundary(self):
+        retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
+        retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
+        for attempt in range(1, retries + 1):
+            task = get_current_task(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+            )
+            if task is not None and task.task_id != self.last_processed_task_id:
+                return task
+            logger.info(f"No new task at boundary attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(retry_seconds)
+        return None
 
     def run(self) -> None:
         self.sync()
-
-        if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
-            raise RuntimeError("Miner hotkey is not registered on this netuid.")
-
-        announced_ip = getattr(self.config.axon, "external_ip", None) or "auto-detect"
-        announced_port = getattr(self.config.axon, "external_port", None) or self.config.axon.port
-        logger.info(
-            f"Serving miner axon {self.axon} on network: {self.config.subtensor.network} "
-            f"with netuid: {self.config.netuid} | bind_port={self.config.axon.port} "
-            f"announce={announced_ip}:{announced_port}"
-        )
-        self.axon.serve(netuid=self.config.netuid, subtensor=self.subtensor)
-        self.axon.start()
-
-        logger.info("Miner started. Waiting for validator queries.")
+        self._miner_uid()
+        try:
+            current_task = get_current_task(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                timeout_seconds=float(
+                    getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                ),
+            )
+        except Exception as exc:
+            logger.warning(f"Initial task fetch failed: {exc}")
+            current_task = None
+        self.last_processed_task_id = current_task.task_id if current_task is not None else ""
+        logger.info(f"Miner started. baseline_task_id={self.last_processed_task_id or '(none)'}")
         while True:
-            time.sleep(12)
-            self.sync()
+            try:
+                self._wait_for_next_task_boundary()
+                task = self._fetch_new_task_at_boundary()
+                if task is None:
+                    continue
+
+                logger.info(f"New task found task_id={task.task_id} image_url={task.image_url}")
+                try:
+                    self._process_task(task_id=task.task_id, image_url=task.image_url)
+                finally:
+                    self.last_processed_task_id = task.task_id
+            except Exception as exc:
+                logger.warning(f"Miner task loop failed: {exc}")
+                time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
 
 
 def build_config() -> typing.Any:
-    parser = argparse.ArgumentParser(description="Perturb subnet miner (one-shot sparse engine)")
+    parser = argparse.ArgumentParser(description="Perturb subnet miner")
     parser.add_argument("--netuid", type=int, required=True)
     parser.add_argument("--network", type=str, default=os.getenv("NETWORK", "finney"))
     parser.add_argument(
@@ -456,12 +342,6 @@ def build_config() -> typing.Any:
     parser.add_argument("--wallet.hotkey", dest="wallet_hotkey", type=str, default=os.getenv("HOTKEY_NAME", "default"))
     parser.add_argument("--logging-dir", dest="logging_dir", type=str, default=os.getenv("LOGGING_DIR", "./logs"))
     parser.add_argument("--log-level", dest="log_level", type=str, default=os.getenv("LOG_LEVEL", "DEBUG"))
-    parser.add_argument(
-        "--axon.port",
-        dest="axon_port",
-        type=int,
-        default=int(os.getenv("MINER_PORT", os.getenv("AXON_PORT", "9000"))),
-    )
 
     if hasattr(bt, "config"):
         config = bt.config(parser)
@@ -484,21 +364,12 @@ def build_config() -> typing.Any:
         config.logging = type("LoggingConfig", (), {})()
     config.logging.logging_dir = getattr(config.logging, "logging_dir", getattr(config, "logging_dir", "./logs"))
 
-    if not hasattr(config, "axon"):
-        config.axon = type("AxonConfig", (), {})()
-    config.axon.port = int(getattr(config.axon, "port", getattr(config, "axon_port", 9000)))
-
-    external_ip = (os.getenv("AXON_EXTERNAL_IP") or os.getenv("RUNPOD_PUBLIC_IP") or "").strip()
-    config.axon.external_ip = external_ip or None
-    external_port_raw = (
-        os.getenv("AXON_EXTERNAL_PORT")
-        or os.getenv(f"RUNPOD_TCP_PORT_{config.axon.port}")
-        or ""
-    ).strip()
-    config.axon.external_port = int(external_port_raw) if external_port_raw else None
+    if not hasattr(config, "perturb"):
+        config.perturb = type("PerturbConfig", (), {})()
+    for key, value in C.VALIDATOR_CONFIG.items():
+        setattr(config.perturb, key, getattr(config.perturb, key, value))
 
     config.log_level = getattr(config, "log_level", os.getenv("LOG_LEVEL", "DEBUG"))
-
     return config
 
 
