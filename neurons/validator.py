@@ -34,6 +34,7 @@ from perturbnet.model import (
     predict_label,
     resolve_target_index,
 )
+from perturbnet.task_timing import next_task_boundary, sleep_until_next_task_boundary
 
 logger = pylogging.getLogger(__name__)
 
@@ -161,6 +162,7 @@ class PerturbValidator:
                     C.LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,
                 )
             ),
+            api_key=str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY)),
             timeout_seconds=float(getattr(self.config.perturb, "leaderboard_report_timeout_seconds", 10.0)),
             wallet=self.wallet,
             validator_hotkey=str(hotkey),
@@ -535,6 +537,73 @@ class PerturbValidator:
         own_uid = self.metagraph.hotkeys.index(own_hotkey) if own_hotkey in self.metagraph.hotkeys else None
         return [uid for uid in metagraph_miner_uids(self.metagraph) if own_uid is None or uid != own_uid]
 
+    def _wait_for_next_task_boundary(self) -> None:
+        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
+        slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
+        logger.info(f"Reached task boundary after waiting {slept:.2f}s")
+
+    def _fetch_new_task_at_boundary(self):
+        retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
+        retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
+        for attempt in range(1, retries + 1):
+            try:
+                task = get_current_task(
+                    base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                    timeout_seconds=float(
+                        getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(f"Task API request failed attempt={attempt}/{retries}: {exc}")
+                task = None
+            if task is not None and task.task_id != self.last_validated_api_task_id:
+                return task
+            logger.info(f"No new task at boundary attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(retry_seconds)
+        return None
+
+    def _wait_until_evaluation_enabled(self, *, task_id: str) -> bool:
+        delay = float(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_delay_seconds",
+                C.VALIDATOR_EVALUATION_DELAY_SECONDS,
+            )
+        )
+        poll_seconds = float(
+            getattr(
+                self.config.perturb,
+                "validator_evaluation_poll_seconds",
+                C.VALIDATOR_EVALUATION_POLL_SECONDS,
+            )
+        )
+        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
+        deadline = next_task_boundary(cadence_seconds=cadence)
+        logger.info(f"Waiting {delay:.2f}s before checking evaluation readiness task_id={task_id}")
+        time.sleep(max(0.0, delay))
+
+        while time.time() < deadline:
+            try:
+                task = get_current_task(
+                    base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                    timeout_seconds=float(
+                        getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
+                    ),
+                )
+            except Exception as exc:
+                logger.warning(f"Task API readiness request failed task_id={task_id}: {exc}")
+                task = None
+            if task is not None and task.task_id != task_id:
+                logger.info(f"Task changed before evaluation enabled old_task_id={task_id} new_task_id={task.task_id}")
+                return False
+            if task is not None and task.evaluation_enabled:
+                logger.info(f"Evaluation enabled task_id={task_id} status={task.status}")
+                return True
+            time.sleep(max(0.1, poll_seconds))
+        logger.warning(f"Evaluation was not enabled before next task boundary task_id={task_id}")
+        return False
+
     def _fallback_burn_rate(self) -> float:
         return min(max(float(getattr(self.config.perturb, "default_burn_rate", 0.0)), 0.0), 1.0)
 
@@ -692,21 +761,12 @@ class PerturbValidator:
                 self.sync()
                 self._log_step_start("loop_get_current_block")
                 block = self.subtensor.get_current_block()
+                self._log_step_start("loop_wait_task_boundary", block=block)
+                self._wait_for_next_task_boundary()
                 self._log_step_start("loop_get_api_task", block=block)
-                task = None
-                while task is None or task.task_id == self.last_validated_api_task_id:
-                    try:
-                        task = get_current_task(
-                            base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                            timeout_seconds=float(
-                                getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
-                            ),
-                        )
-                    except Exception as exc:
-                        logger.warning(f"Task API request failed: {exc}")
-                        task = None
-                    if task is None or task.task_id == self.last_validated_api_task_id:
-                        time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
+                task = self._fetch_new_task_at_boundary()
+                if task is None:
+                    continue
                 try:
                     challenge = self.challenge_from_task_api(task_id=task.task_id, image_url=task.image_url)
                 except Exception as exc:
@@ -719,6 +779,11 @@ class PerturbValidator:
                     epsilon=f"{challenge.epsilon:.4f}",
                     true_label=challenge.true_label,
                 )
+
+                if not self._wait_until_evaluation_enabled(task_id=challenge.task_id):
+                    self.last_validated_api_task_id = challenge.task_id
+                    self._save_state()
+                    continue
 
                 self._log_step_start("loop_get_submitted_responses", task_id=challenge.task_id)
                 try:

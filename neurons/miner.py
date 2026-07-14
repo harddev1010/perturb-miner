@@ -16,6 +16,7 @@ from perturbnet.api_client import get_current_task, submit_miner_response
 from perturbnet.image_io import decode_image_b64, encode_image_b64, image_url_to_b64
 from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_index, predict_label, resolve_target_index
 from perturbnet.storage_uploader import ImageStorageUploader
+from perturbnet.task_timing import sleep_until_next_task_boundary
 
 logger = pylogging.getLogger(__name__)
 
@@ -188,6 +189,10 @@ class PerturbMiner:
                 return raw
             if isinstance(raw, str):
                 return raw.strip().lower() in {"success", "succeeded", "ok", "true"}
+            has_miner_uid = any(key in response for key in ("miner_uid", "miner_id", "minerUid"))
+            has_image_url = any(response.get(key) for key in ("imageURL", "imageUrl", "image_url"))
+            if has_miner_uid and has_image_url:
+                return True
         return False
 
     def _process_task(self, *, task_id: str, image_url: str) -> None:
@@ -213,18 +218,35 @@ class PerturbMiner:
         elapsed = time.time() - started_at
         logger.info(f"Submitted task={task_id} response_url={response_url} elapsed_seconds={elapsed:.2f}")
 
+    def _wait_for_next_task_boundary(self) -> None:
+        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
+        slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
+        logger.info(f"Reached task boundary after waiting {slept:.2f}s")
+
+    def _fetch_new_task_at_boundary(self):
+        retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
+        retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
+        for attempt in range(1, retries + 1):
+            task = get_current_task(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+            )
+            if task is not None and task.task_id != self.last_processed_task_id:
+                return task
+            logger.info(f"No new task at boundary attempt={attempt}/{retries}")
+            if attempt < retries:
+                time.sleep(retry_seconds)
+        return None
+
     def run(self) -> None:
         self.sync()
         self._miner_uid()
         logger.info("Miner started. Polling task API.")
         while True:
             try:
-                task = get_current_task(
-                    base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                    timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
-                )
-                if task is None or task.task_id == self.last_processed_task_id:
-                    time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
+                self._wait_for_next_task_boundary()
+                task = self._fetch_new_task_at_boundary()
+                if task is None:
                     continue
 
                 logger.info(f"New task found task_id={task.task_id} image_url={task.image_url}")
@@ -232,15 +254,6 @@ class PerturbMiner:
                     self._process_task(task_id=task.task_id, image_url=task.image_url)
                 finally:
                     self.last_processed_task_id = task.task_id
-                    time.sleep(
-                        float(
-                            getattr(
-                                self.config.perturb,
-                                "sleep_time",
-                                C.SLEEP_TIME,
-                            )
-                        )
-                    )
             except Exception as exc:
                 logger.warning(f"Miner task loop failed: {exc}")
                 time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
