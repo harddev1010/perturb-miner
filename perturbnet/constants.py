@@ -53,8 +53,6 @@ IMAGENET100_SPLIT = "train"
 # long and try again; there is no fallback image.
 CHALLENGE_RETRY_DELAY_SECONDS = _env_int("PERTURB_CHALLENGE_RETRY_DELAY_SECONDS", 180)
 IMAGE_SIZE = _env_int("PERTURB_IMAGE_SIZE", 64)
-TIMEOUT_SECONDS = _env_int("PERTURB_TIMEOUT_SECONDS", 20)
-QUERY_INTERVAL_SECONDS = _env_int("PERTURB_QUERY_INTERVAL_SECONDS", 20)
 K_MINERS = _env_int("PERTURB_K_MINERS", 150)
 HISTORY_SIZE = _env_int("PERTURB_HISTORY_SIZE", 300)
 MIN_LINF_DELTA = _env_float("PERTURB_MIN_LINF_DELTA", 0.003)
@@ -100,8 +98,6 @@ VALIDATOR_CONFIG = {
     "imagenet100_repo_id": IMAGENET100_REPO_ID,
     "imagenet100_split": IMAGENET100_SPLIT,
     "image_size": IMAGE_SIZE,
-    "timeout_seconds": TIMEOUT_SECONDS,
-    "query_interval_seconds": QUERY_INTERVAL_SECONDS,
     "k_miners": K_MINERS,
     "history_size": HISTORY_SIZE,
     "min_linf_delta": MIN_LINF_DELTA,
@@ -145,7 +141,6 @@ VALIDATOR_CONFIG = {
 }
 
 # Validator scoring defaults.
-SPEED_WEIGHT = _env_float("PERTURB_SPEED_WEIGHT", 0)
 PERTURBATION_WEIGHT = _env_float("PERTURB_PERTURBATION_WEIGHT", 1)
 GAMMA_HISTORY_WEIGHT = _env_float("PERTURB_GAMMA_HISTORY_WEIGHT", 0.7)
 

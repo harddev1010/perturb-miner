@@ -48,7 +48,6 @@ class ChallengeSpec:
     true_label: str
     epsilon: float
     norm_type: str
-    timeout_seconds: int
 
 
 @dataclass
@@ -56,7 +55,6 @@ class EvaluationResult:
     score: float
     reason: str
     model_prediction: str = ""
-    response_time_ms: int = 0
     norm: float = 0.0
     rmse: float = 0.0
     epsilon: float = 0.0
@@ -320,26 +318,24 @@ class PerturbValidator:
             true_label=predicted_label,
             epsilon=float(getattr(self.config.perturb, "max_linf_delta", C.MAX_LINF_DELTA)),
             norm_type="Linf",
-            timeout_seconds=int(getattr(self.config.perturb, "timeout_seconds", C.TIMEOUT_SECONDS)),
         )
 
     def verify_and_score(
         self,
         challenge: ChallengeSpec,
         perturbed_image_b64: str,
-        response_time_ms: int,
         novelty_pixel_count: int | None = None,
     ) -> EvaluationResult:
         try:
             x_clean = quantize_image_uint8_grid(decode_image_b64(challenge.clean_image_b64).to(self.device))
             x_adv = quantize_image_uint8_grid(decode_image_b64(perturbed_image_b64).to(self.device))
         except Exception as exc:
-            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}", response_time_ms=response_time_ms)
+            return EvaluationResult(score=0.0, reason=f"decode_failed:{exc}")
 
         if x_adv.shape != x_clean.shape:
-            return EvaluationResult(score=0.0, reason="shape_mismatch", response_time_ms=response_time_ms)
+            return EvaluationResult(score=0.0, reason="shape_mismatch")
         if x_adv.min().item() < 0.0 or x_adv.max().item() > 1.0:
-            return EvaluationResult(score=0.0, reason="value_out_of_range", response_time_ms=response_time_ms)
+            return EvaluationResult(score=0.0, reason="value_out_of_range")
 
         prediction = ""
         prediction_index: int | None = None
@@ -354,7 +350,6 @@ class PerturbValidator:
             return EvaluationResult(
                 score=0.0,
                 reason=f"model_inference_failed:{exc}",
-                response_time_ms=response_time_ms,
             )
 
         if challenge.norm_type == "Linf":
@@ -369,7 +364,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_delta",
                 model_prediction=prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 epsilon=float(challenge.epsilon),
             )
@@ -379,7 +373,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="above_max_delta",
                 model_prediction=prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
@@ -397,7 +390,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="label_match_with_original",
                 model_prediction=normalized_prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(torch.sqrt(torch.mean((x_adv - x_clean) ** 2)).item()),
                 epsilon=float(challenge.epsilon),
@@ -412,7 +404,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_ssim",
                 model_prediction=normalized_prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
@@ -426,7 +417,6 @@ class PerturbValidator:
                 score=0.0,
                 reason="below_min_psnr_db",
                 model_prediction=normalized_prediction,
-                response_time_ms=response_time_ms,
                 norm=float(norm),
                 rmse=float(rmse),
                 epsilon=float(challenge.epsilon),
@@ -448,9 +438,6 @@ class PerturbValidator:
         total_weight = max(1e-12, linf_weight + rmse_weight)
         perturbation_score = ((linf_weight * linf_score) + (rmse_weight * rmse_score)) / total_weight
 
-        time_ratio = response_time_ms / (challenge.timeout_seconds * 1000.0)
-        speed_score = 1.0 - min(time_ratio, 1.0)
-
         margin_score = 0.0
         if logits is not None and true_index is not None and 0 <= true_index < logits.shape[1]:
             row = logits[0]
@@ -468,7 +455,6 @@ class PerturbValidator:
 
         score = (
             C.PERTURBATION_WEIGHT * perturbation_score
-            + C.SPEED_WEIGHT * speed_score
             + float(getattr(self.config.perturb, "analyze_bucket_margin_weight", 0.03)) * margin_score
             + float(getattr(self.config.perturb, "analyze_bucket_novelty_weight", 0.01)) * novelty_score
         )
@@ -476,7 +462,6 @@ class PerturbValidator:
             score=float(score),
             reason="success",
             model_prediction=normalized_prediction,
-            response_time_ms=response_time_ms,
             norm=float(norm),
             rmse=float(rmse),
             epsilon=float(challenge.epsilon),
@@ -755,7 +740,6 @@ class PerturbValidator:
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
         self._log_summary(
             "validator_config",
-            timeout=self.config.perturb.timeout_seconds,
             k_miners=self.config.perturb.k_miners,
             history_size=self.config.perturb.history_size,
             min_linf=self.config.perturb.min_linf_delta,
@@ -763,7 +747,6 @@ class PerturbValidator:
             min_ssim=self.config.perturb.min_ssim,
             min_psnr_db=self.config.perturb.min_psnr_db,
             perturb_weight=C.PERTURBATION_WEIGHT,
-            speed_weight=C.SPEED_WEIGHT,
             tempo=tempo,
             run_id=self.run_id,
         )
@@ -820,7 +803,6 @@ class PerturbValidator:
                 status_code_by_uid: dict[int, int] = {}
                 for uid in miner_uids:
                     submitted = submitted_response_by_uid[uid]
-                    started_at = time.time()
                     status_code = 200
                     try:
                         perturbed_image_b64 = image_url_to_b64(
@@ -833,7 +815,6 @@ class PerturbValidator:
                         status_code = 0
                         perturbed_image_b64 = ""
                         logger.warning(f"Submitted response download failed uid={uid} url={submitted.image_url}: {exc}")
-                    response_time_ms = int(max(0.001, time.time() - started_at) * 1000)
                     status_code_by_uid[uid] = int(status_code)
 
                     if status_code != 200 or not perturbed_image_b64:
@@ -841,7 +822,6 @@ class PerturbValidator:
                             score=0.0,
                             reason="response_missing_or_status_error",
                             model_prediction="unavailable",
-                            response_time_ms=response_time_ms,
                         )
                     else:
                         try:
@@ -851,7 +831,6 @@ class PerturbValidator:
                         result = self.verify_and_score(
                             challenge=challenge,
                             perturbed_image_b64=perturbed_image_b64,
-                            response_time_ms=response_time_ms,
                         )
                     results_by_uid.append((uid, result))
 
@@ -866,7 +845,6 @@ class PerturbValidator:
                     self.reason_counts_total[result.reason] += 1
                     response_log_lines.append(
                         f"uid={uid} status={status_code_by_uid.get(uid, 0)} score={score:.6f} "
-                        f"response_time_ms={result.response_time_ms} "
                         f"processed={int(self.processed_counts[uid]) + 1} "
                         f"reason={result.reason} "
                         f"norm={result.norm:.6f} rmse={result.rmse:.6f} epsilon={result.epsilon:.6f} "

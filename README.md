@@ -234,11 +234,10 @@ Per-response score (if verification passes):
 - `linf_score = (1 - linf_ratio)^2`
 - `rmse_score = (1 - rmse_ratio)^2`
 - `perturbation_score = weighted_avg(linf_score, rmse_score)` using `PERTURB_LINF_COMPONENT_WEIGHT` and `PERTURB_RMSE_COMPONENT_WEIGHT`
-- `speed_score = 1 - min(response_time / timeout, 1)`
 - `margin = best_non_true_logit - true_class_logit`
 - `margin_score = clamp(margin / 10, 0, 1)` using `ANALYZE_BUCKET_MARGIN_WEIGHT` (default `0.03`)
 - `novelty_score = clamp(changed_pixel_count / ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS, 0, 1)` using `ANALYZE_BUCKET_NOVELTY_WEIGHT` (default `0.01`)
-- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + PERTURB_SPEED_WEIGHT * speed_score + margin_weight * margin_score + novelty_weight * novelty_score`
+- `final = PERTURB_PERTURBATION_WEIGHT * perturbation_score + margin_weight * margin_score + novelty_weight * novelty_score`
 
 Any verification or constraint failure gets `0.0`.
 
