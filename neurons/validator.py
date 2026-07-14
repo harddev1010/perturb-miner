@@ -178,6 +178,15 @@ class PerturbValidator:
 
         self._load_state()
 
+    def _api_key(self) -> str:
+        return str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY)).strip()
+
+    def _ensure_api_key(self) -> None:
+        if not self._api_key():
+            msg = "PERTURB_API_KEY is not set; validator cannot fetch submitted responses."
+            logger.error(msg)
+            raise RuntimeError(msg)
+
     def _log_step_start(self, step_name: str, **context: Any) -> None:
         if context:
             rendered = " ".join([f"{k}={v}" for k, v in context.items()])
@@ -571,7 +580,7 @@ class PerturbValidator:
             )
         )
         base_url = str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL))
-        api_key = str(getattr(self.config.perturb, "api_key", C.PERTURB_API_KEY))
+        api_key = self._api_key()
         timeout_seconds = float(
             getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
         )
@@ -736,6 +745,7 @@ class PerturbValidator:
         self.sync()
         if self.wallet.hotkey.ss58_address not in self.metagraph.hotkeys:
             raise RuntimeError("Validator hotkey is not registered on this netuid.")
+        self._ensure_api_key()
 
         tempo = self.subtensor.get_subnet_hyperparameters(self.config.netuid).tempo
         self._log_summary(

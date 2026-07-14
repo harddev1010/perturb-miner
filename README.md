@@ -207,7 +207,7 @@ The generator samples ImageNet-100, uploads the clean task image with the config
 - Task generator publishes the current task with `task_id` and `imageURL`.
 - Miners read the current task from `GET /task`.
 - Miners submit response image URLs to `POST /submits`.
-- Validators read submitted response image URLs from `GET /response/`.
+- Validators read submitted response image URLs from `GET /submits` (Bearer auth, available while task status is `validating`).
 
 ### Task generator
 

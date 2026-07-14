@@ -50,6 +50,13 @@ def sign_body(wallet: Any, body: bytes) -> str:
     raise RuntimeError(f"Unsupported signature type: {type(signature).__name__}")
 
 
+def _authorization_headers(api_key: str) -> dict[str, str]:
+    api_key = str(api_key).strip()
+    if not api_key:
+        return {}
+    return {"Authorization": f"Bearer {api_key}"}
+
+
 def get_current_task(*, base_url: str, timeout_seconds: float) -> CurrentTask | None:
     response = requests.get(_url(base_url, "/task"), timeout=timeout_seconds)
     payload = _json_response(response)
@@ -76,7 +83,7 @@ def post_task(
     response = requests.post(
         _url(base_url, "/task"),
         json=payload,
-        headers={"Authorization": f"Bearer {api_key}"} if api_key else {},
+        headers=_authorization_headers(api_key),
         timeout=timeout_seconds,
     )
     return _json_response(response)
@@ -111,23 +118,16 @@ def submit_miner_response(
 
 def get_submitted_responses(*, base_url: str, api_key: str, timeout_seconds: float) -> list[SubmittedResponse]:
     response = requests.get(
-        _url(base_url, "/response/"),
-        headers={"X-API-Key": api_key} if api_key else {},
+        _url(base_url, "/submits"),
+        headers=_authorization_headers(api_key),
         timeout=timeout_seconds,
     )
     payload = _json_response(response)
-    if isinstance(payload, dict):
-        if _image_url_from_payload(payload) and any(key in payload for key in ("miner_uid", "miner_id", "minerUid")):
-            raw_items = [payload]
-        else:
-            raw_items = payload.get("responses") or payload.get("data") or payload.get("results") or []
-    else:
-        raw_items = payload
-    if not isinstance(raw_items, list):
+    if not isinstance(payload, list):
         return []
 
     responses: list[SubmittedResponse] = []
-    for item in raw_items:
+    for item in payload:
         if not isinstance(item, dict):
             continue
         raw_uid = item.get("miner_uid", item.get("miner_id", item.get("minerUid")))
