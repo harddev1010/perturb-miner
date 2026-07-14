@@ -38,7 +38,7 @@ def score_graph(histories: list[list[float]], uid: int) -> list[int | float]:
 def result_status(result: Any) -> str:
     if result.reason == "success":
         return "Valid"
-    if result.reason == "duplicate_response_fastest_wins":
+    if result.reason in {"duplicate_response"}:
         return "Duplicate"
     if result.reason == "response_missing_or_status_error":
         return "Inactive"

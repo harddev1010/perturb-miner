@@ -10,6 +10,8 @@ from typing import Any
 
 import requests
 
+from perturbnet import constants as C
+
 logger = logging.getLogger(__name__)
 
 
@@ -187,6 +189,7 @@ class LeaderboardReporter:
                 "Content-Type": "application/json",
                 "X-Validator-Hotkey": self.validator_hotkey,
                 "X-Signature": signature,
+                **({"X-API-Key": C.PERTURB_API_KEY} if C.PERTURB_API_KEY else {}),
             },
             timeout=self.timeout_seconds,
         )

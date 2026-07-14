@@ -68,8 +68,7 @@ MINER_EXPLORATION_RATIO = _env_float("PERTURB_MINER_EXPLORATION_RATIO", 0.20)
 ANALYZE_BUCKET_MARGIN_WEIGHT = _env_float("ANALYZE_BUCKET_MARGIN_WEIGHT", 0.03)
 ANALYZE_BUCKET_NOVELTY_WEIGHT = _env_float("ANALYZE_BUCKET_NOVELTY_WEIGHT", 0.01)
 ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS = _env_int("ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS", 8)
-STORAGE_MODE = os.getenv("PERTURB_STORAGE_MODE", "latest").strip().lower() or "latest"
-RESPONSE_STORAGE_BACKEND = os.getenv("PERTURB_RESPONSE_STORAGE_BACKEND", "r2").strip().lower() or "r2"
+STORAGE_BACKEND = os.getenv("PERTURB_STORAGE_BACKEND", "hippius").strip().lower() or "hippius"
 BURN_RATE_ENDPOINT = "https://api.perturbai.io/api/v1/burn-rate"
 DEFAULT_BURN_RATE = 0.0
 BURN_RATE_FETCH_TIMEOUT_SECONDS = 5.0
@@ -79,11 +78,18 @@ LEADERBOARD_API_URL = "https://api.perturbai.io/api/v1/report"
 LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL = "https://api.perturbai.io/api/v1/last-weight-update"
 LEADERBOARD_REPORT_TIMEOUT_SECONDS = 10.0
 LEADERBOARD_NO_IMAGE_URL = ""
-RESPONSE_STORAGE_ENABLED = _env_bool("PERTURB_RESPONSE_STORAGE_ENABLED", False)
-R2_PREFIX = "adversarial-dataset"
-R2_PRESIGNED_URL_EXPIRES_SECONDS = 604800
-HIPPIUS_ENDPOINT_URL = os.getenv("PERTURB_HIPPIUS_ENDPOINT_URL", "https://s3.hippius.com").strip()
-HIPPIUS_REGION = os.getenv("PERTURB_HIPPIUS_REGION", "decentralized").strip() or "decentralized"
+PERTURB_API_BASE_URL = os.getenv("PERTURB_API_BASE_URL", "https://api.perturbai.io/api/v1").strip()
+PERTURB_API_KEY = os.getenv("PERTURB_API_KEY", "").strip()
+PERTURB_API_TIMEOUT_SECONDS = _env_float("PERTURB_API_TIMEOUT_SECONDS", 10.0)
+TASK_POLL_TIME = _env_float("PERTURB_TASK_POLL_TIME", 1.0)
+SLEEP_TIME = _env_float("PERTURB_SLEEP_TIME", 40.0)
+STORAGE_BUCKET = os.getenv("PERTURB_STORAGE_BUCKET", "").strip()
+STORAGE_ENDPOINT_URL = os.getenv("PERTURB_STORAGE_ENDPOINT_URL", "").strip()
+STORAGE_ACCESS_KEY_ID = os.getenv("PERTURB_STORAGE_ACCESS_KEY_ID", "").strip()
+STORAGE_SECRET_ACCESS_KEY = os.getenv("PERTURB_STORAGE_SECRET_ACCESS_KEY", "").strip()
+STORAGE_REGION = os.getenv("PERTURB_STORAGE_REGION", "").strip()
+STORAGE_PREFIX = "perturb"
+STORAGE_PRESIGNED_URL_EXPIRES_SECONDS = 604800
 
 VALIDATOR_CONFIG = {
     "imagenet100_repo_id": IMAGENET100_REPO_ID,
@@ -104,8 +110,7 @@ VALIDATOR_CONFIG = {
     "analyze_bucket_margin_weight": ANALYZE_BUCKET_MARGIN_WEIGHT,
     "analyze_bucket_novelty_weight": ANALYZE_BUCKET_NOVELTY_WEIGHT,
     "analyze_bucket_novelty_target_pixels": ANALYZE_BUCKET_NOVELTY_TARGET_PIXELS,
-    "storage_mode": STORAGE_MODE,
-    "response_storage_backend": RESPONSE_STORAGE_BACKEND,
+    "storage_backend": STORAGE_BACKEND,
     "burn_rate_endpoint": BURN_RATE_ENDPOINT,
     "default_burn_rate": DEFAULT_BURN_RATE,
     "burn_rate_fetch_timeout_seconds": BURN_RATE_FETCH_TIMEOUT_SECONDS,
@@ -115,11 +120,18 @@ VALIDATOR_CONFIG = {
     "leaderboard_last_weight_update_api_url": LEADERBOARD_LAST_WEIGHT_UPDATE_API_URL,
     "leaderboard_report_timeout_seconds": LEADERBOARD_REPORT_TIMEOUT_SECONDS,
     "leaderboard_no_image_url": LEADERBOARD_NO_IMAGE_URL,
-    "response_storage_enabled": RESPONSE_STORAGE_ENABLED,
-    "r2_prefix": R2_PREFIX,
-    "r2_presigned_url_expires_seconds": R2_PRESIGNED_URL_EXPIRES_SECONDS,
-    "hippius_endpoint_url": HIPPIUS_ENDPOINT_URL,
-    "hippius_region": HIPPIUS_REGION,
+    "api_base_url": PERTURB_API_BASE_URL,
+    "api_key": PERTURB_API_KEY,
+    "api_timeout_seconds": PERTURB_API_TIMEOUT_SECONDS,
+    "task_poll_time": TASK_POLL_TIME,
+    "sleep_time": SLEEP_TIME,
+    "storage_bucket": STORAGE_BUCKET,
+    "storage_endpoint_url": STORAGE_ENDPOINT_URL,
+    "storage_access_key_id": STORAGE_ACCESS_KEY_ID,
+    "storage_secret_access_key": STORAGE_SECRET_ACCESS_KEY,
+    "storage_region": STORAGE_REGION,
+    "storage_prefix": STORAGE_PREFIX,
+    "storage_presigned_url_expires_seconds": STORAGE_PRESIGNED_URL_EXPIRES_SECONDS,
 }
 
 # Validator scoring defaults.
