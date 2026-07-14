@@ -26,21 +26,31 @@ import bittensor as bt
 import torch
 
 from perturbnet import constants as C
-from perturbnet.api_client import get_current_task, submit_miner_response
+from perturbnet.api_client import get_current_task, get_server_epoch, submit_miner_response
 from perturbnet.constants import MAX_LINF_DELTA
 from perturbnet.image_io import decode_image_b64, encode_image_b64, image_url_to_b64
 from perturbnet.model import load_efficientnet_v2_l, logits_for_images, predict_label, resolve_target_index
 from perturbnet.storage_uploader import ImageStorageUploader
-from perturbnet.task_timing import sleep_until_next_task_boundary
 
 from neurons.perturb import perturb
 from neurons.perturb.utils import cw_margin, estimate_validator_score, png_roundtrip, validator_score
 
 logger = pylogging.getLogger(__name__)
 
-# Total wall-clock budget the engine gets per task. The download/upload/submit round-trip must also
-# fit inside the ~20s task window, so the attack timeout is held below that. Override via env.
-_ATTACK_TIMEOUT_SECONDS = float(os.getenv("PERTURB_ATTACK_TIMEOUT_SECONDS", "15.0"))
+# Wall-clock budget for the perturb() attack loop itself. The validator accepts submissions from
+# ~40s to ~90s after each task boundary (see PERTURB_VALIDATOR_EVALUATION_DELAY_SECONDS /
+# PERTURB_VALIDATOR_EVALUATION_POLL_SECONDS in perturbnet/constants.py), and the download/upload/
+# submit round-trip normally costs only a few seconds, so most of that window can go to the attack.
+_ATTACK_TIMEOUT_SECONDS = float(os.getenv("PERTURB_ATTACK_TIMEOUT_SECONDS") or "35.0")
+
+
+def _task_created_epoch(task_id: str) -> float | None:
+    """Task ids look like '<unix_epoch>-hf-...'. Parse the leading epoch so we can measure how old a
+    task already is by the time we fetch/submit it (age = now - created). A large age means we are
+    discovering the task late (clock skew vs the server, or the server serving a stale task), which
+    closes the submission window before our pipeline even runs. Returns None if unparseable."""
+    head = str(task_id).split("-", 1)[0].strip()
+    return float(head) if head.isdigit() else None
 
 
 def _make_wallet(config):
@@ -136,6 +146,29 @@ class PerturbMiner:
             uploader_hotkey=hotkey,
         )
         self.last_processed_task_id = ""
+        # Correction for local clock skew: server_time ≈ time.time() + _server_offset, measured from
+        # the API's HTTP Date header. Lets us log the TRUE age of a task even when the host clock is wrong.
+        self._server_offset = 0.0
+        self._server_offset_ts = 0.0
+
+    def _maybe_refresh_server_offset(self) -> None:
+        """Refresh the local→server clock offset at most once a minute (cheap; skew drifts slowly).
+        Call only while idle-polling, never mid-attack, so it never adds latency to the pipeline."""
+        now = time.time()
+        if now - self._server_offset_ts < 60.0:
+            return
+        self._server_offset_ts = now
+        epoch = get_server_epoch(
+            base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+        )
+        if epoch is not None:
+            self._server_offset = epoch - now
+            logger.info(f"[clock] local→server offset={self._server_offset:+.1f}s (host clock is that far ahead if negative)")
+
+    def _server_now(self) -> float:
+        """Best estimate of the server's wall clock, correcting for measured local skew."""
+        return time.time() + self._server_offset
 
     def _init_subtensor_with_retry(self):
         max_attempts = int(os.getenv("SUBTENSOR_CONNECT_RETRIES", "5"))
@@ -254,78 +287,94 @@ class PerturbMiner:
         return False
 
     def _process_task(self, *, task_id: str, image_url: str) -> None:
-        # Processing, upload, and API submission should complete within 20 seconds.
+        # The whole chain (download -> attack -> upload -> submit) must land inside the task's open
+        # submission window, otherwise the API rejects the submit with HTTP 403. Time each phase so
+        # the bottleneck is visible; the breakdown is logged even when the submit fails (see finally).
         started_at = time.time()
-        clean_image_b64 = image_url_to_b64(
-            image_url,
-            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
-        )
+        api_timeout = float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS))
+
+        t0 = time.time()
+        clean_image_b64 = image_url_to_b64(image_url, timeout_seconds=api_timeout)
+        download_seconds = time.time() - t0
+
+        t0 = time.time()
         perturbed_image_b64, _ = self._attack_image(task_id=task_id, clean_image_b64=clean_image_b64)
-        response_url = self._upload_response(
-            task_id=task_id,
-            perturbed_image_b64=perturbed_image_b64,
-        )
-        submit_response = submit_miner_response(
-            base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-            wallet=self.wallet,
-            image_url=response_url,
-            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
-        )
+        attack_seconds = time.time() - t0
+
+        t0 = time.time()
+        response_url = self._upload_response(task_id=task_id, perturbed_image_b64=perturbed_image_b64)
+        upload_seconds = time.time() - t0
+
+        submit_seconds = 0.0
+        t0 = time.time()
+        try:
+            submit_response = submit_miner_response(
+                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                wallet=self.wallet,
+                image_url=response_url,
+                timeout_seconds=api_timeout,
+            )
+        finally:
+            submit_seconds = time.time() - t0
+            total_seconds = time.time() - started_at
+            created = _task_created_epoch(task_id)
+            age_str = f" true_age_at_submit={self._server_now() - created:.1f}s" if created is not None else ""
+            logger.info(
+                f"Timing task={task_id} download={download_seconds:.2f}s attack={attack_seconds:.2f}s "
+                f"upload={upload_seconds:.2f}s submit={submit_seconds:.2f}s "
+                f"total_got_task_to_submit={total_seconds:.2f}s{age_str}"
+            )
         if not self._submission_succeeded(submit_response):
             raise RuntimeError(f"Response submission failed task={task_id} api_response={submit_response}")
-        elapsed = time.time() - started_at
-        logger.info(f"Submitted task={task_id} response_url={response_url} elapsed_seconds={elapsed:.2f}")
+        logger.info(
+            f"Submitted task={task_id} response_url={response_url} "
+            f"total_got_task_to_submit={total_seconds:.2f}s"
+        )
 
-    def _wait_for_next_task_boundary(self) -> None:
-        cadence = int(getattr(self.config.perturb, "task_cadence_seconds", C.TASK_CADENCE_SECONDS))
-        slept = sleep_until_next_task_boundary(cadence_seconds=cadence)
-        logger.info(f"Reached task boundary after waiting {slept:.2f}s")
-
-    def _fetch_new_task_at_boundary(self):
-        retries = int(getattr(self.config.perturb, "task_fetch_retries", C.TASK_FETCH_RETRIES))
-        retry_seconds = float(getattr(self.config.perturb, "task_fetch_retry_seconds", C.TASK_FETCH_RETRY_SECONDS))
-        for attempt in range(1, retries + 1):
-            task = get_current_task(
-                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
-            )
-            if task is not None and task.task_id != self.last_processed_task_id:
-                return task
-            logger.info(f"No new task at boundary attempt={attempt}/{retries}")
-            if attempt < retries:
-                time.sleep(retry_seconds)
-        return None
+    def _get_current_task(self):
+        return get_current_task(
+            base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+            timeout_seconds=float(getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)),
+        )
 
     def run(self) -> None:
+        # Task discovery is by CONTINUOUS POLLING, not local-clock boundaries. Boundary sync assumes
+        # the miner's wall clock matches the server's; on a skewed host clock (common in containers we
+        # can't set the time on) that makes us fetch tasks long after their submission window closed.
+        # Polling for a changed task_id reacts to the server's real task-creation moment within
+        # ~poll_seconds regardless of clock skew, so submissions land inside the open window.
         self.sync()
         self._miner_uid()
+        poll_seconds = float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME))
         try:
-            current_task = get_current_task(
-                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                timeout_seconds=float(
-                    getattr(self.config.perturb, "api_timeout_seconds", C.PERTURB_API_TIMEOUT_SECONDS)
-                ),
-            )
+            current_task = self._get_current_task()
         except Exception as exc:
             logger.warning(f"Initial task fetch failed: {exc}")
             current_task = None
+        # Skip whatever is already current at startup; only act on the NEXT task the server publishes.
         self.last_processed_task_id = current_task.task_id if current_task is not None else ""
-        logger.info(f"Miner started. baseline_task_id={self.last_processed_task_id or '(none)'}")
+        logger.info(
+            f"Miner started (poll mode, every {poll_seconds:.1f}s). "
+            f"baseline_task_id={self.last_processed_task_id or '(none)'}"
+        )
         while True:
             try:
-                self._wait_for_next_task_boundary()
-                task = self._fetch_new_task_at_boundary()
-                if task is None:
+                task = self._get_current_task()
+                if task is None or task.task_id == self.last_processed_task_id:
+                    self._maybe_refresh_server_offset()
+                    time.sleep(poll_seconds)
                     continue
 
-                logger.info(f"New task found task_id={task.task_id} image_url={task.image_url}")
+                created = _task_created_epoch(task.task_id)
+                age_str = f" true_age_at_fetch={self._server_now() - created:.1f}s" if created is not None else ""
+                logger.info(f"New task found task_id={task.task_id}{age_str} image_url={task.image_url}")
                 try:
                     self._process_task(task_id=task.task_id, image_url=task.image_url)
                 finally:
                     self.last_processed_task_id = task.task_id
             except Exception as exc:
                 logger.warning(f"Miner task loop failed: {exc}")
-                time.sleep(float(getattr(self.config.perturb, "task_poll_time", C.TASK_POLL_TIME)))
+                time.sleep(poll_seconds)
 
 
 def build_config() -> typing.Any:

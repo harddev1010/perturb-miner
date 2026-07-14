@@ -223,7 +223,7 @@ ITERATIONS_PER_K = _env_int("PERTURB_FW_ITERATIONS_PER_K", 60)
 # (it closes on max-iters / convergence). The instant the first flip appears, a budget of
 # OPTIM_SECONDS is armed; all optimization after the flip (further refinement + Phase E
 # sparsification) must finish within that window.
-OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 20.0)
+OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 40.0)
 
 # --- Post-flip objective (maximize the full score, use the whole budget) -------------------------
 # The validator scores total = perturbation(L∞,RMSE) + 0.03·clip(-margin/10,0,1) + 0.01·clip(px/8,0,1).

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import email.utils
 import json
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -67,6 +68,20 @@ def get_current_task(*, base_url: str, timeout_seconds: float) -> CurrentTask | 
     if not task_id or not image_url:
         return None
     return CurrentTask(task_id=task_id, image_url=image_url)
+
+
+def get_server_epoch(*, base_url: str, timeout_seconds: float) -> float | None:
+    """Server wall-clock (epoch seconds) parsed from the HTTP Date header of /task. Lets a miner on a
+    skewed host clock compute the TRUE age of a task independent of its own (possibly wrong) clock.
+    Returns None if the request fails or no usable Date header is present."""
+    try:
+        response = requests.get(_url(base_url, "/task"), timeout=timeout_seconds)
+        date_hdr = response.headers.get("Date")
+        if not date_hdr:
+            return None
+        return email.utils.parsedate_to_datetime(date_hdr).timestamp()
+    except Exception:
+        return None
 
 
 def post_task(
