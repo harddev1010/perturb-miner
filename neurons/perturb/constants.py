@@ -247,6 +247,10 @@ OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 40.0)
 #   both: run coupled, THEN a grow pass seeded from coupled's result (approached from below), folded into
 #     the SAME score-ranked Bank. Strictly non-regressing vs coupled (can only raise the returned score),
 #     at the cost of the extra grow budget. Recommended A/B target vs coupled.
+#   ufs: UNIFIED FRONTIER SCHEDULER — an anytime replacement for the whole post-flip waterfall. One loop
+#     over a K-indexed frontier + online margin surrogate; each step runs the highest-expected-gain move
+#     (DEEPEN / SHRINK / GROW) against a single shared budget, so budget is never sliced (no starvation)
+#     nor left unused (it schedules until the deadline, diversifying on convergence). See the UFS_* block.
 POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "coupled").strip().lower() or "coupled"
 ANALYTIC_PROBE_FRACS = _env_floats("PERTURB_ANALYTIC_PROBE_FRACS", (0.5, 0.25))  # K/K_anchor probes that fit margin(K)
 MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
@@ -311,6 +315,26 @@ GROW_ADD_FRAC = _env_float("PERTURB_GROW_ADD_FRAC", 0.35)     # per-step block a
 GROW_MIN_BATCH = _env_int("PERTURB_GROW_MIN_BATCH", 32)       # floor on the per-step block add
 GROW_PATIENCE = _env_int("PERTURB_GROW_PATIENCE", 3)          # non-improving adds tolerated before stopping
 GROW_MAX_STEPS = _env_int("PERTURB_GROW_MAX_STEPS", 24)       # safety cap on grow steps per lineage
+
+# --- Unified Frontier Scheduler (PERTURB_POSTFLIP_STRATEGY=ufs) -----------------------------------
+# ANYTIME post-flip: instead of a fixed waterfall (anchor -> K_sat bisection -> refine sweep), keep a
+# small beam ("frontier") of warm-start States at different K, fit an online margin surrogate m̂(K) from
+# every (K,margin) seen, and each iteration execute the single move with the highest expected score gain:
+#   DEEPEN(node)     — push a node's margin toward CEIL at its own K (raises the 0.03 bonus).
+#   SHRINK(node,K')  — warm-start a node down to a surrogate-chosen sparser K' (lower RMSE).
+#   GROW(node)       — climb a sparse node up to saturation (Part-2 sparse-then-grow; reaches K̂* from below).
+# The surrogate's argmax K̂* = argmax_K [pert(K) + margin_bonus(m̂(K))] steers both SHRINK and GROW toward
+# the score peak; a move is skipped when its analytic ceiling can't beat the Bank. Budget is one shared
+# pool (no per-phase slices => no starvation, no unused tail). On convergence (no move beats the Bank by
+# SCORE_TOL) with budget left, a bounded PartialRestart diversifies to escape local optima. INVARIANT:
+# the densest node is never evicted, so a saturatable anchor always survives (the 0.03 bonus stays
+# reachable — prevents the sparse-drift regression). Every candidate folds through the score-ranked Bank.
+UFS_FRONTIER_CAP = _env_int("PERTURB_UFS_FRONTIER_CAP", 6)    # live warm-start nodes kept in the frontier
+UFS_CHUNK_ITERS = _env_int("PERTURB_UFS_CHUNK_ITERS", 30)     # optimizer iters per DEEPEN/SHRINK burst
+UFS_GRID = _env_int("PERTURB_UFS_GRID", 48)                   # geometric-K grid resolution for the surrogate argmax
+UFS_DEEPEN_MIN_GAIN = _env_float("PERTURB_UFS_DEEPEN_MIN_GAIN", 0.2)  # min |margin| drop for a DEEPEN to count as progress
+UFS_RESTARTS = _env_int("PERTURB_UFS_RESTARTS", 3)           # PartialRestart diversifications allowed on convergence
+UFS_MAX_ACTIONS = _env_int("PERTURB_UFS_MAX_ACTIONS", 400)   # hard safety cap on scheduled actions per call
 
 # --- C2: diminishing-returns early stop for STANDALONE margin-deepen calls (OptimizeFixedK) --------
 # Complements the QuickAnchor (which already stall-stops the anchor). This covers the OTHER deepen calls

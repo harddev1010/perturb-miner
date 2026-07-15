@@ -1724,6 +1724,175 @@ def PostFlipAnalytic(ctx: Context, flip_state: State, K_start: int, K_min: int) 
 
 
 # ==========================================================================================
+# Unified Frontier Scheduler (PERTURB_POSTFLIP_STRATEGY=ufs) — anytime, priority-driven post-flip.
+# Replaces the coupled/grow/analytic waterfalls with ONE loop: a K-indexed frontier of warm-start
+# States, an online margin surrogate m̂(K), and per-iteration selection of the single highest-expected-
+# score-gain move (DEEPEN / SHRINK / GROW). One shared budget => no phase starvation, no unused tail.
+# ==========================================================================================
+class _UfsNode:
+    """A live warm-start parent in the frontier: a State plus its cached (K, margin, score) and a
+    DEEPEN-exhausted flag. `nid` gives each node a stable identity so scheduled SHRINK/GROW moves are
+    de-duplicated per (node, target)."""
+    __slots__ = ("state", "K", "margin", "score", "deepen_exhausted", "nid")
+
+    def __init__(self, ctx: Context, state: State, nid: int) -> None:
+        self.state = state
+        self.K = _k_of(state)
+        self.margin = float(state.margin)
+        self.score = _state_score(ctx, state)
+        self.deepen_exhausted = False
+        self.nid = nid
+
+
+def _ufs_geom_grid(lo: int, hi: int, n: int) -> list[int]:
+    """A geometric K grid on [lo, hi] for the surrogate argmax (cheap, no model evals)."""
+    lo = max(1, int(lo)); hi = max(lo, int(hi))
+    if hi == lo:
+        return [lo]
+    return sorted({min(hi, max(lo, int(round(lo * (hi / lo) ** (i / max(1, n - 1)))))) for i in range(max(2, n))})
+
+
+def _ufs_search(ctx: Context, seed_state: State) -> None:
+    """Anytime post-flip scheduler. Seeded from the dense FIND flip (a saturatable anchor) plus any
+    banked flips, it fits m̂(K) online and, until the deadline, keeps executing the single move whose
+    expected score gain is largest — DEEPEN a node toward CEIL, SHRINK a node to a surrogate-chosen
+    sparser K, or GROW a sparse node up to saturation. Every candidate folds through the score-ranked
+    Bank; the densest node is never evicted so a saturatable anchor always survives."""
+    target = -K.MARGIN_DEEPEN_TARGET
+    N = max(1, ctx.clean_u8.numel())
+    K_floor = _novelty_floor_k(_k_of(seed_state), max(1, int(round(K.K_MIN_FRAC * N))))
+    cap = max(1, int(K.UFS_FRONTIER_CAP))
+    chunk = max(1, int(K.UFS_CHUNK_ITERS))
+
+    samples: dict[int, float] = {}                       # K -> best (most negative) margin observed
+    def observe(st: State) -> None:
+        # Record EVERY probe, including non-flips (margin >= 0): the surrogate must learn that a too-small
+        # K does not flip (score_at -> 0), else it keeps re-proposing the same worthless sparse shrink.
+        k = _k_of(st)
+        if k not in samples or st.margin < samples[k]:
+            samples[k] = float(st.margin)
+
+    def score_at(K_: int, m_: float) -> float:
+        if m_ >= 0.0:
+            return 0.0
+        rmse = ctx.q * math.sqrt(max(0, int(K_)) / N)
+        return validator_score(ctx.q, rmse, m_, 10 ** 9, ctx.cap)   # novelty saturated (K >> target px)
+
+    def pred(K_: int) -> float:
+        if not samples:
+            return 0.0
+        return score_at(K_, _interp_margin(K_, sorted(samples.items())))
+
+    nid = [0]
+    def make_node(st: State) -> _UfsNode:
+        nid[0] += 1
+        return _UfsNode(ctx, st, nid[0])
+
+    def add_node(nodes: list, node: _UfsNode) -> None:
+        nodes.append(node)
+        if len(nodes) <= cap:
+            return
+        protect = max(range(len(nodes)), key=lambda i: nodes[i].K)         # invariant: keep the densest
+        victim = min((i for i in range(len(nodes)) if i != protect), key=lambda i: nodes[i].score)
+        nodes.pop(victim)
+
+    nodes: list[_UfsNode] = [make_node(seed_state)]
+    observe(seed_state)
+    seed_ks = {nodes[0].K}
+    for b in (ctx.bank.best_safe, ctx.bank.best_flip):                     # fold Phase-A / FIND flips as seeds
+        if b is not None and b.get("delta") is not None and int(b["nz"]) not in seed_ks:
+            st = _state_from_delta(ctx, seed_state, b)
+            add_node(nodes, make_node(st)); observe(st); seed_ks.add(int(b["nz"]))
+
+    logger.info(f"[postflip:ufs] start: seeds={len(nodes)} K_floor={K_floor} chunk={chunk}")
+    t0 = time.time()
+    seen: set = set()
+    restarts = acted = 0
+    while not _oob(ctx) and acted < int(K.UFS_MAX_ACTIONS):
+        K_hi = max(samples) if samples else nodes[0].K
+        grid = _ufs_geom_grid(K_floor, K_hi, int(K.UFS_GRID))
+        K_star = max(grid, key=pred)
+        bank = _bank_best_score(ctx)
+
+        # --- propose: pick the single highest-gain move across the frontier (gain must clear SCORE_TOL) ---
+        best = None
+        best_gain = float(K.SCORE_TOL)
+        for node in nodes:
+            # DEEPEN only an EXISTING flip (raises its margin bonus); a non-flip is grown, not deepened.
+            if node.margin < 0.0 and node.margin > target and not node.deepen_exhausted:
+                g = score_at(node.K, target) - node.score
+                if g > best_gain:
+                    best, best_gain = ("D", node, node.K), g
+            for Kp in _ufs_shrink_targets(node.K, K_star, K_floor):                 # SHRINK
+                if ("S", node.nid, Kp) in seen:
+                    continue
+                g = pred(Kp) - bank
+                if g > best_gain:
+                    best, best_gain = ("S", node, Kp), g
+            if node.K < K_star and node.margin > target and ("G", node.nid) not in seen:  # GROW
+                g = pred(K_star) - bank
+                if g > best_gain:
+                    best, best_gain = ("G", node, K_star), g
+
+        if best is None:
+            # Converged: no move beats the Bank. If budget remains, diversify by re-approaching the peak
+            # from BELOW — grow a lean core of the best flip (a different coordinate set at ~K_sat, the
+            # Part-2 sparse-then-grow move). Cheaper and more on-target than a dense random restart; the
+            # varied core fraction keeps successive diversifications from being identical.
+            flippers = [nd for nd in nodes if nd.margin < 0.0]
+            if restarts < int(K.UFS_RESTARTS) and not _oob(ctx) and flippers:
+                restarts += 1
+                src = max(flippers, key=lambda nd: nd.score)
+                frac = K.GROW_CORE_FRAC * (0.6, 1.0, 1.6)[min(restarts - 1, 2)]
+                K_core = max(K_floor, min(src.K, int(round(frac * src.K))))
+                grown = _grow_to_saturation(ctx, WarmStartSmallerK(ctx, src.state, K_core), target)
+                observe(grown); add_node(nodes, make_node(grown))
+                logger.debug(f"[ufs] converged -> grow-diversify #{restarts} core K={K_core} <- K={src.K}")
+                continue
+            break
+
+        kind, node, Kp = best
+        acted += 1
+        if kind == "D":
+            new, _ = OptimizeFixedK(ctx, node.state, node.K, chunk, deepen_target=target)
+            observe(new)
+            nodes.remove(node)
+            nn = make_node(new)
+            if new.margin > node.margin - K.UFS_DEEPEN_MIN_GAIN:      # no real deepening -> stop retrying it
+                nn.deepen_exhausted = True
+            add_node(nodes, nn)
+            logger.debug(f"[ufs] DEEPEN K={node.K} margin {node.margin:.3f}->{new.margin:.3f}")
+        elif kind == "S":
+            seen.add(("S", node.nid, Kp))
+            new = _probe_k(ctx, node.state, Kp, chunk, target)
+            observe(new); add_node(nodes, make_node(new))
+            logger.debug(f"[ufs] SHRINK K={node.K}->{Kp} margin={new.margin:.3f} score={_state_score(ctx, new):.4f}")
+        else:  # GROW
+            seen.add(("G", node.nid))
+            new = _grow_to_saturation(ctx, node.state, target)
+            observe(new); add_node(nodes, make_node(new))
+            logger.debug(f"[ufs] GROW K={node.K}->{_k_of(new)} margin={new.margin:.3f} score={_state_score(ctx, new):.4f}")
+
+    b = ctx.bank.best_safe
+    logger.info(f"[postflip:ufs] done: actions={acted} restarts={restarts} nodes={len(nodes)} "
+                f"K*={K_star if samples else '-'} spent={time.time() - t0:.3f}s "
+                + (f"best=({b['nz']}ch pixels={b['pixels']} margin={b['margin']:.4f} score={b['score']:.4f})"
+                   if b is not None else "no safe flip banked"))
+
+
+def _ufs_shrink_targets(K_node: int, K_star: int, K_floor: int) -> list[int]:
+    """Sparser K targets to propose for a node: the surrogate optimum K̂* (when below the node) and the
+    midpoint toward it. Only strictly-smaller, above-floor targets — SHRINK never grows a node."""
+    out = []
+    if K_floor <= K_star < K_node:
+        out.append(int(K_star))
+    mid = (K_node + max(K_floor, min(K_star, K_node))) // 2
+    if K_floor <= mid < K_node:
+        out.append(int(mid))
+    return sorted(set(out))
+
+
+# ==========================================================================================
 # Orchestrator — DynamicSparseFixedQAttack.
 # ==========================================================================================
 def search(ctx: Context) -> None:
@@ -1760,6 +1929,8 @@ def search(ctx: Context) -> None:
                     PostFlipStrict(ctx, successful_state, K_init, K_min)
                 elif K.POSTFLIP_STRATEGY == "analytic":
                     PostFlipAnalytic(ctx, successful_state, K_init, K_min)
+                elif K.POSTFLIP_STRATEGY == "ufs":
+                    _ufs_search(ctx, successful_state)
                 elif K.POSTFLIP_STRATEGY == "grow":
                     PostFlipGrow(ctx, successful_state, K_init, K_min)
                 elif K.POSTFLIP_STRATEGY == "both":
