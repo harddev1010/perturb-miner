@@ -1752,6 +1752,36 @@ def _ufs_geom_grid(lo: int, hi: int, n: int) -> list[int]:
     return sorted({min(hi, max(lo, int(round(lo * (hi / lo) ** (i / max(1, n - 1)))))) for i in range(max(2, n))})
 
 
+def _isotonic_nonincreasing(pts: list[tuple[int, float]]) -> list[tuple[int, float]]:
+    """Pool-Adjacent-Violators fit of margin(K) constrained NON-INCREASING in K (a larger support can
+    always match or beat a smaller one's margin, so the achievable margin only deepens with K). Pools
+    adjacent points that violate monotonicity into their mean, smoothing optimizer-noise wiggles that
+    would otherwise make the piecewise-linear surrogate pick a wrong K̂*. `pts` is sorted ascending by K."""
+    blocks: list[list] = []                          # each: [sum_m, count, [ks...]]
+    for k, m in pts:
+        blocks.append([m, 1, [k]])
+        while len(blocks) >= 2 and blocks[-2][0] / blocks[-2][1] < blocks[-1][0] / blocks[-1][1]:
+            s2, c2, k2 = blocks.pop(); s1, c1, k1 = blocks.pop()   # earlier mean < later => violation
+            blocks.append([s1 + s2, c1 + c2, k1 + k2])
+    out: list[tuple[int, float]] = []
+    for s, c, ks in blocks:
+        v = s / c
+        out.extend((k, v) for k in ks)
+    return out
+
+
+def _ufs_margin_hat(K_new: int, samples: dict, m0: float) -> float:
+    """Surrogate margin at K_new: anchor the fit at the KNOWN clean point (K=0, m0) — margin at zero
+    changed coords IS the clean margin — then isotonic-monotonize the observed (K, margin) probes and
+    interpolate. The (0, m0) anchor removes the dangerous below-range extrapolation of the raw piecewise-
+    linear interp (which mispredicted a flip at tiny K); between (0, m0>0) and the sparsest flip it now
+    interpolates the real flip boundary for free."""
+    pts = sorted(samples.items())
+    if not pts or pts[0][0] > 0:
+        pts = [(0, float(m0))] + pts
+    return _interp_margin(K_new, _isotonic_nonincreasing(pts))
+
+
 def _ufs_search(ctx: Context, seed_state: State) -> None:
     """Anytime post-flip scheduler. Seeded from the dense FIND flip (a saturatable anchor) plus any
     banked flips, it fits m̂(K) online and, until the deadline, keeps executing the single move whose
@@ -1779,9 +1809,7 @@ def _ufs_search(ctx: Context, seed_state: State) -> None:
         return validator_score(ctx.q, rmse, m_, 10 ** 9, ctx.cap)   # novelty saturated (K >> target px)
 
     def pred(K_: int) -> float:
-        if not samples:
-            return 0.0
-        return score_at(K_, _interp_margin(K_, sorted(samples.items())))
+        return score_at(K_, _ufs_margin_hat(K_, samples, ctx.m0))
 
     nid = [0]
     def make_node(st: State) -> _UfsNode:
@@ -1807,6 +1835,11 @@ def _ufs_search(ctx: Context, seed_state: State) -> None:
     logger.info(f"[postflip:ufs] start: seeds={len(nodes)} K_floor={K_floor} chunk={chunk}")
     t0 = time.time()
     seen: set = set()
+    # Per-kind wall-cost EMA for time-weighted VOI: rank moves by expected score gain PER SECOND, not raw
+    # gain — else a full-climb GROW (many steps) is unfairly ranked against a one-chunk DEEPEN. Primed at
+    # a common chunk-cost so the first move of each kind is compared on raw gain, then costs self-calibrate.
+    prior_cost = max(1e-6, chunk * ctx.t_step)
+    cost = {"D": prior_cost, "S": prior_cost, "G": prior_cost}
     restarts = acted = 0
     while not _oob(ctx) and acted < int(K.UFS_MAX_ACTIONS):
         K_hi = max(samples) if samples else nodes[0].K
@@ -1814,25 +1847,25 @@ def _ufs_search(ctx: Context, seed_state: State) -> None:
         K_star = max(grid, key=pred)
         bank = _bank_best_score(ctx)
 
-        # --- propose: pick the single highest-gain move across the frontier (gain must clear SCORE_TOL) ---
+        # --- propose: pick the move with the highest gain-PER-SECOND (raw gain must still clear SCORE_TOL) ---
         best = None
-        best_gain = float(K.SCORE_TOL)
+        best_prio = 0.0
         for node in nodes:
             # DEEPEN only an EXISTING flip (raises its margin bonus); a non-flip is grown, not deepened.
             if node.margin < 0.0 and node.margin > target and not node.deepen_exhausted:
                 g = score_at(node.K, target) - node.score
-                if g > best_gain:
-                    best, best_gain = ("D", node, node.K), g
+                if g > K.SCORE_TOL and g / cost["D"] > best_prio:
+                    best, best_prio = ("D", node, node.K), g / cost["D"]
             for Kp in _ufs_shrink_targets(node.K, K_star, K_floor):                 # SHRINK
                 if ("S", node.nid, Kp) in seen:
                     continue
                 g = pred(Kp) - bank
-                if g > best_gain:
-                    best, best_gain = ("S", node, Kp), g
+                if g > K.SCORE_TOL and g / cost["S"] > best_prio:
+                    best, best_prio = ("S", node, Kp), g / cost["S"]
             if node.K < K_star and node.margin > target and ("G", node.nid) not in seen:  # GROW
                 g = pred(K_star) - bank
-                if g > best_gain:
-                    best, best_gain = ("G", node, K_star), g
+                if g > K.SCORE_TOL and g / cost["G"] > best_prio:
+                    best, best_prio = ("G", node, K_star), g / cost["G"]
 
         if best is None:
             # Converged: no move beats the Bank. If budget remains, diversify by re-approaching the peak
@@ -1853,6 +1886,7 @@ def _ufs_search(ctx: Context, seed_state: State) -> None:
 
         kind, node, Kp = best
         acted += 1
+        t_act = time.time()
         if kind == "D":
             new, _ = OptimizeFixedK(ctx, node.state, node.K, chunk, deepen_target=target)
             observe(new)
@@ -1872,6 +1906,7 @@ def _ufs_search(ctx: Context, seed_state: State) -> None:
             new = _grow_to_saturation(ctx, node.state, target)
             observe(new); add_node(nodes, make_node(new))
             logger.debug(f"[ufs] GROW K={node.K}->{_k_of(new)} margin={new.margin:.3f} score={_state_score(ctx, new):.4f}")
+        cost[kind] = 0.5 * cost[kind] + 0.5 * max(1e-6, time.time() - t_act)   # calibrate the VOI cost model
 
     b = ctx.bank.best_safe
     logger.info(f"[postflip:ufs] done: actions={acted} restarts={restarts} nodes={len(nodes)} "
