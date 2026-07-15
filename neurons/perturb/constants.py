@@ -230,7 +230,7 @@ OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 40.0)
 # perturbation(K) is ANALYTIC (RMSE=q·√(K/N)) and RISES as K falls; the margin bonus saturates at CW
 # margin <= -CEIL. So among K that still saturate the margin, score = perturbation(K)+0.04 is maximized
 # at the SMALLEST such K (=K_sat). env PERTURB_POSTFLIP_STRATEGY:
-#   coupled (default): BINARY-SEARCH K_sat — ~log probes (warm-start + deepen at K), each score-ranked
+#   coupled: BINARY-SEARCH K_sat — ~log probes (warm-start + deepen at K), each score-ranked
 #     into the Bank, which also holds Phase A's low-K bare flips. Lands at the peak within budget and
 #     dynamically balances margin vs RMSE per image (hard images where deep margin costs too much RMSE
 #     keep the bare flip). Much cheaper than a geometric descent that re-deepens every 10% step.
@@ -247,11 +247,12 @@ OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 40.0)
 #   both: run coupled, THEN a grow pass seeded from coupled's result (approached from below), folded into
 #     the SAME score-ranked Bank. Strictly non-regressing vs coupled (can only raise the returned score),
 #     at the cost of the extra grow budget. Recommended A/B target vs coupled.
-#   ufs: UNIFIED FRONTIER SCHEDULER — an anytime replacement for the whole post-flip waterfall. One loop
-#     over a K-indexed frontier + online margin surrogate; each step runs the highest-expected-gain move
-#     (DEEPEN / SHRINK / GROW) against a single shared budget, so budget is never sliced (no starvation)
-#     nor left unused (it schedules until the deadline, diversifying on convergence). See the UFS_* block.
-POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "coupled").strip().lower() or "coupled"
+#   ufs (default): UNIFIED FRONTIER SCHEDULER — an anytime replacement for the whole post-flip waterfall.
+#     One loop over a K-indexed frontier + online margin surrogate; each step runs the highest-expected-
+#     gain move (DEEPEN / SHRINK / GROW) against a single shared budget, so budget is never sliced (no
+#     starvation) nor left unused (it schedules until the deadline, diversifying on convergence). See the
+#     UFS_* block. Promoted to default after winning the hardware A/B vs coupled.
+POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "ufs").strip().lower() or "ufs"
 ANALYTIC_PROBE_FRACS = _env_floats("PERTURB_ANALYTIC_PROBE_FRACS", (0.5, 0.25))  # K/K_anchor probes that fit margin(K)
 MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
 KSAT_REL_TOL = _env_float("PERTURB_KSAT_REL_TOL", 0.05)   # coupled: stop binary search when (hi-lo) <= max(KSAT_ABS_TOL, this·hi)
