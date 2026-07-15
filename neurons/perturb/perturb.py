@@ -1532,6 +1532,112 @@ def PostFlipCoupled(ctx: Context, flip_state: State, K_start: int, K_min: int) -
         logger.info("[postflip] result: no safe flip banked")
 
 
+# ==========================================================================================
+# Sparse-then-grow post-flip (PERTURB_POSTFLIP_STRATEGY=grow|both). Reach the score peak from BELOW:
+# a lean guided core grown in margin-gain order until the margin saturates. A structural complement to
+# coupled's dense->shrink — a different route to ~K_sat that can land a better coordinate SET.
+# ==========================================================================================
+def _grow_to_saturation(ctx: Context, core: State, target: float) -> State:
+    """Grow a sparse `core` UP toward the score peak. Each step re-linearizes the gradient at the current
+    grown image, adds a block of the steepest feasible margin-gain INACTIVE coords (block = max(
+    GROW_MIN_BATCH, GROW_ADD_FRAC·K_cur)), and folds the new cumulative state through the score-ranked
+    Bank. Climbs while it makes progress; stops at saturation (margin <= target => extra coords only
+    raise RMSE) or after GROW_PATIENCE non-improving adds. Progress is a NEW Bank best once flipped, or a
+    NEW margin low while still pre-flip (so the pre-flip prefix isn't mistaken for a stall). Returns the
+    final grown state (the Bank holds the actual best across the whole trajectory)."""
+    state = copy.deepcopy(core)
+    baseline = _bank_best_score(ctx)      # score to beat once flipped
+    prev_margin = state.margin
+    misses = steps = grew = 0
+    while not _oob(ctx) and steps < max(1, int(K.GROW_MAX_STEPS)):
+        steps += 1
+        if state.margin <= target:        # saturated: the score peak is at/below here -> stop growing
+            break
+        inactive = ~state.mask
+        n_inactive = int(inactive.sum().item())
+        if n_inactive <= 0:
+            break
+        _m, g = _grad_at(ctx, state.x_adv)
+        in_sign = _best_direction(ctx, g)
+        in_gain = (-g * ctx.q * in_sign).clamp(min=0.0)
+        in_gain[state.mask] = float("-inf")                        # inactive coords only
+        add = min(n_inactive, max(int(K.GROW_MIN_BATCH), int(round(K.GROW_ADD_FRAC * _k_of(state)))))
+        cand = torch.topk(in_gain, add).indices
+        cand = cand[in_gain[cand] > 0]                             # only coords with a real feasible gain
+        if cand.numel() == 0:
+            break
+        state.mask = state.mask.clone(); state.mask[cand] = True
+        state.sign = state.sign.clone(); state.sign[cand] = in_sign[cand]
+        state.gradient = g
+        state.margin, state.x_adv, _ = _evaluate_state(ctx, state.mask, state.sign)   # folds to Bank
+        grew += 1
+        if state.margin < 0.0:
+            cur = _bank_best_score(ctx)
+            improved = cur > baseline + 1e-9
+            baseline = max(baseline, cur)
+        else:
+            improved = state.margin < prev_margin - 1e-6           # pre-flip: closing on the boundary
+        prev_margin = state.margin
+        misses = 0 if improved else misses + 1
+        if misses >= max(1, int(K.GROW_PATIENCE)):
+            break
+    logger.debug(f"[grow] climb: steps={grew} K={_k_of(state)} margin={state.margin:.4f} "
+                 f"score={_state_score(ctx, state):.4f}")
+    return state
+
+
+def _grow_lineages(ctx: Context, anchor: State, K_start: int, K_min: int) -> None:
+    """Reduce `anchor` to a lean guided core (top-retention GROW_CORE_FRAC·K coords, ranked at the
+    anchor's own — ideally saturated — margin) and grow it to the peak; then a second lineage from the
+    sparsest banked flip when it is distinct. Both fold through the shared Bank, so this only adds
+    coverage — it can never lower the returned score."""
+    target = -K.MARGIN_DEEPEN_TARGET
+    K_anchor = _k_of(anchor)
+    K_floor = _novelty_floor_k(K_start, K_min)
+    K_core = max(K_floor, min(K_anchor, int(round(K.GROW_CORE_FRAC * K_anchor))))
+    logger.info(f"[postflip:grow] lineage-1: core K={K_core} <- anchor K={K_anchor} margin={anchor.margin:.4f}")
+    _grow_to_saturation(ctx, WarmStartSmallerK(ctx, anchor, K_core), target)
+
+    b = ctx.bank.best_safe
+    if not _oob(ctx) and b is not None and b.get("delta") is not None and int(b["nz"]) < K_anchor:
+        K_core2 = max(K_floor, min(int(b["nz"]), int(round(K.GROW_CORE_FRAC * int(b["nz"])))))
+        core2 = WarmStartSmallerK(ctx, _state_from_delta(ctx, anchor, b), K_core2)
+        logger.info(f"[postflip:grow] lineage-2: core K={K_core2} <- bank flip K={b['nz']}")
+        _grow_to_saturation(ctx, core2, target)
+
+
+def PostFlipGrow(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
+    """Sparse-then-grow strategy. Deepen the dense first flip to saturation (QuickAnchor) so its coord
+    retention reflects DEEP-margin value, then grow lean cores derived from it up to the score peak.
+    Approaches ~K_sat from below (a different coordinate set than coupled's dense->shrink); every
+    candidate is score-ranked into the Bank, which arbitrates the winner."""
+    target = -K.MARGIN_DEEPEN_TARGET
+    logger.info(f"[postflip:grow] start: K_flip={_k_of(flip_state)}")
+    t0 = time.time()
+    if K.COUPLED_QUICK_ANCHOR:
+        anchor, ok = _quick_anchor(ctx, flip_state, target)
+    else:
+        anchor, _ = OptimizeFixedK(ctx, flip_state, _k_of(flip_state), max(1, int(K.ITERATIONS_PER_K)),
+                                   deepen_target=target)
+        ok = _saturates(anchor, target)
+    _grow_lineages(ctx, anchor, K_start, K_min)
+    best = ctx.bank.best_safe
+    logger.info(f"[postflip:grow] done: spent={time.time() - t0:.3f}s anchor_sat={ok} "
+                + (f"best=({best['nz']}ch pixels={best['pixels']} margin={best['margin']:.4f} "
+                   f"score={best['score']:.4f})" if best is not None else "no safe flip banked"))
+
+
+def GrowComplement(ctx: Context, flip_state: State, K_start: int, K_min: int) -> None:
+    """`both` mode: after coupled, grow from coupled's own result (approached from below) into the SAME
+    Bank. The coupled best is already saturated at ~K_sat, so it is a strong anchor for a lean guided
+    core. Strictly non-regressing — folds only into the score-ranked Bank."""
+    b = ctx.bank.best_safe
+    if b is None or b.get("delta") is None:
+        return
+    logger.info(f"[postflip:grow-complement] from coupled best K={b['nz']} margin={b['margin']:.4f}")
+    _grow_lineages(ctx, _state_from_delta(ctx, flip_state, b), K_start, K_min)
+
+
 def _interp_margin(K_new: int, samples: list[tuple[int, float]]) -> float:
     """Estimate margin at K_new from (K, margin) probe samples (margin is more negative at larger K).
     Piecewise-linear within the sampled range; LINEAR-EXTRAPOLATED below the smallest sample using the
@@ -1654,6 +1760,12 @@ def search(ctx: Context) -> None:
                     PostFlipStrict(ctx, successful_state, K_init, K_min)
                 elif K.POSTFLIP_STRATEGY == "analytic":
                     PostFlipAnalytic(ctx, successful_state, K_init, K_min)
+                elif K.POSTFLIP_STRATEGY == "grow":
+                    PostFlipGrow(ctx, successful_state, K_init, K_min)
+                elif K.POSTFLIP_STRATEGY == "both":
+                    PostFlipCoupled(ctx, successful_state, K_init, K_min)
+                    if not _oob(ctx):
+                        GrowComplement(ctx, successful_state, K_init, K_min)
                 else:
                     PostFlipCoupled(ctx, successful_state, K_init, K_min)
                 # INNER refinement on the chosen K (all strategies): exact deletion + score swaps.

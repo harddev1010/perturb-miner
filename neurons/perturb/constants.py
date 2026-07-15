@@ -239,6 +239,14 @@ OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 40.0)
 #     analytic score S(K) (perturbation is closed-form q√(K/N); margin bonus from the interpolated margin;
 #     novelty saturated) over a fine K grid for FREE, and verify the predicted optimum + neighborhood at
 #     full budget. Fewer probes than the binary search -> more optimization depth on the winner.
+#   grow: SPARSE-THEN-GROW. Deepen a dense anchor to saturation (so its retention ranks coords by their
+#     DEEP-margin value, not a shallow first-flip value), reduce to a lean guided core, then GROW that
+#     core back up by adding steepest margin-gain coords (re-linearizing each step), stopping at the
+#     score peak (margin saturates => extra coords only cost RMSE). Reaches ~K_sat from BELOW, so it can
+#     land a different (often better) coordinate SET than coupled's dense->shrink. No K_sat bisection.
+#   both: run coupled, THEN a grow pass seeded from coupled's result (approached from below), folded into
+#     the SAME score-ranked Bank. Strictly non-regressing vs coupled (can only raise the returned score),
+#     at the cost of the extra grow budget. Recommended A/B target vs coupled.
 POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "coupled").strip().lower() or "coupled"
 ANALYTIC_PROBE_FRACS = _env_floats("PERTURB_ANALYTIC_PROBE_FRACS", (0.5, 0.25))  # K/K_anchor probes that fit margin(K)
 MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
@@ -287,6 +295,22 @@ ANCHOR_PUSH_MARGIN = _env_float("PERTURB_ANCHOR_PUSH_MARGIN", 8.0)   # once best
 # worth the full MAX_ITERATIONS deepen; a shallow one gets the bounded ITERATIONS_PER_K pass so it can't
 # grind an unreachable CEIL. This lets a good candidate recover even when the anchor itself fell short.
 COUPLED_REFINE_DEEP_MARGIN = _env_float("PERTURB_COUPLED_REFINE_DEEP_MARGIN", 6.0)
+
+# --- Sparse-then-grow post-flip (PERTURB_POSTFLIP_STRATEGY=grow|both) -----------------------------
+# Grow reaches the score peak from BELOW. From a saturated dense anchor it keeps the top-retention
+# GROW_CORE_FRAC·K_anchor coords (a lean guided core whose ranking reflects DEEP-margin value), then
+# repeatedly adds a block of the steepest feasible margin-gain inactive coords — block = max(
+# GROW_MIN_BATCH, GROW_ADD_FRAC·K_cur) — re-linearizing the gradient at each add. Each cumulative state
+# folds through the score-ranked Bank. The climb stops when the margin SATURATES (<= -CEIL: further
+# coords only raise RMSE, so the score can only fall) or when GROW_PATIENCE consecutive adds set no new
+# Bank best (pre-flip: no new margin low). GROW_MAX_STEPS is a safety cap. A second lineage grows from
+# the sparsest banked flip when it is distinct. Overshoot past the peak is pruned by the SupportRefine
+# deletion pass that runs after every post-flip strategy, so grow lands at the peak either way.
+GROW_CORE_FRAC = _env_float("PERTURB_GROW_CORE_FRAC", 0.15)   # lean core size as a fraction of anchor K
+GROW_ADD_FRAC = _env_float("PERTURB_GROW_ADD_FRAC", 0.35)     # per-step block add as a fraction of current K
+GROW_MIN_BATCH = _env_int("PERTURB_GROW_MIN_BATCH", 32)       # floor on the per-step block add
+GROW_PATIENCE = _env_int("PERTURB_GROW_PATIENCE", 3)          # non-improving adds tolerated before stopping
+GROW_MAX_STEPS = _env_int("PERTURB_GROW_MAX_STEPS", 24)       # safety cap on grow steps per lineage
 
 # --- C2: diminishing-returns early stop for STANDALONE margin-deepen calls (OptimizeFixedK) --------
 # Complements the QuickAnchor (which already stall-stops the anchor). This covers the OTHER deepen calls
