@@ -115,15 +115,15 @@ def main():
     assert flip2 and nz2 >= 1 and grid2 and step2 == 1
     assert linf2 >= 0.003 - 1e-9
 
-    print("[3] search() flips grid-aligned (built against a Context)")
+    print("[3] anytime_search() flips grid-aligned (built against a Context)")
     torch.manual_seed(100)
     ctx = build_ctx(clean, 11, 0.012)
-    P.search(ctx)
+    P.anytime_search(ctx)
     r = ctx.bank.result(ctx.allow_unsafe)
-    assert r is not None, "search() found no safe flip"
+    assert r is not None, "anytime_search() found no safe flip"
     ref, on_grid, mstep = nz_grid_step(r, clean)
-    print(f"  [search] |S|={ref} on_grid={on_grid} max_step={mstep}")
-    assert on_grid and mstep == 1, "search() must keep a grid-aligned one-byte flip"
+    print(f"  [anytime] |S|={ref} on_grid={on_grid} max_step={mstep}")
+    assert on_grid and mstep == 1, "anytime_search() must keep a grid-aligned one-byte flip"
 
     print("[4] unsafe-flip gate — kappa beyond the achievable margin swing makes nothing safe")
     nzg, _, _, _, flipg = run("gate-off", clean, 7, 0.005,

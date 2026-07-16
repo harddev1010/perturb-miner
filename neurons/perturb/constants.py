@@ -225,117 +225,38 @@ ITERATIONS_PER_K = _env_int("PERTURB_FW_ITERATIONS_PER_K", 60)
 # sparsification) must finish within that window.
 OPTIM_SECONDS = _env_float("PERTURB_FW_OPTIM_SECONDS", 40.0)
 
-# --- Post-flip objective (maximize the full score, use the whole budget) -------------------------
-# The validator scores total = perturbation(L∞,RMSE) + 0.03·clip(-margin/10,0,1) + 0.01·clip(px/8,0,1).
-# perturbation(K) is ANALYTIC (RMSE=q·√(K/N)) and RISES as K falls; the margin bonus saturates at CW
-# margin <= -CEIL. So among K that still saturate the margin, score = perturbation(K)+0.04 is maximized
-# at the SMALLEST such K (=K_sat). env PERTURB_POSTFLIP_STRATEGY:
-#   coupled: BINARY-SEARCH K_sat — ~log probes (warm-start + deepen at K), each score-ranked
-#     into the Bank, which also holds Phase A's low-K bare flips. Lands at the peak within budget and
-#     dynamically balances margin vs RMSE per image (hard images where deep margin costs too much RMSE
-#     keep the bare flip). Much cheaper than a geometric descent that re-deepens every 10% step.
-#   strict: geometric first-flip descent (shallow rungs, cheap) then ONE deepen pass at the settled K.
-#   analytic: MODEL-based (fewest expensive probes). Fit margin(K) from a few probes, then MAXIMIZE the
-#     analytic score S(K) (perturbation is closed-form q√(K/N); margin bonus from the interpolated margin;
-#     novelty saturated) over a fine K grid for FREE, and verify the predicted optimum + neighborhood at
-#     full budget. Fewer probes than the binary search -> more optimization depth on the winner.
-#   grow: SPARSE-THEN-GROW. Deepen a dense anchor to saturation (so its retention ranks coords by their
-#     DEEP-margin value, not a shallow first-flip value), reduce to a lean guided core, then GROW that
-#     core back up by adding steepest margin-gain coords (re-linearizing each step), stopping at the
-#     score peak (margin saturates => extra coords only cost RMSE). Reaches ~K_sat from BELOW, so it can
-#     land a different (often better) coordinate SET than coupled's dense->shrink. No K_sat bisection.
-#   both: run coupled, THEN a grow pass seeded from coupled's result (approached from below), folded into
-#     the SAME score-ranked Bank. Strictly non-regressing vs coupled (can only raise the returned score),
-#     at the cost of the extra grow budget. Recommended A/B target vs coupled.
-#   ufs (default): UNIFIED FRONTIER SCHEDULER — an anytime replacement for the whole post-flip waterfall.
-#     One loop over a K-indexed frontier + online margin surrogate; each step runs the highest-expected-
-#     gain move (DEEPEN / SHRINK / GROW) against a single shared budget, so budget is never sliced (no
-#     starvation) nor left unused (it schedules until the deadline, diversifying on convergence). See the
-#     UFS_* block. Promoted to default after winning the hardware A/B vs coupled.
-POSTFLIP_STRATEGY = os.getenv("PERTURB_POSTFLIP_STRATEGY", "ufs").strip().lower() or "ufs"
-ANALYTIC_PROBE_FRACS = _env_floats("PERTURB_ANALYTIC_PROBE_FRACS", (0.5, 0.25))  # K/K_anchor probes that fit margin(K)
+# --- Shared operator knobs (used by the anytime engine's operators) ------------------------------
+# Validator total = perturbation(L∞,RMSE) + 0.03·clip(-margin/10) + 0.01·clip(px/8). The margin bonus
+# saturates at CW margin <= -CEIL, so CEIL is the deepen/grow target and the point past which the
+# surrogate score flattens (margin depth stops paying).
 MARGIN_DEEPEN_TARGET = _env_float("PERTURB_MARGIN_DEEPEN_TARGET", 10.5)  # CEIL: CW margin <= -this saturates the bonus
-KSAT_REL_TOL = _env_float("PERTURB_KSAT_REL_TOL", 0.05)   # coupled: stop binary search when (hi-lo) <= max(KSAT_ABS_TOL, this·hi)
-KSAT_ABS_TOL = _env_int("PERTURB_KSAT_ABS_TOL", 8)        # absolute tol floor so small K doesn't over-probe single coords
-# Coupled V2 = a fast saturation-boundary LOCATOR followed by a SCORE-peak refinement (the validator
-# rewards a score maximum, not the saturation threshold). Boundary probes run cheap (a fraction of the
-# per-K iters) just to classify saturate/not; refinement probes around K_sat run the full budget. A
-# near-miss (margin reached >= COUPLED_RETRY_FRAC·target) is retried once from a different warm-start
-# parent before conceding the bracket (a single fixed-K run can be a false negative). COUPLED_PARENTS is
-# a tiny beam of best-score states kept as alternate warm-start parents (breaks single-lineage path
-# dependence). COUPLED_REFINE_MULTS are the K/K_sat ratios sampled in the refinement sweep.
-# Phase 3 refinement is SCREEN-then-refine (keeps depth where it matters under the 15s budget): all
-# COUPLED_REFINE_MULTS ratios of K_sat are screened with the cheap boundary budget, then only the best
-# COUPLED_REFINE_FULL are given a full OptimizeFixedK. Ratios are <=1 (below the boundary, where the score
-# peak lives — above-boundary K has worse RMSE and is already covered by the binary-search probes). Every
-# expensive probe/retry is skipped when its analytic score upper bound can't beat the current Bank best.
-COUPLED_BOUNDARY_ITER_FRAC = _env_float("PERTURB_COUPLED_BOUNDARY_ITER_FRAC", 0.4)
-COUPLED_REFINE_MULTS = _env_floats("PERTURB_COUPLED_REFINE_MULTS", (0.85, 0.7, 0.55))
-COUPLED_REFINE_FULL = _env_int("PERTURB_COUPLED_REFINE_FULL", 2)  # screened candidates given the full budget
-COUPLED_RETRY_FRAC = _env_float("PERTURB_COUPLED_RETRY_FRAC", 0.6)
-COUPLED_PARENTS = _env_int("PERTURB_COUPLED_PARENTS", 3)
-# Budget-aware anchor (coupled Phase 1). The saturating anchor deepens the FIRST flip at its own K to
-# CW margin <= CEIL. On a robust image where CEIL is slow/unreachable, a full-budget anchor can eat the
-# whole post-flip window buying at most the 0.03 margin bonus while the K/RMSE search — which may raise
-# score more — starves. BUT margin deepening in this optimizer is NON-monotonic and often DELAYED (block
-# swaps / sign turnover pay off only after tens of iters), so a too-eager early stop bails at margin ~-4/-5
-# on images that would have reached CEIL. So: (a) always give the anchor a real chance — run at least
-# ANCHOR_MIN_ITERS before ANY slope-based early stop; (b) preserve the optimizer trajectory across chunks
-# (continue from the LIVE state, not the best-margin snapshot — see _quick_anchor), so delayed nonlinear
-# drops are not thrown away; (c) never bail once the margin is already close to CEIL (<= -ANCHOR_PUSH_MARGIN
-# it is nearly saturated — finish it); (d) only after the warmup, stop on a sustained stall (margin gain
-# < ANCHOR_MIN_MARGIN_GAIN for ANCHOR_STALL_CHUNKS chunks in a row => ~a 20-iter flat window) or the
-# iter/time caps. Whatever depth it reached is a valid anchor; the score-ranked Bank + K sweep take over.
-# Set the gate off to restore the old fixed full-budget anchor.
-COUPLED_QUICK_ANCHOR = _env_bool("PERTURB_COUPLED_QUICK_ANCHOR", True)
-ANCHOR_CHUNK_ITERS = _env_int("PERTURB_ANCHOR_CHUNK_ITERS", 5)         # iters per slope-check chunk (small: fine stall resolution)
-ANCHOR_MIN_ITERS = _env_int("PERTURB_ANCHOR_MIN_ITERS", 25)          # never slope-bail before this many iters (give delayed deepening a chance)
-ANCHOR_MAX_ITERS = _env_int("PERTURB_ANCHOR_MAX_ITERS", 40)          # hard cap on total anchor iters
-ANCHOR_MAX_FRAC = _env_float("PERTURB_ANCHOR_MAX_FRAC", 0.20)        # post-warmup cap: fraction of remaining post-flip budget
-ANCHOR_MIN_MARGIN_GAIN = _env_float("PERTURB_ANCHOR_MIN_MARGIN_GAIN", 0.1)  # min best-|margin| drop/chunk to count as progress
-ANCHOR_STALL_CHUNKS = _env_int("PERTURB_ANCHOR_STALL_CHUNKS", 4)     # consecutive weak chunks (post-warmup) before bailing
-ANCHOR_PUSH_MARGIN = _env_float("PERTURB_ANCHOR_PUSH_MARGIN", 8.0)   # once best margin <= -this, never stall-bail (close to CEIL)
-# Phase-3 refine budget is decided PER CANDIDATE by how close it already is to CEIL, not by whether the
-# anchor saturated: a screened candidate at CW margin <= -COUPLED_REFINE_DEEP_MARGIN is close enough to be
-# worth the full MAX_ITERATIONS deepen; a shallow one gets the bounded ITERATIONS_PER_K pass so it can't
-# grind an unreachable CEIL. This lets a good candidate recover even when the anchor itself fell short.
-COUPLED_REFINE_DEEP_MARGIN = _env_float("PERTURB_COUPLED_REFINE_DEEP_MARGIN", 6.0)
 
-# --- Sparse-then-grow post-flip (PERTURB_POSTFLIP_STRATEGY=grow|both) -----------------------------
-# Grow reaches the score peak from BELOW. From a saturated dense anchor it keeps the top-retention
-# GROW_CORE_FRAC·K_anchor coords (a lean guided core whose ranking reflects DEEP-margin value), then
-# repeatedly adds a block of the steepest feasible margin-gain inactive coords — block = max(
-# GROW_MIN_BATCH, GROW_ADD_FRAC·K_cur) — re-linearizing the gradient at each add. Each cumulative state
-# folds through the score-ranked Bank. The climb stops when the margin SATURATES (<= -CEIL: further
-# coords only raise RMSE, so the score can only fall) or when GROW_PATIENCE consecutive adds set no new
-# Bank best (pre-flip: no new margin low). GROW_MAX_STEPS is a safety cap. A second lineage grows from
-# the sparsest banked flip when it is distinct. Overshoot past the peak is pruned by the SupportRefine
-# deletion pass that runs after every post-flip strategy, so grow lands at the peak either way.
-GROW_CORE_FRAC = _env_float("PERTURB_GROW_CORE_FRAC", 0.15)   # lean core size as a fraction of anchor K
+# grow operator (_grow_to_saturation): climb a sparse flip up toward the score peak, adding a block of
+# the steepest feasible margin-gain coords per step until the margin saturates or GROW_PATIENCE stalls.
 GROW_ADD_FRAC = _env_float("PERTURB_GROW_ADD_FRAC", 0.35)     # per-step block add as a fraction of current K
 GROW_MIN_BATCH = _env_int("PERTURB_GROW_MIN_BATCH", 32)       # floor on the per-step block add
 GROW_PATIENCE = _env_int("PERTURB_GROW_PATIENCE", 3)          # non-improving adds tolerated before stopping
-GROW_MAX_STEPS = _env_int("PERTURB_GROW_MAX_STEPS", 24)       # safety cap on grow steps per lineage
+GROW_MAX_STEPS = _env_int("PERTURB_GROW_MAX_STEPS", 24)       # safety cap on grow steps per climb
 
-# --- Unified Frontier Scheduler (PERTURB_POSTFLIP_STRATEGY=ufs) -----------------------------------
-# ANYTIME post-flip: instead of a fixed waterfall (anchor -> K_sat bisection -> refine sweep), keep a
-# small beam ("frontier") of warm-start States at different K, fit an online margin surrogate m̂(K) from
-# every (K,margin) seen, and each iteration execute the single move with the highest expected score gain:
-#   DEEPEN(node)     — push a node's margin toward CEIL at its own K (raises the 0.03 bonus).
-#   SHRINK(node,K')  — warm-start a node down to a surrogate-chosen sparser K' (lower RMSE).
-#   GROW(node)       — climb a sparse node up to saturation (Part-2 sparse-then-grow; reaches K̂* from below).
-# The surrogate's argmax K̂* = argmax_K [pert(K) + margin_bonus(m̂(K))] steers both SHRINK and GROW toward
-# the score peak; a move is skipped when its analytic ceiling can't beat the Bank. Budget is one shared
-# pool (no per-phase slices => no starvation, no unused tail). On convergence (no move beats the Bank by
-# SCORE_TOL) with budget left, a bounded PartialRestart diversifies to escape local optima. INVARIANT:
-# the densest node is never evicted, so a saturatable anchor always survives (the 0.03 bonus stays
-# reachable — prevents the sparse-drift regression). Every candidate folds through the score-ranked Bank.
-UFS_FRONTIER_CAP = _env_int("PERTURB_UFS_FRONTIER_CAP", 6)    # live warm-start nodes kept in the frontier
-UFS_CHUNK_ITERS = _env_int("PERTURB_UFS_CHUNK_ITERS", 30)     # optimizer iters per DEEPEN/SHRINK burst
+# surrogate m̂(K): the prune/ksat operators pick K targets by maximizing the predicted score over this
+# many geometric grid points (isotonic fit anchored at the clean (0, m0) point; see _ufs_margin_hat).
 UFS_GRID = _env_int("PERTURB_UFS_GRID", 48)                   # geometric-K grid resolution for the surrogate argmax
-UFS_DEEPEN_MIN_GAIN = _env_float("PERTURB_UFS_DEEPEN_MIN_GAIN", 0.2)  # min |margin| drop for a DEEPEN to count as progress
-UFS_RESTARTS = _env_int("PERTURB_UFS_RESTARTS", 3)           # PartialRestart diversifications allowed on convergence
-UFS_MAX_ACTIONS = _env_int("PERTURB_UFS_MAX_ACTIONS", 400)   # hard safety cap on scheduled actions per call
+
+# --- Anytime banked operator loop (the engine — anytime_search) ----------------------------------
+# Phase-less controller + phase-aware interruptible operators + shared Pareto banks + the immutable
+# submission Bank. Each iteration picks a diverse PARENT (best-score / deepest-margin / leanest-RMSE
+# flip, rotated) and runs the highest score-gain-per-second eligible OPERATOR (push / deepen / prune /
+# swap / ksat / grow / refine / cleanup / restart) for ONE quantum, folding every candidate through the
+# banks. Budget is one shared pool (no stage boundaries => no starvation, no unused tail); the returned
+# answer is always the best VALIDATED flip. Reuses UFS_GRID (surrogate argmax) and the GROW_*/MARGIN_
+# DEEPEN_TARGET/REFINE_* knobs for the individual operators.
+AL_FRONTIER_LIMIT = _env_int("PERTURB_AL_FRONTIER_LIMIT", 12)   # Pareto bank of pre-flip parents (margin, rmse)
+AL_FLIPWORK_LIMIT = _env_int("PERTURB_AL_FLIPWORK_LIMIT", 16)   # Pareto bank of flipped parents (score, rmse, margin)
+AL_QUANTUM_ITERS = _env_int("PERTURB_AL_QUANTUM_ITERS", 25)     # optimizer iters per push/deepen/prune quantum
+AL_ROBUST_MARGIN = _env_float("PERTURB_AL_ROBUST_MARGIN", 2.0)  # |CW margin| past which a flip is "robust" (ksat/grow eligible)
+AL_EXPLORE_C = _env_float("PERTURB_AL_EXPLORE_C", 0.03)         # UCB exploration weight in the operator choice
+AL_RESTART_EVERY = _env_int("PERTURB_AL_RESTART_EVERY", 15)     # force a diversify (restart) op at this action cadence
+AL_MAX_ACTIONS = _env_int("PERTURB_AL_MAX_ACTIONS", 800)        # hard safety cap on scheduled actions per call
 
 # --- C2: diminishing-returns early stop for STANDALONE margin-deepen calls (OptimizeFixedK) --------
 # Complements the QuickAnchor (which already stall-stops the anchor). This covers the OTHER deepen calls
