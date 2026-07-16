@@ -43,6 +43,12 @@ logger = pylogging.getLogger(__name__)
 # submit round-trip normally costs only a few seconds, so most of that window can go to the attack.
 _ATTACK_TIMEOUT_SECONDS = float(os.getenv("PERTURB_ATTACK_TIMEOUT_SECONDS") or "35.0")
 
+# Test mode (PERTURB_TEST_MODE=1): run the WHOLE pipeline — poll -> download -> attack -> score —
+# but DON'T upload the result to object storage or submit it back to the API. The full validator
+# score is already logged by _attack_image, so this lets you observe scores locally (dry run)
+# without touching storage/the network or requiring a registered, submission-eligible hotkey.
+_TEST_MODE = (os.getenv("PERTURB_TEST_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _task_created_epoch(task_id: str) -> float | None:
     """Task ids look like '<unix_epoch>-hf-...'. Parse the leading epoch so we can measure how old a
@@ -300,6 +306,15 @@ class PerturbMiner:
         t0 = time.time()
         perturbed_image_b64, _ = self._attack_image(task_id=task_id, clean_image_b64=clean_image_b64)
         attack_seconds = time.time() - t0
+
+        # Dry run: stop before any network-facing side effect. _attack_image has already logged the
+        # full validator score; nothing is written to storage or submitted to the API.
+        if _TEST_MODE:
+            logger.info(
+                f"TEST_MODE task={task_id} download={download_seconds:.2f}s attack={attack_seconds:.2f}s "
+                f"total={time.time() - started_at:.2f}s (upload+submit SKIPPED)"
+            )
+            return
 
         t0 = time.time()
         response_url = self._upload_response(task_id=task_id, perturbed_image_b64=perturbed_image_b64)
