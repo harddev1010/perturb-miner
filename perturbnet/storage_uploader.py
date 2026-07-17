@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import io
+import json
 import logging
 from typing import Any
 
@@ -42,6 +43,8 @@ class ImageStorageUploader:
         self.prefix = C.STORAGE_PREFIX.strip().strip("/")
         self.miner_key_secret = ""
         self.client: Any | None = None
+        # Fail-fast client for best-effort writes (challenge JSON). Falls back to self.client if unset.
+        self._besteffort_client: Any | None = None
 
         if not self.bucket:
             self._raise_config_error(f"{self.backend} storage requires PERTURB_STORAGE_BUCKET.")
@@ -65,11 +68,27 @@ class ImageStorageUploader:
             "aws_secret_access_key": secret_key,
             "region_name": self._region_for_backend(),
         }
-        if self.backend == "hippius":
-            from botocore.config import Config as BotoConfig
+        # Both hippius and R2 are S3-compatible via SigV4 + path-style addressing. Path-style avoids
+        # virtual-hosted DNS / presigned-URL pitfalls (e.g. bucket names with dots) and is the mode
+        # Cloudflare R2 recommends, so the presigned response URL the validator fetches always resolves.
+        from botocore.config import Config as BotoConfig
 
-            client_kwargs["config"] = BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"})
+        base_config = BotoConfig(signature_version="s3v4", s3={"addressing_style": "path"})
+        client_kwargs["config"] = base_config
         self.client = boto3.client("s3", **client_kwargs)
+
+        # A second, fail-fast client for best-effort writes (challenge JSON, uploaded after submit):
+        # bounded retries + short timeouts so a transient backend blip can't stall the miner loop for
+        # the full default retry budget and delay the next task. Never break startup — on any failure
+        # fall back to self.client (upload_json handles None), so behaviour is at worst unchanged.
+        try:
+            fast_config = base_config.merge(
+                BotoConfig(retries={"max_attempts": 2, "mode": "standard"}, connect_timeout=4, read_timeout=6)
+            )
+            self._besteffort_client = boto3.client("s3", **{**client_kwargs, "config": fast_config})
+        except Exception as exc:
+            logger.warning(f"Fail-fast storage client unavailable, using default client for best-effort writes: {exc}")
+            self._besteffort_client = None
         logger.info(f"Image storage enabled backend={self.backend} bucket={self.bucket} prefix={self.prefix}")
 
     def _raise_config_error(self, message: str) -> None:
@@ -116,3 +135,47 @@ class ImageStorageUploader:
             CacheControl="no-store, max-age=0",
         )
         return self.object_url(key)
+
+    def upload_json(self, *, key: str, obj: Any) -> str:
+        """Store a JSON document (challenge record + miner score/time) at `key`. Returns its URL.
+
+        Uses the fail-fast client (bounded retries + short timeouts): this is a best-effort write done
+        after the submit, and must never block the miner loop while the backend is degraded."""
+        client = self._besteffort_client or self.client
+        if client is None:
+            raise RuntimeError("Image storage is not configured.")
+        body = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        client.put_object(
+            Bucket=self.bucket,
+            Key=key,
+            Body=body,
+            ContentType="application/json",
+            CacheControl="no-store, max-age=0",
+        )
+        return self.object_url(key)
+
+    def list_objects(self, *, prefix: str) -> list[dict[str, Any]]:
+        """List every object under `prefix` as {key, last_modified, size}, following pagination."""
+        if self.client is None:
+            raise RuntimeError("Image storage is not configured.")
+        items: list[dict[str, Any]] = []
+        paginator = self.client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            for entry in page.get("Contents", []) or []:
+                items.append(
+                    {
+                        "key": entry.get("Key", ""),
+                        "last_modified": entry.get("LastModified"),
+                        "size": int(entry.get("Size", 0)),
+                    }
+                )
+        return items
+
+    def download_bytes(self, *, key: str) -> bytes:
+        if self.client is None:
+            raise RuntimeError("Image storage is not configured.")
+        response = self.client.get_object(Bucket=self.bucket, Key=key)
+        return response["Body"].read()
+
+    def download_json(self, *, key: str) -> Any:
+        return json.loads(self.download_bytes(key=key).decode("utf-8"))

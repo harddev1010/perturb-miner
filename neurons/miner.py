@@ -25,6 +25,7 @@ import typing
 import bittensor as bt
 import torch
 
+from perturbnet import challenge_store
 from perturbnet import constants as C
 from perturbnet.api_client import get_current_task, get_server_epoch, submit_miner_response
 from perturbnet.constants import MAX_LINF_DELTA
@@ -48,6 +49,12 @@ _ATTACK_TIMEOUT_SECONDS = float(os.getenv("PERTURB_ATTACK_TIMEOUT_SECONDS") or "
 # score is already logged by _attack_image, so this lets you observe scores locally (dry run)
 # without touching storage/the network or requiring a registered, submission-eligible hotkey.
 _TEST_MODE = (os.getenv("PERTURB_TEST_MODE") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+# Persist each processed challenge (clean image + our score/time) to hippius under
+# perturb_challenges/<task_id>.json so scripts/score_miner.py can later replay the CURRENT engine
+# against the exact real challenges we saw. Storage happens AFTER submit so it never eats the
+# submission window, and never in TEST_MODE (which is contractually storage/network-free).
+_STORE_CHALLENGES = (os.getenv("PERTURB_STORE_CHALLENGES") or "1").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _task_created_epoch(task_id: str) -> float | None:
@@ -215,9 +222,11 @@ class PerturbMiner:
             raise RuntimeError("Miner hotkey is not registered on this netuid.")
         return int(self.metagraph.hotkeys.index(hotkey))
 
-    def _attack_image(self, *, task_id: str, clean_image_b64: str) -> tuple[str, str]:
+    def _attack_image(self, *, task_id: str, clean_image_b64: str) -> tuple[str, str, dict[str, typing.Any]]:
         """Run the neurons/perturb engine on the clean image. Returns (perturbed_image_b64,
-        predicted_label). Falls back to the clean bytes verbatim when no envelope-safe flip is found."""
+        predicted_label, metrics). Falls back to the clean bytes verbatim when no envelope-safe flip is
+        found. `metrics` carries the challenge params + this task's score/flip result for the challenge
+        store (see challenge_store.build_record)."""
         t_received = time.time()
         clean = decode_image_b64(clean_image_b64).to(self.device)
         predicted_label = predict_label(self.model, clean)
@@ -244,6 +253,25 @@ class PerturbMiner:
         norm = float(diff.abs().max().item())
         rmse = float(torch.sqrt(torch.mean(diff ** 2)).item())
 
+        # Base challenge params — always recorded so score_miner.py can replay this exact image.
+        metrics: dict[str, typing.Any] = {
+            "true_label": str(predicted_label),
+            "target_index": int(target_index),
+            "epsilon": float(epsilon),
+            "min_delta": float(min_delta),
+            "flip": False,
+            "q1_flip": False,
+            "q2_flip": False,
+            "score": 0.0,
+            "pert_score": 0.0,
+            "margin": 0.0,
+            "linf": float(norm),
+            "rmse": float(rmse),
+            "k": 0,
+            "changed_pixels": 0,
+            "changed_channels": 0,
+        }
+
         # Clean tier: perturb() returned the clean image (no flip found). Pass the original bytes
         # through verbatim rather than the re-encoded ones.
         if norm < min_delta:
@@ -251,7 +279,7 @@ class PerturbMiner:
                 f"No flip found task={task_id} target_idx={target_index} norm={norm:.6f} "
                 f"min_delta={min_delta:.6f} elapsed={time.time() - t_received:.3f}s"
             )
-            return clean_image_b64, str(predicted_label)
+            return clean_image_b64, str(predicted_label), metrics
 
         # Log BOTH: pert_score = L∞+RMSE component only; score = the FULL validator objective
         # (adds margin + novelty terms). The full score is what the validator actually assigns.
@@ -260,13 +288,28 @@ class PerturbMiner:
             adv_logits = logits_for_images(model=self.model, image_bchw=seen.unsqueeze(0))[0]
         cw = cw_margin(adv_logits, target_index)  # true - best_other; validator margin = -cw
         changed_pixels = int((diff.abs() > (0.5 / 255.0)).any(dim=0).sum().item())
+        changed_channels = int((diff.abs() > (0.5 / 255.0)).sum().item())
         full_score = validator_score(norm, rmse, cw, changed_pixels, min(epsilon, MAX_LINF_DELTA))
+        # Fixed-q invariant: q=1 flips step every changed coord by exactly 1 byte (k=1); the q=2
+        # fallback steps by 2 (k>=2). So k = round(linf*255) attributes the flip to its search path.
+        k = int(round(norm * 255.0))
+        metrics.update(
+            flip=True,
+            q1_flip=(k <= 1),
+            q2_flip=(k >= 2),
+            score=float(full_score),
+            pert_score=float(pert_score),
+            margin=float(cw),
+            k=int(k),
+            changed_pixels=int(changed_pixels),
+            changed_channels=int(changed_channels),
+        )
         logger.info(
-            f"Finished task={task_id} target_idx={target_index} k={int(round(norm * 255.0))} "
+            f"Finished task={task_id} target_idx={target_index} k={k} "
             f"linf={norm:.6f} rmse={rmse:.6f} pert_score={pert_score:.4f} score={full_score:.4f} "
             f"elapsed={time.time() - t_received:.3f}s"
         )
-        return adv_b64, str(predicted_label)
+        return adv_b64, str(predicted_label), metrics
 
     def _upload_response(self, *, task_id: str, perturbed_image_b64: str) -> str:
         uid = self._miner_uid()
@@ -304,40 +347,63 @@ class PerturbMiner:
         download_seconds = time.time() - t0
 
         t0 = time.time()
-        perturbed_image_b64, _ = self._attack_image(task_id=task_id, clean_image_b64=clean_image_b64)
+        perturbed_image_b64, _, attack_metrics = self._attack_image(task_id=task_id, clean_image_b64=clean_image_b64)
         attack_seconds = time.time() - t0
 
-        # Dry run: stop before any network-facing side effect. _attack_image has already logged the
-        # full validator score; nothing is written to storage or submitted to the API.
+        # Dry run: skip the competition submit (upload response + POST /submits), but STILL persist the
+        # challenge record so test-mode runs populate the store that scripts/score_miner.py reads. The
+        # response image is not uploaded; only our own challenge JSON is written (gated + best-effort).
         if _TEST_MODE:
+            self._store_challenge_record(
+                task_id=task_id,
+                image_url=image_url,
+                clean_image_b64=clean_image_b64,
+                metrics=attack_metrics,
+                time_spent_seconds=attack_seconds,
+            )
             logger.info(
                 f"TEST_MODE task={task_id} download={download_seconds:.2f}s attack={attack_seconds:.2f}s "
-                f"total={time.time() - started_at:.2f}s (upload+submit SKIPPED)"
+                f"total={time.time() - started_at:.2f}s (response upload+submit SKIPPED; challenge stored)"
             )
             return
 
-        t0 = time.time()
-        response_url = self._upload_response(task_id=task_id, perturbed_image_b64=perturbed_image_b64)
-        upload_seconds = time.time() - t0
-
+        upload_seconds = 0.0
         submit_seconds = 0.0
-        t0 = time.time()
+        submit_response = None
+        response_url = ""
         try:
-            submit_response = submit_miner_response(
-                base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
-                wallet=self.wallet,
-                image_url=response_url,
-                timeout_seconds=api_timeout,
-            )
+            t0 = time.time()
+            response_url = self._upload_response(task_id=task_id, perturbed_image_b64=perturbed_image_b64)
+            upload_seconds = time.time() - t0
+
+            t0 = time.time()
+            try:
+                submit_response = submit_miner_response(
+                    base_url=str(getattr(self.config.perturb, "api_base_url", C.PERTURB_API_BASE_URL)),
+                    wallet=self.wallet,
+                    image_url=response_url,
+                    timeout_seconds=api_timeout,
+                )
+            finally:
+                submit_seconds = time.time() - t0
+                total_seconds = time.time() - started_at
+                created = _task_created_epoch(task_id)
+                age_str = f" true_age_at_submit={self._server_now() - created:.1f}s" if created is not None else ""
+                logger.info(
+                    f"Timing task={task_id} download={download_seconds:.2f}s attack={attack_seconds:.2f}s "
+                    f"upload={upload_seconds:.2f}s submit={submit_seconds:.2f}s "
+                    f"total_got_task_to_submit={total_seconds:.2f}s{age_str}"
+                )
         finally:
-            submit_seconds = time.time() - t0
-            total_seconds = time.time() - started_at
-            created = _task_created_epoch(task_id)
-            age_str = f" true_age_at_submit={self._server_now() - created:.1f}s" if created is not None else ""
-            logger.info(
-                f"Timing task={task_id} download={download_seconds:.2f}s attack={attack_seconds:.2f}s "
-                f"upload={upload_seconds:.2f}s submit={submit_seconds:.2f}s "
-                f"total_got_task_to_submit={total_seconds:.2f}s{age_str}"
+            # Persist the challenge + our score regardless of how upload/submit went — success, a rejected
+            # window (HTTP 403), an upload error, or any exception. Runs after the submit attempt so it
+            # never delays the response, and is best-effort so it never masks the upload/submit error.
+            self._store_challenge_record(
+                task_id=task_id,
+                image_url=image_url,
+                clean_image_b64=clean_image_b64,
+                metrics=attack_metrics,
+                time_spent_seconds=attack_seconds,
             )
         if not self._submission_succeeded(submit_response):
             raise RuntimeError(f"Response submission failed task={task_id} api_response={submit_response}")
@@ -345,6 +411,41 @@ class PerturbMiner:
             f"Submitted task={task_id} response_url={response_url} "
             f"total_got_task_to_submit={total_seconds:.2f}s"
         )
+
+    def _store_challenge_record(
+        self,
+        *,
+        task_id: str,
+        image_url: str,
+        clean_image_b64: str,
+        metrics: dict[str, typing.Any],
+        time_spent_seconds: float,
+    ) -> None:
+        """Best-effort: upload this task's challenge record to the cloud store (R2) at
+        challenge_store.CHALLENGE_PREFIX (perturb/attack-challenges/<task_id>.json), reusing the same
+        uploader as the response image. Called after the submit, on a fail-fast client. Any failure is
+        logged and swallowed — persisting the challenge must never break the miner's task loop."""
+        if not _STORE_CHALLENGES:
+            logger.debug(f"Challenge store disabled (PERTURB_STORE_CHALLENGES) task={task_id}")
+            return
+        key = challenge_store.challenge_key(task_id)
+        try:
+            record = challenge_store.build_record(
+                task_id=task_id,
+                image_b64=clean_image_b64,
+                true_label=str(metrics.get("true_label", "")),
+                target_index=int(metrics.get("target_index", -1)),
+                epsilon=float(metrics.get("epsilon", C.MAX_LINF_DELTA)),
+                min_delta=float(metrics.get("min_delta", C.MIN_LINF_DELTA)),
+                image_url=image_url,
+                created_epoch=_task_created_epoch(task_id),
+                metrics=metrics,
+                time_spent_seconds=time_spent_seconds,
+            )
+            url = challenge_store.store_challenge(self.response_exporter, record)
+            logger.info(f"Stored challenge task={task_id} key={key} url={url}")
+        except Exception as exc:
+            logger.warning(f"Challenge store FAILED task={task_id} key={key}: {exc!r}", exc_info=True)
 
     def _get_current_task(self):
         return get_current_task(
