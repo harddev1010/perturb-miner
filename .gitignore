@@ -8,4 +8,4 @@ logs/
 scripts/miner.env
 scripts/miner.p.env
 scripts/validator.env
-
+btt-backup/

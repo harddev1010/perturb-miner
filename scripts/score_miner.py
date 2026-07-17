@@ -5,7 +5,7 @@ each one exactly the way the validator does, so you can measure an algorithm cha
 of real inputs without touching the live network.
 
 Workflow it mimics:
-  * MINER side — for each challenge it loads the clean image and runs neurons/perturb.perturb() with the
+  * MINER side — for each challenge it loads the clean image and runs neurons/perturb_dev.perturb() with the
     same budget the miner uses (see neurons/miner._ATTACK_TIMEOUT_SECONDS).
   * VALIDATOR side — it re-derives the true label, quantises to the uint8 grid, checks the L∞/SSIM/PSNR
     gates and the label flip, then computes the full validator objective (perturbation + margin +
@@ -38,8 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
 
-from neurons.perturb import perturb
-from neurons.perturb.utils import (
+from neurons.perturb_dev import perturb
+from neurons.perturb_dev.utils import (
     compute_psnr_db,
     compute_ssim,
     cw_margin,
